@@ -18,6 +18,8 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -82,7 +84,9 @@ func usageWith(w io.Writer) {
 
 Usage:
   chctl config render -spec chi.yaml [-host 0-0] [-host name=address]... [-replica name=cloudname]...
-                        [-out config.d] [-users-dir users.d] [-dry-run] [-keeper]
+                        [-user-password name=path]... [-out config.d] [-users-dir users.d] [-dry-run] [-keeper]
+                        [-remote-user <name> -remote-password-env <VAR> | -remote-password-file <path>]
+                        keeper mode: [-keeper] -host <host> [-server-id <n>] [-single-file <path>]
   chctl schema sync <host> -cluster <name> -host <name=addr>... [-user u] [-password p] [-port n] [-secure]
   chctl replica drop <host> -on <peer> -cluster <name> -host <name=addr>...
   chctl replica sync <host> -cluster <name> -host <name=addr>...
@@ -92,6 +96,17 @@ Usage:
 
 Commands:
   config    render config.d/users.d XML for a cluster or host from a CHI/CHK spec
+            -user-password injects runtime passwords: each file is read, sha256-hashed
+            and emitted as password_sha256_hex for that user (the spec declares the
+            user, the secret store supplies the password — never the spec file)
+            -remote-user with -remote-password-env/-remote-password-file injects
+            <user>/<password> into every remote_servers <replica> so
+            distributed queries authenticate (never argv passwords)
+            keeper mode: -single-file merges common+host sections into ONE complete
+            <clickhouse>-rooted config for nodes running clickhouse-keeper with an
+            explicit --config (which disables config.d auto-include); -server-id
+            overrides the CR's zero-based replica index with the myid file's
+            authoritative identity
   schema    create all schema objects on a host from cluster peers (new-reader boot)
   replica   drop a dead replica's registration / re-sync a restarted one / gc stale ones
   keeper    Raft-quorum safety gate for planned keeper stop/replacement,
@@ -108,16 +123,22 @@ func runConfig(args []string) error {
 	}
 	fs := flag.NewFlagSet("config render", flag.ContinueOnError)
 	var (
-		specFile string
-		outDir   string
-		usersDir string
-		dryRun   bool
-		isKeeper bool
+		specFile   string
+		outDir     string
+		usersDir   string
+		dryRun     bool
+		isKeeper   bool
+		serverID   int
+		singleFile string
 	)
 	var (
-		hostFlags   hostList
-		replicaMap  replicaList
-		keeperAddrs keeperAddrList
+		hostFlags          hostList
+		replicaMap         replicaList
+		keeperAddrs        keeperAddrList
+		userPasswords      userPasswordList
+		remoteUser         string
+		remotePasswordEnv  string
+		remotePasswordFile string
 	)
 	fs.StringVar(&specFile, "spec", "", "CHI/CHK spec file (YAML), required")
 	fs.Var(&hostFlags, "host", "render host-scoped files for this host; with name=address syntax (repeatable) also maps the CR host to its cloud DNS name/IP")
@@ -127,11 +148,28 @@ func runConfig(args []string) error {
 	fs.BoolVar(&isKeeper, "keeper", false, "spec is a ClickHouseKeeperInstallation (CHK)")
 	fs.Var(&replicaMap, "replica", "CR host name to cloud short hostname mapping name=cloudname (repeatable; the rendered macros <replica> carries the cloud name)")
 	fs.Var(&keeperAddrs, "keeper-address", "CHK host cloud DNS mapping crName=address (repeatable; raft server entries use the cloud names)")
+	fs.IntVar(&serverID, "server-id", 0, "keeper mode: overrides the rendered <server_id> for the selected host (e.g. the myid file's 1-based value; 0 keeps the CR-derived replica index)")
+	fs.StringVar(&singleFile, "single-file", "", "keeper mode: write ONE complete <clickhouse>-rooted config file (common+host sections merged) to this path instead of per-group files in -out; requires -host")
+	fs.Var(&userPasswords, "user-password", "user name=password-file path (repeatable); the file is read, hashed sha256 and injected as password_sha256_hex for that user — never the spec")
+	fs.StringVar(&remoteUser, "remote-user", "", "ClickHouse user distributed queries authenticate as (with -remote-password-env/-remote-password-file)")
+	fs.StringVar(&remotePasswordEnv, "remote-password-env", "", "environment variable holding the distributed-query password (mutually exclusive with -remote-password-file)")
+	fs.StringVar(&remotePasswordFile, "remote-password-file", "", "file holding the distributed-query password (mutually exclusive with -remote-password-env)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
 	if specFile == "" {
 		return fmt.Errorf("-spec is required")
+	}
+
+	// Distributed-query credentials: resolve the password once, from
+	// exactly one source, before anything renders. The rendered
+	// remote_servers.xml carries the pair per <replica> so peers
+	// authenticate instead of rejecting passwordless "default"
+	// (PASSWORD_REQUIRED). The password itself never appears in argv,
+	// logs, or the spec.
+	remotePassword, err := readRemotePassword(remoteUser, remotePasswordEnv, remotePasswordFile)
+	if err != nil {
+		return err
 	}
 
 	// -host is dual-form: a bare name (e.g. "0-0") selects the host whose
@@ -151,6 +189,14 @@ func runConfig(args []string) error {
 		replicas[name] = cloudName
 	}
 
+	// Runtime user passwords: read each secret file and hash it here in
+	// the CLI layer — only the hex crosses into the request. A spec file
+	// with a checked-in password would be the exact leak this prevents.
+	userPasswordHashes, err := readUserPasswordHashes(userPasswords.values)
+	if err != nil {
+		return err
+	}
+
 	specData, err := os.ReadFile(specFile)
 	if err != nil {
 		return fmt.Errorf("read spec: %w", err)
@@ -160,7 +206,36 @@ func runConfig(args []string) error {
 	renderer := operator.NewConfigRenderer()
 	ctx := context.Background()
 
+	// Keeper-mode flags are meaningless against a CHI spec: refuse
+	// instead of silently ignoring (a CHI render has no <server_id>
+	// and no keeper single-file shape).
+	if !isKeeper {
+		if singleFile != "" {
+			return fmt.Errorf("-single-file applies to keeper mode only: add -keeper")
+		}
+		if serverID != 0 {
+			return fmt.Errorf("-server-id applies to keeper mode only: add -keeper")
+		}
+	}
+	if serverID < 0 {
+		return fmt.Errorf("-server-id must be positive, got %d", serverID)
+	}
+
 	if isKeeper {
+		if len(userPasswordHashes) > 0 {
+			return fmt.Errorf("-user-password is not applicable to a CHK spec (keeper installations carry no ClickHouse users)")
+		}
+		// A single-file render is host-complete — one keeper node's
+		// entire config — so a host must be selected.
+		if singleFile != "" && hostName == "" {
+			return fmt.Errorf("-single-file requires a keeper host: pass -host (name or name=address)")
+		}
+		// The server-id override targets the selected host's
+		// <server_id> section; without a host there is no section to
+		// shape.
+		if serverID != 0 && hostName == "" {
+			return fmt.Errorf("-server-id requires a keeper host: pass -host (name or name=address)")
+		}
 		cr, err := loader.LoadCHK(ctx, port.LoadCHKRequest{Spec: specRef})
 		if err != nil {
 			return err
@@ -180,6 +255,8 @@ func runConfig(args []string) error {
 			OutputDir:       outDir,
 			DryRun:          dryRun,
 			KeeperAddresses: keeperMap,
+			ServerID:        serverID,
+			SingleFilePath:  singleFile,
 		})
 		if err != nil {
 			return err
@@ -193,13 +270,16 @@ func runConfig(args []string) error {
 		return err
 	}
 	rendered, err := renderer.RenderCHI(ctx, port.RenderCHIRequest{
-		NormalizedCR: cr,
-		HostName:     hostName,
-		Hosts:        hosts,
-		Replicas:     replicas,
-		OutputDir:    outDir,
-		UsersDir:     usersDir,
-		DryRun:       dryRun,
+		NormalizedCR:   cr,
+		HostName:       hostName,
+		Hosts:          hosts,
+		Replicas:       replicas,
+		UserPasswords:  userPasswordHashes,
+		RemoteUser:     remoteUser,
+		RemotePassword: remotePassword,
+		OutputDir:      outDir,
+		UsersDir:       usersDir,
+		DryRun:         dryRun,
 	})
 	if err != nil {
 		return err
@@ -312,6 +392,59 @@ func (h *keeperAddrList) Set(value string) error {
 	return nil
 }
 
+// userPasswordList collects repeated -user-password name=path values.
+type userPasswordList struct {
+	values []string
+}
+
+// String implements flag.Value. Never includes file contents — only the
+// flag text the user already typed.
+func (u *userPasswordList) String() string { return strings.Join(u.values, ", ") }
+
+// Set implements flag.Value.
+func (u *userPasswordList) Set(value string) error {
+	u.values = append(u.values, value)
+	return nil
+}
+
+// readUserPasswordHashes reads each -user-password secret file and hashes
+// it to SHA-256 hex: name=path flag values in, name=hex out.
+//
+// Why hash in the app layer: password bytes must never cross the request
+// boundary into the domain — only the hex does. Trailing newline(s) are
+// trimmed first: cloud-init's `printf '%s\n'` writes one, and an
+// untrimmed hash would silently set a different password than the one
+// the stack stored.
+//
+// Without it: the password would have to live in the spec file as a
+// password_sha256_hex literal — a runtime secret in version control,
+// precisely what the cloud secret-store + per-role 600 files exist to
+// prevent. Error messages carry the file path (already known to the
+// operator), never the password bytes.
+func readUserPasswordHashes(entries []string) (map[string]string, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	hashes := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		name, path, ok := strings.Cut(entry, "=")
+		if !ok || name == "" || path == "" {
+			return nil, fmt.Errorf("-user-password %q must be name=path", entry)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("-user-password %s: read %s: %w", name, path, err)
+		}
+		password := strings.TrimRight(string(data), "\r\n")
+		if password == "" {
+			return nil, fmt.Errorf("-user-password %s: file %s is empty", name, path)
+		}
+		hash := sha256.Sum256([]byte(password))
+		hashes[name] = hex.EncodeToString(hash[:])
+	}
+	return hashes, nil
+}
+
 // replicaList collects repeated -replica name=cloudname values.
 type replicaList struct {
 	values []string
@@ -355,6 +488,49 @@ func parseRenderHosts(values []string) (hostName string, hosts []domain.HostIden
 		hostName = value
 	}
 	return hostName, hosts, nil
+}
+
+// readRemotePassword resolves the distributed-query password for the
+// config render from exactly one of -remote-password-env or
+// -remote-password-file.
+//
+// Why: the AWS stack's remote_servers entries need <user>/<password> for
+// peers to authenticate (the cluster-level <secret> is rejected by
+// ClickHouse 26.8), but the password may never sit in argv, the spec, or
+// a log line. Environment variable and file are the two secret-friendly
+// sources cloud-init and systemd both offer.
+//
+// Without it: every passwordless render leaves distributed queries
+// failing as "default" (PASSWORD_REQUIRED), or the password leaks into
+// shell history via argv. Error messages name the flag, never the value.
+func readRemotePassword(user, envVar, file string) (string, error) {
+	switch {
+	case user == "" && envVar == "" && file == "":
+		// No credentials requested — the backwards-compatible render.
+		return "", nil
+	case user == "":
+		return "", fmt.Errorf("-remote-password-env/-remote-password-file requires -remote-user")
+	case envVar != "" && file != "":
+		return "", fmt.Errorf("-remote-password-env and -remote-password-file are mutually exclusive")
+	case envVar != "":
+		password, ok := os.LookupEnv(envVar)
+		if !ok {
+			return "", fmt.Errorf("-remote-password-env: environment variable not set")
+		}
+		return password, nil
+	case file != "":
+		data, err := os.ReadFile(file)
+		if err != nil {
+			// No path echo: the flag value must not surface in errors —
+			// "cannot read" plus the flag name is enough to act on.
+			return "", fmt.Errorf("-remote-password-file: cannot read (missing or unreadable)")
+		}
+		return strings.TrimRight(string(data), "\r\n"), nil
+	default:
+		// -remote-user given with neither password source: without the
+		// password the pair would half-authenticate.
+		return "", fmt.Errorf("-remote-user requires -remote-password-env or -remote-password-file")
+	}
 }
 
 // portNetworkList collects repeated -network user=ip flag values.

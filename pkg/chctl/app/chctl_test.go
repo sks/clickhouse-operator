@@ -16,6 +16,12 @@ package app
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/xml"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -95,4 +101,316 @@ func TestParseRenderHosts(t *testing.T) {
 	require.ErrorContains(t, err, "name=address or a bare host name")
 	_, _, err = parseRenderHosts([]string{"0-0", "0-1"})
 	require.ErrorContains(t, err, "only one bare -host selector")
+}
+
+func TestReadRemotePasswordEnvSource(t *testing.T) {
+	// The env form: the value is read at render time, never argv.
+	t.Setenv("CHCTL_TEST_REMOTE_PW", "env-secret")
+	password, err := readRemotePassword("distuser", "CHCTL_TEST_REMOTE_PW", "")
+	require.NoError(t, err)
+	require.Equal(t, "env-secret", password)
+}
+
+func TestReadRemotePasswordFileSource(t *testing.T) {
+	// The file form: cloud-init writes the password to a root-only file;
+	// a trailing newline (echo >file) must not corrupt it.
+	path := filepath.Join(t.TempDir(), "remote.pw")
+	require.NoError(t, os.WriteFile(path, []byte("file-secret\n"), 0o600))
+	password, err := readRemotePassword("distuser", "", path)
+	require.NoError(t, err)
+	require.Equal(t, "file-secret", password)
+}
+
+func TestReadRemotePasswordNoFlags(t *testing.T) {
+	// Neither flag: the backwards-compatible no-credentials render.
+	password, err := readRemotePassword("", "", "")
+	require.NoError(t, err)
+	require.Empty(t, password)
+}
+
+func TestReadRemotePasswordUsageErrors(t *testing.T) {
+	// Both password sources at once: ambiguous, refuse.
+	_, err := readRemotePassword("u", "VAR", "file")
+	require.ErrorContains(t, err, "mutually exclusive")
+
+	// A password source without -remote-user: half a credential pair.
+	_, err = readRemotePassword("", "VAR", "")
+	require.ErrorContains(t, err, "requires -remote-user")
+	_, err = readRemotePassword("", "", "file")
+	require.ErrorContains(t, err, "requires -remote-user")
+
+	// -remote-user without any password source.
+	_, err = readRemotePassword("u", "", "")
+	require.ErrorContains(t, err, "requires -remote-password-env or -remote-password-file")
+
+	// An unset env var must fail the render (an empty password would
+	// half-authenticate against peers).
+	_, err = readRemotePassword("u", "CHCTL_TEST_UNSET_PW", "")
+	require.ErrorContains(t, err, "environment variable not set")
+
+	// A missing file must fail without echoing the path.
+	_, err = readRemotePassword("u", "", filepath.Join(t.TempDir(), "no-such.pw"))
+	require.ErrorContains(t, err, "cannot read")
+	require.NotContains(t, err.Error(), "no-such.pw", "flag value must not surface in errors")
+}
+
+func TestUsageMentionsRemoteCredentialFlags(t *testing.T) {
+	// The render command's credential flags must appear in the help
+	// (docs update is a separate todo).
+	var out bytes.Buffer
+	usageWith(&out)
+	require.Contains(t, out.String(), "-remote-user")
+	require.Contains(t, out.String(), "-remote-password-env")
+	require.Contains(t, out.String(), "-remote-password-file")
+}
+
+func TestUsageMentionsUserPasswordFlag(t *testing.T) {
+	// The users-group password injection flag must appear in the help
+	// (docs update is a separate todo).
+	var out bytes.Buffer
+	usageWith(&out)
+	require.Contains(t, out.String(), "[-user-password name=path]")
+	require.Contains(t, out.String(), "-user-password injects runtime passwords")
+}
+
+func TestUsageMentionsKeeperSingleFileFlags(t *testing.T) {
+	// The keeper-mode flags must appear in the help (docs update is a
+	// separate todo).
+	var out bytes.Buffer
+	usageWith(&out)
+	require.Contains(t, out.String(), "[-server-id <n>]")
+	require.Contains(t, out.String(), "[-single-file <path>]")
+	require.Contains(t, out.String(), "-single-file merges common+host sections")
+}
+
+func writeSpecFile(t *testing.T, spec string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "keeper.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(spec), 0o600))
+	return path
+}
+
+const appKeeperSpec = `apiVersion: clickhouse-keeper.altinity.com/v1
+kind: ClickHouseKeeperInstallation
+metadata:
+  name: keeper-flags
+spec:
+  configuration:
+    clusters:
+      - name: keeper
+        layout:
+          replicasCount: 1
+    settings:
+      keeper_server/tcp_port: "9181"
+`
+
+func TestRunConfigSingleFileRequiresHost(t *testing.T) {
+	// -single-file is host-complete: without -host the flag combination
+	// must be refused before any rendering runs.
+	spec := writeSpecFile(t, appKeeperSpec)
+	err := runConfig([]string{"render", "-spec", spec, "-keeper", "-single-file", "/x/keeper_config.xml"})
+	require.ErrorContains(t, err, "-single-file requires a keeper host")
+}
+
+func TestRunConfigServerIDRequiresHost(t *testing.T) {
+	// -server-id targets the selected host's <server_id> section: with
+	// no host there is nothing to shape — refuse early.
+	spec := writeSpecFile(t, appKeeperSpec)
+	err := runConfig([]string{"render", "-spec", spec, "-keeper", "-server-id", "1"})
+	require.ErrorContains(t, err, "-server-id requires a keeper host")
+}
+
+func TestRunConfigKeeperFlagsRequireKeeperMode(t *testing.T) {
+	// Against a CHI spec the keeper flags have no meaning: refuse
+	// rather than silently ignoring them.
+	spec := writeSpecFile(t, appKeeperSpec)
+	err := runConfig([]string{"render", "-spec", spec, "-single-file", "/x/keeper_config.xml"})
+	require.ErrorContains(t, err, "-single-file applies to keeper mode only")
+	err = runConfig([]string{"render", "-spec", spec, "-server-id", "1"})
+	require.ErrorContains(t, err, "-server-id applies to keeper mode only")
+}
+
+func TestRunConfigNegativeServerIDRejected(t *testing.T) {
+	// Keeper server ids are positive integers; a negative value would
+	// render an invalid <server_id> that keeper refuses at boot.
+	spec := writeSpecFile(t, appKeeperSpec)
+	err := runConfig([]string{"render", "-spec", spec, "-keeper", "-host", "0-0", "-server-id", "-1"})
+	require.ErrorContains(t, err, "-server-id must be positive")
+}
+
+func TestRunConfigSingleFileEndToEnd(t *testing.T) {
+	// The flag wiring end-to-end: -host + -server-id + -single-file
+	// produces ONE parsable file with the overridden server_id and the
+	// cloud-resolved raft entry — the shape the AWS stack's keeper
+	// units consume.
+	spec := writeSpecFile(t, appKeeperSpec)
+	singlePath := filepath.Join(t.TempDir(), "keeper_config.xml")
+	outDir := t.TempDir()
+
+	err := runConfig([]string{
+		"render",
+		"-spec", spec,
+		"-keeper",
+		"-host", "0-0",
+		"-keeper-address", "0-0=keeper-0.aws.internal",
+		"-server-id", "1",
+		"-single-file", singlePath,
+		"-out", outDir,
+	})
+	require.NoError(t, err)
+
+	data, err := os.ReadFile(singlePath)
+	require.NoError(t, err)
+	merged := string(data)
+
+	// Valid XML, one root.
+	require.Equal(t, 1, strings.Count(merged, "<clickhouse>"))
+	decoder := xml.NewDecoder(strings.NewReader(merged))
+	for {
+		_, err := decoder.Token()
+		if err == io.EOF {
+			break
+		}
+		require.NoError(t, err, "merged keeper_config.xml must be well-formed: %s", merged)
+	}
+
+	// The override wins over the CR's zero-based replica index.
+	require.Contains(t, merged, "<server_id>1</server_id>")
+	// The raft entry carries the cloud DNS name from the -host inventory.
+	require.Contains(t, merged, "<hostname>keeper-0.aws.internal</hostname>")
+	// And the client settings from the spec.
+	require.Contains(t, merged, "<tcp_port>9181</tcp_port>")
+
+	// -out stays empty: single-file mode skips it entirely.
+	entries, err := os.ReadDir(outDir)
+	require.NoError(t, err)
+	require.Empty(t, entries, "single-file mode must not write per-group files to -out")
+}
+
+func TestRunConfigOutDirRegression(t *testing.T) {
+	// No -single-file: the flag defaults keep the per-group render
+	// writing files to -out exactly as before the new flags existed.
+	spec := writeSpecFile(t, appKeeperSpec)
+	outDir := t.TempDir()
+
+	err := runConfig([]string{
+		"render",
+		"-spec", spec,
+		"-keeper",
+		"-host", "0-0",
+		"-out", outDir,
+	})
+	require.NoError(t, err)
+
+	// Per-group files land in -out with the CR-derived server_id.
+	entries, err := os.ReadDir(outDir)
+	require.NoError(t, err)
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	require.Contains(t, names, "chop-generated-server-id.xml")
+	require.Contains(t, names, "chop-generated-raft.xml")
+	require.Contains(t, names, "chop-generated-settings.xml")
+
+	data, err := os.ReadFile(filepath.Join(outDir, "chop-generated-server-id.xml"))
+	require.NoError(t, err)
+	require.Contains(t, string(data), "<server_id>0</server_id>",
+		"no -server-id flag: CR zero-based replica index must be kept")
+}
+
+func TestReadUserPasswordHashes(t *testing.T) {
+	// The trailing-newline trim: cloud-init writes with printf '%s\n',
+	// and hash("abc\n") != hash("abc") — an untrimmed hash silently sets
+	// a different password than the stack stored.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "admin.pw")
+	require.NoError(t, os.WriteFile(path, []byte("abc\n"), 0o600))
+
+	hashes, err := readUserPasswordHashes([]string{"admin=" + path})
+	require.NoError(t, err)
+
+	// Known vector: printf '%s' abc | sha256sum
+	expected := sha256.Sum256([]byte("abc"))
+	require.Equal(t, map[string]string{"admin": hex.EncodeToString(expected[:])}, hashes)
+
+	// A CRLF-terminated file (Windows-style secret plumbing) trims too.
+	require.NoError(t, os.WriteFile(path, []byte("abc\r\n"), 0o600))
+	hashes, err = readUserPasswordHashes([]string{"admin=" + path})
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{"admin": hex.EncodeToString(expected[:])}, hashes,
+		"trailing CR must be trimmed with the LF")
+}
+
+func TestReadUserPasswordHashesKnownVector(t *testing.T) {
+	// Hash correctness against the independent vector the task pinned:
+	// printf '%s' testpass | sha256sum → 13d249f2...9f6c.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "default.pw")
+	require.NoError(t, os.WriteFile(path, []byte("testpass\n"), 0o600))
+
+	hashes, err := readUserPasswordHashes([]string{"default=" + path})
+	require.NoError(t, err)
+	require.Equal(t,
+		"13d249f2cb4127b40cfa757866850278793f814ded3c587fe5889e889a7a9f6c",
+		hashes["default"])
+}
+
+func TestReadUserPasswordHashesRepeatable(t *testing.T) {
+	// Multiple entries: one hash per user, keyed by name.
+	dir := t.TempDir()
+	aPath := filepath.Join(dir, "a.pw")
+	bPath := filepath.Join(dir, "b.pw")
+	require.NoError(t, os.WriteFile(aPath, []byte("alpha\n"), 0o600))
+	require.NoError(t, os.WriteFile(bPath, []byte("beta"), 0o600))
+
+	hashes, err := readUserPasswordHashes([]string{"default=" + aPath, "writer=" + bPath})
+	require.NoError(t, err)
+	require.Len(t, hashes, 2)
+
+	hashA := sha256.Sum256([]byte("alpha"))
+	hashB := sha256.Sum256([]byte("beta"))
+	require.Equal(t, hex.EncodeToString(hashA[:]), hashes["default"])
+	require.Equal(t, hex.EncodeToString(hashB[:]), hashes["writer"])
+}
+
+func TestReadUserPasswordHashesUsageErrors(t *testing.T) {
+	// Malformed entries are usage errors, not silent skips.
+	_, err := readUserPasswordHashes([]string{"no-equals-sign"})
+	require.ErrorContains(t, err, "must be name=path")
+	_, err = readUserPasswordHashes([]string{"=path"})
+	require.ErrorContains(t, err, "must be name=path")
+	_, err = readUserPasswordHashes([]string{"name="})
+	require.ErrorContains(t, err, "must be name=path")
+
+	// An unreadable file fails the whole render — never a partial silent
+	// render where some users keep the spec password while the operator
+	// believes the secret-file password is live.
+	_, err = readUserPasswordHashes([]string{"admin=" + filepath.Join(t.TempDir(), "missing.pw")})
+	require.ErrorContains(t, err, "read")
+	require.ErrorContains(t, err, "admin", "the error names the user, for cross-referencing the flag entry")
+
+	// An empty file is refused: hashing "" would lock the account with a
+	// password nobody knows, silently.
+	emptyPath := filepath.Join(t.TempDir(), "empty.pw")
+	require.NoError(t, os.WriteFile(emptyPath, []byte("\n"), 0o600))
+	_, err = readUserPasswordHashes([]string{"admin=" + emptyPath})
+	require.ErrorContains(t, err, "empty")
+}
+
+func TestReadUserPasswordHashesNeverEchoesBytes(t *testing.T) {
+	// Secrets hygiene: after a password has been read into memory, a
+	// later entry's failure must not echo it — the error surface stays
+	// names and paths only.
+	dir := t.TempDir()
+	goodPath := filepath.Join(dir, "good.pw")
+	require.NoError(t, os.WriteFile(goodPath, []byte("super-secret\n"), 0o600))
+	bad := "admin=" + filepath.Join(dir, "missing.pw")
+
+	// The readable file is processed first, so the password bytes are
+	// in memory when the error for the missing file is built.
+	_, err := readUserPasswordHashes([]string{"writer=" + goodPath, bad})
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "super-secret",
+		"password bytes never appear in error messages")
 }

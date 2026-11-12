@@ -78,6 +78,25 @@ type RenderCHIRequest struct {
 	// keep the operator name — Keeper replica paths and per-replica
 	// S3 prefixes on existing clusters encode this identity.
 	Replicas map[string]string
+	// UserPasswords injects runtime password hashes into the
+	// users-group render: user name → SHA-256 hex. The app layer reads
+	// the secret files and hashes them BEFORE this boundary, so only
+	// the hex crosses it — password bytes never reach the domain.
+	// Each entry overrides any password/password_sha256_hex the spec
+	// carries for that user; a user the spec does not declare is a
+	// hard error (typo guard).
+	UserPasswords map[string]string
+	// RemoteUser is the ClickHouse user distributed queries
+	// authenticate as. When non-empty (with RemotePassword), every
+	// remote_servers <replica> entry gains <user>/<password> children —
+	// without them peers reject distributed queries as passwordless
+	// "default" (PASSWORD_REQUIRED). Empty keeps the generator's
+	// output untouched (backwards compatible).
+	RemoteUser string
+	// RemotePassword authenticates RemoteUser on distributed queries.
+	// It is read at render time from an env var or file (never argv,
+	// never the spec) and lands XML-escaped in remote_servers.xml only.
+	RemotePassword string
 	// OutputDir is the directory files are written to.
 	OutputDir string
 	// UsersDir overrides the output directory for the users group when
@@ -105,6 +124,18 @@ type RenderCHKRequest struct {
 	// for raft server entries; empty keeps the operator's k8s-pattern
 	// names (parity with on-cluster rendering).
 	KeeperAddresses map[string]string
+	// ServerID overrides the rendered <keeper_server/server_id> for the
+	// selected host. Cloud stacks persist keeper identity outside the CR
+	// (e.g. a myid file on the keeper disk, 1-based); the CR's zero-based
+	// replica index must not clobber it. Zero keeps the CR-derived value.
+	// No effect without SingleFilePath.
+	ServerID int
+	// SingleFilePath, when non-empty, makes the renderer skip -out
+	// writing and instead write ONE complete <clickhouse>-rooted file
+	// (common + host sections merged) to this path — the shape
+	// clickhouse-keeper needs when launched with an explicit --config
+	// file, which disables the config.d auto-include. Requires HostName.
+	SingleFilePath string
 }
 
 // RenderedFile is one rendered configuration file.

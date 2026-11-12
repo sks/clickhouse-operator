@@ -664,6 +664,288 @@ spec:
 		"-host inventory must resolve raft hostnames")
 }
 
+// keeperSpec is the CHK spec shape the off-cluster stack renders: a
+// 3-keeper fleet with client settings and a logger files section.
+const keeperSingleFileSpec = `
+apiVersion: clickhouse-keeper.altinity.com/v1
+kind: ClickHouseKeeperInstallation
+metadata:
+  name: keeper-single
+spec:
+  configuration:
+    clusters:
+      - name: keeper
+        layout:
+          replicasCount: 3
+    settings:
+      keeper_server/tcp_port: "9181"
+      keeper_server/listen_host: "0.0.0.0"
+    files:
+      keeper-logging.xml: |
+        <clickhouse>
+            <logger>
+                <level>information</level>
+                <log>/var/log/clickhouse-keeper/clickhouse-keeper.log</log>
+            </logger>
+        </clickhouse>
+`
+
+// loadCHKFromSpec runs the SpecLoader over a CHK spec body.
+func loadCHKFromSpec(t *testing.T, spec string) any {
+	t.Helper()
+	crAny, err := NewSpecLoader().LoadCHK(context.Background(), port.LoadCHKRequest{
+		Spec: domain.SpecReference{Data: []byte(spec)},
+	})
+	require.NoError(t, err)
+	return crAny
+}
+
+// keeperInventory is the 3-node cloud inventory the single-file tests use.
+var keeperInventory = []domain.HostIdentity{
+	{Name: "0-0", Address: "keeper-0.aws.internal"},
+	{Name: "0-1", Address: "keeper-1.aws.internal"},
+	{Name: "0-2", Address: "keeper-2.aws.internal"},
+}
+
+// requireWellFormedXML asserts the document parses as XML.
+func requireWellFormedXML(t *testing.T, doc string) {
+	t.Helper()
+	decoder := xml.NewDecoder(strings.NewReader(doc))
+	for {
+		_, err := decoder.Token()
+		if err == io.EOF {
+			return
+		}
+		require.NoError(t, err, "malformed XML: %s", doc)
+	}
+}
+
+func TestRenderCHKSingleFileMerge(t *testing.T) {
+	// The AWS stack runs clickhouse-keeper with an explicit
+	// --config=keeper_config.xml, which DISABLES the config.d
+	// auto-include — the node needs ONE complete file: raft config,
+	// listeners, settings and the logger, everything the common+host
+	// groups produce, under one root.
+	cr := loadCHKFromSpec(t, keeperSingleFileSpec)
+	outDir := t.TempDir()
+	singlePath := filepath.Join(outDir, "keeper_config.xml")
+
+	rendered, err := NewConfigRenderer().RenderCHK(context.Background(), port.RenderCHKRequest{
+		NormalizedCR:   cr,
+		HostName:       "0-0",
+		OutputDir:      outDir,
+		Hosts:          keeperInventory,
+		ServerID:       1,
+		SingleFilePath: singlePath,
+	})
+	require.NoError(t, err)
+
+	// The merged artifact is returned as its own entry for inspection.
+	var merged string
+	for _, f := range rendered {
+		if f.Group == "single" {
+			merged = f.Content
+		}
+	}
+	require.NotEmpty(t, merged, "single-file render must return the merged content")
+
+	// ONE <clickhouse> root, valid XML.
+	require.Equal(t, 1, strings.Count(merged, "<clickhouse>"))
+	requireWellFormedXML(t, merged)
+
+	// Exactly one <server_id> — the myid-file override, not the CR's
+	// zero-based replica index.
+	require.Equal(t, 1, strings.Count(merged, "<server_id>"))
+	require.Contains(t, merged, "<server_id>1</server_id>")
+	require.NotContains(t, merged, "<server_id>0</server_id>")
+
+	// The full raft <server> list with cloud DNS names (pinned from
+	// ebc4625 — the single-file merge must not lose or collapse it).
+	require.Equal(t, 3, strings.Count(merged, "<server>"))
+	require.Contains(t, merged, "<hostname>keeper-0.aws.internal</hostname>")
+	require.Contains(t, merged, "<hostname>keeper-1.aws.internal</hostname>")
+	require.Contains(t, merged, "<hostname>keeper-2.aws.internal</hostname>")
+	require.NotContains(t, merged, "svc.cluster.local")
+
+	// Every section a keeper needs to boot from the single file: client
+	// settings, listeners and the logger from the CR's files section.
+	require.Contains(t, merged, "<tcp_port>9181</tcp_port>")
+	require.Contains(t, merged, "<listen_host>0.0.0.0</listen_host>")
+	require.Contains(t, merged, "<logger>")
+
+	// The file is on disk at the requested path, byte-identical to the
+	// returned content.
+	data, err := os.ReadFile(singlePath)
+	require.NoError(t, err)
+	require.Equal(t, merged, string(data))
+
+	// Single-file mode skips -out writing entirely.
+	entries, err := os.ReadDir(outDir)
+	require.NoError(t, err)
+	for _, e := range entries {
+		if e.Name() != "keeper_config.xml" {
+			t.Fatalf("single-file mode must not write per-group files to -out, found %s", e.Name())
+		}
+	}
+}
+
+func TestRenderCHKSingleFileWithoutServerIDKeepsCRIndex(t *testing.T) {
+	// -server-id 0/unset keeps the CR-derived replica index — the
+	// override is opt-in, never a silent renumbering.
+	cr := loadCHKFromSpec(t, keeperSingleFileSpec)
+	rendered, err := NewConfigRenderer().RenderCHK(context.Background(), port.RenderCHKRequest{
+		NormalizedCR:   cr,
+		HostName:       "0-0",
+		OutputDir:      t.TempDir(),
+		Hosts:          keeperInventory,
+		SingleFilePath: filepath.Join(t.TempDir(), "keeper_config.xml"),
+	})
+	require.NoError(t, err)
+	var merged string
+	for _, f := range rendered {
+		if f.Group == "single" {
+			merged = f.Content
+		}
+	}
+	require.Contains(t, merged, "<server_id>0</server_id>",
+		"no override: CR zero-based replica index must be kept")
+}
+
+func TestRenderCHKSingleFileRequiresHost(t *testing.T) {
+	// The single file is host-complete (it carries <server_id>): without
+	// a host selection there is no such thing as "this node's" file.
+	cr := loadCHKFromSpec(t, keeperSingleFileSpec)
+	_, err := NewConfigRenderer().RenderCHK(context.Background(), port.RenderCHKRequest{
+		NormalizedCR:   cr,
+		OutputDir:      t.TempDir(),
+		Hosts:          keeperInventory,
+		SingleFilePath: filepath.Join(t.TempDir(), "keeper_config.xml"),
+	})
+	require.ErrorContains(t, err, "requires a keeper host")
+}
+
+func TestRenderCHKSingleFileDryRunSkipsWrite(t *testing.T) {
+	// DryRun means no writes at all — the merged content is returned
+	// but the file does not land on disk.
+	cr := loadCHKFromSpec(t, keeperSingleFileSpec)
+	singlePath := filepath.Join(t.TempDir(), "keeper_config.xml")
+	rendered, err := NewConfigRenderer().RenderCHK(context.Background(), port.RenderCHKRequest{
+		NormalizedCR:   cr,
+		HostName:       "0-0",
+		OutputDir:      t.TempDir(),
+		Hosts:          keeperInventory,
+		DryRun:         true,
+		SingleFilePath: singlePath,
+	})
+	require.NoError(t, err)
+	var merged string
+	for _, f := range rendered {
+		if f.Group == "single" {
+			merged = f.Content
+		}
+	}
+	require.NotEmpty(t, merged)
+	require.NoFileExists(t, singlePath, "dry-run must not write the single file")
+}
+
+func TestRenderCHKOutDirUnchangedBySingleFileFlags(t *testing.T) {
+	// Regression: without -single-file, the per-group render (files,
+	// groups, content) must stay byte-identical to the pre-flag output —
+	// the new flags may not perturb the existing path.
+	cr := loadCHKFromSpec(t, keeperSingleFileSpec)
+
+	a := renderCHKFiles(t, port.RenderCHKRequest{
+		NormalizedCR: cr,
+		HostName:     "0-0",
+		OutputDir:    t.TempDir(),
+		DryRun:       true,
+		Hosts:        keeperInventory,
+	})
+	b := renderCHKFiles(t, port.RenderCHKRequest{
+		NormalizedCR: cr,
+		HostName:     "0-1",
+		OutputDir:    t.TempDir(),
+		DryRun:       true,
+		Hosts:        keeperInventory,
+	})
+	// Host 0-1: its own server-id section (index 1), the same common files.
+	require.Contains(t, b["chop-generated-server-id.xml"], "<server_id>1</server_id>")
+	require.Equal(t, a["chop-generated-raft.xml"], b["chop-generated-raft.xml"],
+		"common raft file must be identical across hosts")
+	require.Contains(t, a["chop-generated-server-id.xml"], "<server_id>0</server_id>")
+}
+
+// TestRenderCHKOutDirBytes pins the per-group output byte-for-byte: the
+// -server-id/-single-file flags may not perturb the original render path.
+// Golden bytes captured from the ebc4625 output.
+func TestRenderCHKOutDirBytes(t *testing.T) {
+	cr := loadCHKFromSpec(t, keeperSingleFileSpec)
+	files := renderCHKFiles(t, port.RenderCHKRequest{
+		NormalizedCR: cr,
+		HostName:     "0-0",
+		OutputDir:    t.TempDir(),
+		DryRun:       true,
+		Hosts:        keeperInventory,
+	})
+
+	require.Equal(t, map[string]string{
+		"chop-generated-raft.xml": `<clickhouse>
+    <keeper_server>
+        <raft_configuration>
+            <server>
+                <id>0</id>
+                <hostname>keeper-0.aws.internal</hostname>
+                <port>9444</port>
+            </server>
+            <server>
+                <id>1</id>
+                <hostname>keeper-1.aws.internal</hostname>
+                <port>9444</port>
+            </server>
+            <server>
+                <id>2</id>
+                <hostname>keeper-2.aws.internal</hostname>
+                <port>9444</port>
+            </server>
+        </raft_configuration>
+    </keeper_server>
+</clickhouse>
+`,
+		"chop-generated-server-id.xml": `<clickhouse>
+    <keeper_server>
+        <server_id>0</server_id>
+    </keeper_server>
+</clickhouse>
+`,
+		"chop-generated-settings.xml": `<clickhouse>
+    <keeper_server>
+        <listen_host>0.0.0.0</listen_host>
+        <tcp_port>9181</tcp_port>
+    </keeper_server>
+</clickhouse>
+`,
+		"keeper-logging.xml": `<clickhouse>
+    <logger>
+        <level>information</level>
+        <log>/var/log/clickhouse-keeper/clickhouse-keeper.log</log>
+    </logger>
+</clickhouse>
+`,
+	}, files)
+}
+
+// renderCHKFiles runs a dry render and maps file path → content.
+func renderCHKFiles(t *testing.T, request port.RenderCHKRequest) map[string]string {
+	t.Helper()
+	rendered, err := NewConfigRenderer().RenderCHK(context.Background(), request)
+	require.NoError(t, err)
+	files := make(map[string]string, len(rendered))
+	for _, f := range rendered {
+		files[f.Path] = f.Content
+	}
+	return files
+}
+
 func TestSchemaRunnerHostResolvesCloudName(t *testing.T) {
 	// The real stack's inventory keys are CR ordinals (0-2) with cloud
 	// DNS addresses (reader-3.aws.internal); the GC detects system.replicas
@@ -699,4 +981,341 @@ func TestSchemaRunnerDropReplicaUnknownHost(t *testing.T) {
 		RunOn:    "writer-0",
 	})
 	require.ErrorContains(t, err, "not in inventory")
+}
+
+// userPasswordSpec is the shared fixture for user-password injection
+// tests: a spec declaring `admin` with a plaintext password (the
+// hand-migrated-spec case the injection must win over) plus a second
+// user to prove non-injected users pass through untouched.
+const userPasswordSpec = `
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: pw-inject
+spec:
+  configuration:
+    users:
+      admin/profile: default
+      admin/quota: default
+      admin/access_management: "1"
+      admin/password: "specpass"
+      writer/profile: ingest
+`
+
+// loadUserPasswordCHI loads the shared injection fixture.
+func loadUserPasswordCHI(t *testing.T) *v1.ClickHouseInstallation {
+	t.Helper()
+	loader := NewSpecLoader()
+	crAny, err := loader.LoadCHI(context.Background(), port.LoadCHIRequest{
+		Spec: domain.SpecReference{Data: []byte(userPasswordSpec)},
+	})
+	require.NoError(t, err)
+	cr, ok := crAny.(*v1.ClickHouseInstallation)
+	require.True(t, ok, "loader returned non-CHI")
+	return cr
+}
+
+// hashOf returns the sha256 hex of s — the same value the app layer's
+// readUserPasswordHashes produces for a file containing s.
+func hashOf(t *testing.T, s string) string {
+	t.Helper()
+	hash := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(hash[:])
+}
+
+// usersXML renders the users-group files of the given request, keyed by
+// file name.
+func usersXML(t *testing.T, request port.RenderCHIRequest) map[string]string {
+	t.Helper()
+	files := renderCHIFiles(t, request)
+	users := make(map[string]string, 1)
+	for name, content := range files {
+		if strings.Contains(name, "users") {
+			users[name] = content
+		}
+	}
+	require.NotEmpty(t, users, "users-group files must render")
+	return users
+}
+
+// TestConfigRendererUserPasswordInjectionOverridesSpec asserts the core
+// fix: the injected runtime hash replaces every spec-carried password
+// for that user, the spec's own fields pass through, and non-injected
+// users keep the normalizer's output untouched.
+func TestConfigRendererUserPasswordInjectionOverridesSpec(t *testing.T) {
+	cr := loadUserPasswordCHI(t)
+	injected := hashOf(t, "testpass")
+
+	files := usersXML(t, port.RenderCHIRequest{
+		NormalizedCR:  cr,
+		UserPasswords: map[string]string{"admin": injected},
+	})
+	xmlBody := files["chop-generated-users.xml"]
+
+	// The injected hash wins over the spec's plaintext password (which
+	// the normalizer would have hashed itself at load time).
+	require.Contains(t, xmlBody, "<password_sha256_hex>"+injected+"</password_sha256_hex>")
+	require.NotContains(t, xmlBody, hashOf(t, "specpass"),
+		"the spec-derived hash must be replaced by the injected one")
+	require.NotContains(t, xmlBody, "specpass",
+		"the plaintext must never appear, not even as a hash pre-image")
+
+	// The spec still owns the non-secret fields — chctl only supplies
+	// the hash.
+	require.Contains(t, xmlBody, "<access_management>1</access_management>")
+	require.Contains(t, xmlBody, "<profile>default</profile>")
+
+	// Non-injected users pass through the normalizer untouched.
+	require.Contains(t, xmlBody, "<profile>ingest</profile>")
+
+	// A custom user gets no remove-stub: stock users.xml has no <password>
+	// element for it, matching the operator's own removePlainPassword
+	// (default-only) discipline.
+	require.NotContains(t, xmlBody, "remove=")
+}
+
+// TestConfigRendererUserPasswordDoesNotLeakIntoLaterRenders asserts the
+// deep-copy invariant: the shared CR is rendered again in the same
+// process (host group, subsequent renders), so an injected hash must
+// never leak into a render that did not request it.
+func TestConfigRendererUserPasswordDoesNotLeakIntoLaterRenders(t *testing.T) {
+	cr := loadUserPasswordCHI(t)
+	injected := hashOf(t, "testpass")
+
+	// First render: injection on.
+	_, err := NewConfigRenderer().RenderCHI(context.Background(), port.RenderCHIRequest{
+		NormalizedCR:  cr,
+		OutputDir:     t.TempDir(),
+		DryRun:        true,
+		UserPasswords: map[string]string{"admin": injected},
+	})
+	require.NoError(t, err)
+
+	// Second render, same CR: no injection requested — the spec's own
+	// (normalizer-derived) hash must be back, the injected one gone.
+	files := usersXML(t, port.RenderCHIRequest{NormalizedCR: cr})
+	xmlBody := files["chop-generated-users.xml"]
+	require.NotContains(t, xmlBody, injected,
+		"in-place mutation of the shared CR would leak the injected hash across renders")
+	require.Contains(t, xmlBody, hashOf(t, "specpass"),
+		"the CR's own spec must survive injection renders byte-for-byte")
+}
+
+// TestConfigRendererUserPasswordUnknownUserRejected asserts the typo
+// guard: a -user-password entry naming a user the spec does not declare
+// is a hard error listing the known users — never a silent partial
+// render where the account keeps a stale credential while the operator
+// believes the secret-file password is live.
+func TestConfigRendererUserPasswordUnknownUserRejected(t *testing.T) {
+	cr := loadUserPasswordCHI(t)
+
+	_, err := NewConfigRenderer().RenderCHI(context.Background(), port.RenderCHIRequest{
+		NormalizedCR:  cr,
+		OutputDir:     t.TempDir(),
+		DryRun:        true,
+		UserPasswords: map[string]string{"admi": hashOf(t, "testpass")},
+	})
+	require.ErrorContains(t, err, `"admi"`)
+	require.ErrorContains(t, err, "not declared by the spec")
+	require.ErrorContains(t, err, "admin", "the error must list the spec's known users (typo cross-reference)")
+	require.ErrorContains(t, err, "writer")
+}
+
+// TestConfigRendererUserPasswordDefaultBlanksStockPassword asserts
+// operator parity for the one user stock users.xml ships with a
+// <password> element: the injected hash must arrive with the
+// remove="1" stub or the base-file credential survives the users.d
+// merge.
+func TestConfigRendererUserPasswordDefaultBlanksStockPassword(t *testing.T) {
+	cr := loadUserPasswordCHI(t)
+	injected := hashOf(t, "testpass")
+
+	files := usersXML(t, port.RenderCHIRequest{
+		NormalizedCR:  cr,
+		UserPasswords: map[string]string{"default": injected},
+	})
+	xmlBody := files["chop-generated-users.xml"]
+
+	require.Contains(t, xmlBody, `<password remove="1"></password>`,
+		"default user must blank the stock <password> element (removePlainPassword parity)")
+	require.Contains(t, xmlBody, "<password_sha256_hex>"+injected+"</password_sha256_hex>")
+
+	// The injected user's spec fields are untouched by injection for
+	// other users.
+	require.Contains(t, xmlBody, "<access_management>1</access_management>")
+}
+
+// TestConfigRendererUserPasswordDoubleSHA1SpecOverridden asserts the
+// ClickHouse priority order is respected: a spec-declared
+// password_double_sha1_hex (which ClickHouse ranks above
+// password_sha256_hex) is stripped so the injected hash is the only
+// credential on the account.
+func TestConfigRendererUserPasswordDoubleSHA1SpecOverridden(t *testing.T) {
+	spec := []byte(`
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: pw-double-sha1
+spec:
+  configuration:
+    users:
+      admin/profile: default
+      admin/password_double_sha1_hex: "aaaa"
+`)
+	loader := NewSpecLoader()
+	crAny, err := loader.LoadCHI(context.Background(), port.LoadCHIRequest{
+		Spec: domain.SpecReference{Data: spec},
+	})
+	require.NoError(t, err)
+
+	injected := hashOf(t, "testpass")
+	files := usersXML(t, port.RenderCHIRequest{
+		NormalizedCR:  crAny,
+		UserPasswords: map[string]string{"admin": injected},
+	})
+	xmlBody := files["chop-generated-users.xml"]
+
+	require.Contains(t, xmlBody, "<password_sha256_hex>"+injected+"</password_sha256_hex>")
+	require.NotContains(t, xmlBody, "password_double_sha1_hex",
+		"a leftover double-sha1 spec would out-rank the injected hash")
+}
+
+// TestConfigRendererUserPasswordNoFlagUnchanged asserts backwards
+// compatibility: without UserPasswords the users-group render is the
+// operator-native output (no injected hash, no remove stub) — the
+// pre-feature behavior byte-for-byte.
+func TestConfigRendererUserPasswordNoFlagUnchanged(t *testing.T) {
+	cr := loadUserPasswordCHI(t)
+
+	files := usersXML(t, port.RenderCHIRequest{NormalizedCR: cr})
+	xmlBody := files["chop-generated-users.xml"]
+
+	require.Contains(t, xmlBody, hashOf(t, "specpass"),
+		"no flag: the normalizer's own hash of the spec password must stay")
+	require.NotContains(t, xmlBody, "remove=", "no flag: no injection stubs may appear")
+}
+
+// countReplicaEntries counts the <replica> blocks the rendered
+// remote_servers.xml carries (user-specified plus autogenerated clusters).
+func countReplicaEntries(t *testing.T, remote string) int {
+	t.Helper()
+	require.Contains(t, remote, "<remote_servers>", "remote_servers.xml must render")
+	return strings.Count(remote, "<replica>")
+}
+
+// parseXMLTokens asserts the XML is well-formed via a real decode —
+// escaping bugs corrupt remote_servers and the server rejects the whole
+// file at startup (the users.xml Tag-mismatch finding class).
+func parseXMLTokens(t *testing.T, content string) {
+	t.Helper()
+	decoder := xml.NewDecoder(strings.NewReader(content))
+	for {
+		if _, err := decoder.Token(); err == io.EOF {
+			return
+		} else {
+			require.NoError(t, err, "malformed XML: %s", content)
+		}
+	}
+}
+
+// TestConfigRendererRemoteCredentialsInjected asserts the core fix: with
+// remote credentials every <replica> entry — user-specified AND
+// autogenerated clusters — carries <user>/<password>, XML-escaped.
+// Without them peers reject distributed queries as passwordless
+// "default" (PASSWORD_REQUIRED).
+func TestConfigRendererRemoteCredentialsInjected(t *testing.T) {
+	cr := loadCHIFromFile(t, "ch-int-dev", "")
+	password := `p&w<>"'`
+
+	files := renderCHIFiles(t, port.RenderCHIRequest{
+		NormalizedCR:   cr,
+		HostName:       "0-0",
+		RemoteUser:     "distwriter",
+		RemotePassword: password,
+	})
+
+	remote := files["chop-generated-remote_servers.xml"]
+	replicas := countReplicaEntries(t, remote)
+
+	require.Equal(t, replicas, strings.Count(remote, "<user>distwriter</user>"),
+		"every <replica> must carry the remote user")
+	require.Equal(t, replicas, strings.Count(remote, "<password>p&amp;w&lt;&gt;&#34;&#39;</password>"),
+		"every <replica> must carry the XML-escaped password")
+	require.NotContains(t, remote, password, "the raw password must never appear unescaped")
+	parseXMLTokens(t, remote)
+}
+
+// TestConfigRendererRemoteCredentialsEscapeTable pins the exact escaping
+// for the five XML-significant characters — the generator's own
+// getRemoteServersClusterSecret escapes with encoding/xml and chctl must
+// match byte-for-byte.
+func TestConfigRendererRemoteCredentialsEscapeTable(t *testing.T) {
+	cr := loadCHIFromFile(t, "ch-int-dev", "")
+
+	files := renderCHIFiles(t, port.RenderCHIRequest{
+		NormalizedCR:   cr,
+		RemoteUser:     "u&1",
+		RemotePassword: "<>&\"'",
+	})
+
+	remote := files["chop-generated-remote_servers.xml"]
+	require.Contains(t, remote, "<user>u&amp;1</user>")
+	require.Contains(t, remote, "<password>&lt;&gt;&amp;&#34;&#39;</password>")
+	parseXMLTokens(t, remote)
+}
+
+// TestConfigRendererNoRemoteCredentialsUnchanged asserts backwards
+// compatibility: no credentials in the request, no <user>/<password> in
+// the output — the pre-credentials render byte-for-byte.
+func TestConfigRendererNoRemoteCredentialsUnchanged(t *testing.T) {
+	cr := loadCHIFromFile(t, "ch-int-dev", "")
+
+	files := renderCHIFiles(t, port.RenderCHIRequest{
+		NormalizedCR: cr,
+		HostName:     "0-0",
+	})
+
+	remote := files["chop-generated-remote_servers.xml"]
+	require.NotContains(t, remote, "<user>", "no credentials: no <user> element")
+	require.NotContains(t, remote, "<password>", "no credentials: no <password> element")
+}
+
+// TestConfigRendererRemotePasswordWithoutUserRejected asserts the port
+// guard: the renderer is callable without the app's flag validation, so
+// a password-only request must fail loudly rather than silently render
+// credentials-free XML.
+func TestConfigRendererRemotePasswordWithoutUserRejected(t *testing.T) {
+	cr := loadCHIFromFile(t, "ch-int-dev", "")
+
+	_, err := NewConfigRenderer().RenderCHI(context.Background(), port.RenderCHIRequest{
+		NormalizedCR:   cr,
+		RemotePassword: "orphan",
+		OutputDir:      t.TempDir(),
+		DryRun:         true,
+	})
+	require.ErrorContains(t, err, "RemotePassword set without RemoteUser")
+}
+
+// TestConfigRendererRemoteCredentialsWritten0640 asserts the secrets
+// hygiene follow-through: remote_servers.xml carrying a password lands
+// 0640 (group-readable at most), never world-readable.
+func TestConfigRendererRemoteCredentialsWritten0640(t *testing.T) {
+	cr := loadCHIFromFile(t, "ch-int-dev", "")
+	outDir := t.TempDir()
+
+	rendered, err := NewConfigRenderer().RenderCHI(context.Background(), port.RenderCHIRequest{
+		NormalizedCR:   cr,
+		HostName:       "0-0",
+		RemoteUser:     "distwriter",
+		RemotePassword: "sekret",
+		OutputDir:      outDir,
+	})
+	require.NoError(t, err)
+
+	for _, file := range rendered {
+		info, err := os.Stat(filepath.Join(outDir, filepath.Base(file.Path)))
+		require.NoError(t, err)
+		require.Equal(t, os.FileMode(0o640), info.Mode().Perm(),
+			"%s must be 0640", file.Path)
+	}
 }

@@ -15,11 +15,15 @@
 package operator
 
 import (
+	"bytes"
 	"context"
+	"encoding/xml"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	chk "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse-keeper.altinity.com/v1"
 	v1 "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse.altinity.com/v1"
@@ -74,7 +78,15 @@ func (r *ConfigRenderer) RenderCHI(ctx context.Context, request port.RenderCHIRe
 	if addresses := hostInventory(request.Hosts); len(addresses) > 0 || len(request.Replicas) > 0 {
 		namer = newCloudNamer(addresses).withReplicas(request.Replicas)
 	}
-	gen := chiConfig.NewGenerator(cr, namer, chiGeneratorOptions(cr))
+	genOpts := chiGeneratorOptions(cr)
+	if len(request.UserPasswords) > 0 {
+		users, err := injectUserPasswords(genOpts.Users, request.UserPasswords)
+		if err != nil {
+			return nil, err
+		}
+		genOpts.Users = users
+	}
+	gen := chiConfig.NewGenerator(cr, namer, genOpts)
 	genDomain := chiConfig.NewFilesGeneratorDomain(gen)
 	filesGenerator := chiConfig.NewFilesGenerator(gen, chop.Config().ClickHouse.Config.File.Runtime, genDomain)
 
@@ -82,6 +94,21 @@ func (r *ConfigRenderer) RenderCHI(ctx context.Context, request port.RenderCHIRe
 
 	commonFiles := filesGenerator.CreateConfigFiles(interfaces.FilesGroupCommon, chiConfig.NewFilesGeneratorOptions())
 	rendered = append(rendered, toRenderedFiles("common", commonFiles)...)
+
+	// Per-replica distributed-query credentials are a chctl-only
+	// concern: the operator's generator has no <user>/<password> support
+	// (its cluster-level <secret> element is rejected by ClickHouse
+	// 26.8), so the pair is spliced into the already-rendered
+	// remote_servers.xml instead of threading a new option through the
+	// shared generator.
+	if request.RemoteUser != "" || request.RemotePassword != "" {
+		if request.RemoteUser == "" {
+			return nil, fmt.Errorf("RemotePassword set without RemoteUser")
+		}
+		if err := injectReplicaCredentials(rendered, request.RemoteUser, request.RemotePassword); err != nil {
+			return nil, err
+		}
+	}
 
 	usersFiles := filesGenerator.CreateConfigFiles(interfaces.FilesGroupUsers)
 	rendered = append(rendered, toRenderedFiles("users", usersFiles)...)
@@ -110,6 +137,13 @@ func (r *ConfigRenderer) RenderCHI(ctx context.Context, request port.RenderCHIRe
 // Why: keeper nodes need identical config discipline (raft, TLS,
 // prometheus endpoint); reusing the keeper generator keeps keeper configs
 // on the same single-source footing.
+//
+// Single-file mode: when request.SingleFilePath is set, no per-group
+// files are written to OutputDir — instead the common and host sections
+// merge into ONE complete <clickhouse>-rooted document at the given
+// path. Cloud stacks run clickhouse-keeper with an explicit
+// --config=keeper_config.xml, which disables the config.d auto-include;
+// those nodes need the whole configuration in a single file.
 func (r *ConfigRenderer) RenderCHK(ctx context.Context, request port.RenderCHKRequest) ([]port.RenderedFile, error) {
 	bootstrapChop()
 
@@ -136,14 +170,47 @@ func (r *ConfigRenderer) RenderCHK(ctx context.Context, request port.RenderCHKRe
 	commonFiles := filesGenerator.CreateConfigFiles(interfaces.FilesGroupCommon, chkConfig.NewFilesGeneratorOptions())
 	rendered = append(rendered, toRenderedFiles("common", commonFiles)...)
 
+	var host *v1.Host
 	if request.HostName != "" {
-		host, err := findKeeperHost(cr, request.HostName)
+		var err error
+		host, err = findKeeperHost(cr, request.HostName)
 		if err != nil {
 			return nil, err
 		}
 		hostOptions := chkConfig.NewFilesGeneratorOptions().SetHost(host)
 		hostFiles := filesGenerator.CreateConfigFiles(interfaces.FilesGroupHost, hostOptions)
 		rendered = append(rendered, toRenderedFiles("host", hostFiles)...)
+	}
+
+	// Single-file mode: apply the server-id override (the myid-derived
+	// identity is cloud state, authoritative across re-images — the CR's
+	// zero-based replica index must not clobber it), merge every
+	// rendered section into one complete document and write it to
+	// SingleFilePath. OutputDir is deliberately skipped.
+	if request.SingleFilePath != "" {
+		if host == nil {
+			return nil, fmt.Errorf("-single-file requires a keeper host: pass -host (name or name=address)")
+		}
+		if request.ServerID > 0 {
+			applyServerIDOverride(rendered, request.ServerID)
+		}
+		merged, err := mergeRenderedSections(rendered)
+		if err != nil {
+			return nil, err
+		}
+		if !request.DryRun {
+			if err := writeSingleFile(request.SingleFilePath, merged); err != nil {
+				return nil, err
+			}
+		}
+		// The returned list keeps the per-group files (dry-run parity for
+		// callers that inspect them) plus the merged artifact, so
+		// consumers can see both.
+		return append(rendered, port.RenderedFile{
+			Group:   "single",
+			Path:    request.SingleFilePath,
+			Content: merged,
+		}), nil
 	}
 
 	if !request.DryRun {
@@ -153,6 +220,372 @@ func (r *ConfigRenderer) RenderCHK(ctx context.Context, request port.RenderCHKRe
 	}
 
 	return rendered, nil
+}
+
+// applyServerIDOverride replaces the rendered host server-id section's
+// <server_id> value, deterministically and without touching the CR.
+//
+// Why a section replacement, not a regex on the merged document: the
+// generator emits exactly one <server_id> and it lives in exactly one
+// host-group file (chop-generated-server-id.xml); regenerating that
+// section through the same Settings.ClickHouseConfig() machinery keeps
+// the output byte-identical in shape to the generator's own render.
+func applyServerIDOverride(rendered []port.RenderedFile, serverID int) {
+	const serverIDFilename = "chop-generated-server-id.xml"
+	replacement := v1.NewSettings().
+		Set("keeper_server/server_id", v1.MustNewSettingScalarFromAny(serverID)).
+		ClickHouseConfig()
+	for i, file := range rendered {
+		if file.Group != "host" || file.Path != serverIDFilename {
+			continue
+		}
+		rendered[i].Content = replacement
+		return
+	}
+	// No server-id section found: unreachable in single-file mode (a
+	// host is required and its group always carries the section); kept
+	// defensive so a future call path cannot silently drop the
+	// override.
+}
+
+// mergeRenderedSections merges every rendered section into ONE complete
+// <clickhouse>-rooted document.
+//
+// Merge order mirrors clickhouse-keeper's on-cluster ConfigMap assembly:
+// the per-host files (conf.d) merge first, the common files
+// (keeper_config.d) after, so common wins any conflict — the merged
+// single file behaves exactly like the two directories did together.
+//
+// Merge semantics mirror ClickHouse's own ConfigProcessor.mergeRecursive
+// exactly: elements match by name and merge-control-free attributes;
+// one merge pass per section; a matched pair merges recursively while a
+// removal directive deletes its match — see mergeXMLChildren.
+//
+// Why parsing (not string surgery): the sections are generated XML rooted
+// at <clickhouse>; an encoding/xml parse-extract-append round trip keeps
+// the merge deterministic for any section shape the generator emits,
+// where regex-scraping would re-derive fragile assumptions about
+// whitespace and nesting.
+func mergeRenderedSections(rendered []port.RenderedFile) (string, error) {
+	root := &configXMLNode{Name: xmlTagClickHouse}
+	// Host group first, common after: common wins conflicts (see doc
+	// comment). Within a group, keep the caller's deterministic order.
+	ordered := make([]port.RenderedFile, 0, len(rendered))
+	for _, group := range []string{"host", "common"} {
+		for _, file := range rendered {
+			if file.Group == group {
+				ordered = append(ordered, file)
+			}
+		}
+	}
+	for _, file := range ordered {
+		nodes, err := parseSectionChildren(file.Content)
+		if err != nil {
+			return "", fmt.Errorf("merge section %s/%s: %w", file.Group, file.Path, err)
+		}
+		// One merge pass per section, exactly as ClickHouse runs one
+		// pass per config.d file — sibling repetition inside a single
+		// section (e.g. vector-valued settings such as listen_host)
+		// appends rather than folding into the first entry.
+		mergeXMLChildren(root, nodes)
+	}
+	return renderXMLDocument(root), nil
+}
+
+// xmlTagClickHouse is the root tag ClickHouse 26.8 keeper configuration
+// uses (the operator's generator emits the same tag — see
+// Settings.ClickHouseConfig). The legacy <yandex> tag remains an accepted
+// equivalent in ClickHouse itself, but new documents are <clickhouse>.
+const xmlTagClickHouse = "clickhouse"
+
+// configXMLNode is a minimal DOM node for section merging.
+type configXMLNode struct {
+	// Name is the element tag.
+	Name string
+	// Attrs holds the element's attributes (name → value).
+	Attrs []xml.Attr
+	// Text is the element's character data.
+	Text string
+	// Children are the nested elements.
+	Children []*configXMLNode
+}
+
+// parseSectionChildren parses one rendered section (a <clickhouse>- or
+// <yandex>-rooted fragment, per the generator's Settings.ClickHouseConfig)
+// and returns the root's child elements.
+func parseSectionChildren(content string) ([]*configXMLNode, error) {
+	if strings.TrimSpace(content) == "" {
+		return nil, nil
+	}
+	decoder := xml.NewDecoder(strings.NewReader(content))
+	var root *configXMLNode
+	var stack []*configXMLNode
+	for {
+		token, err := decoder.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		switch tok := token.(type) {
+		case xml.StartElement:
+			node := &configXMLNode{Name: tok.Name.Local, Attrs: copyAttrs(tok.Attr)}
+			if len(stack) == 0 {
+				// First element is the section root (<clickhouse> or
+				// <yandex>); its own attributes stay on the root and its
+				// children are what merges.
+				root = node
+				stack = append(stack, node)
+				continue
+			}
+			parent := stack[len(stack)-1]
+			parent.Children = append(parent.Children, node)
+			stack = append(stack, node)
+		case xml.EndElement:
+			if len(stack) == 0 {
+				return nil, fmt.Errorf("unbalanced XML: unexpected </%s>", tok.Name.Local)
+			}
+			stack = stack[:len(stack)-1]
+		case xml.CharData:
+			if len(stack) > 0 {
+				// Append character data to the innermost open element;
+				// the section root's own text is ignored (never rendered).
+				stack[len(stack)-1].Text += string(tok)
+			}
+		case xml.Comment, xml.Directive, xml.ProcInst:
+			// Comments and directives do not affect configuration
+			// semantics; they are dropped (the merged document is
+			// generated output, and deterministic bytes matter more
+			// than provenance comments).
+		}
+	}
+	if len(stack) != 0 {
+		return nil, fmt.Errorf("unbalanced XML: unclosed <%s>", stack[len(stack)-1].Name)
+	}
+	if root == nil {
+		return nil, nil
+	}
+	if root.Name != xmlTagClickHouse && root.Name != xmlTagYandex {
+		return nil, fmt.Errorf("section root is <%s>, expected <%s> or <%s>", root.Name, xmlTagClickHouse, xmlTagYandex)
+	}
+	return root.Children, nil
+}
+
+// copyAttrs snapshots decoder-provided attributes: xml.Decoder reuses the
+// Attr slice between tokens, so storing the slice directly would alias
+// later elements' attributes.
+func copyAttrs(attrs []xml.Attr) []xml.Attr {
+	copied := make([]xml.Attr, len(attrs))
+	copy(copied, attrs)
+	return copied
+}
+
+// xmlTagYandex is the legacy root tag ClickHouse still accepts as an
+// equivalent of <clickhouse>.
+const xmlTagYandex = "yandex"
+
+// mergeXMLChildren merges one incoming batch into target's children with
+// ClickHouse's exact merge rules (ConfigProcessor::mergeRecursive):
+//
+//   - The candidate map snapshots the target's children BEFORE the pass;
+//     nodes appended during the pass are not matchable (parity with the
+//     upstream multimap built once per merge).
+//   - An incoming element matches the first not-yet-consumed candidate
+//     with the same merge-control-free identity (name + attributes).
+//   - remove="1" on the incoming node deletes the matched target; a
+//     removal with no match is dropped (never appended).
+//   - replace="1" swaps the matched target for the incoming node.
+//   - A matched pair merges: attributes copy over, and children recurse
+//     (a fresh pass over the matched target's children).
+//   - An unmatched incoming element appends.
+//
+// One batch == one section: repeated siblings in the SAME batch append
+// (each finds no remaining candidate — the raft <server> list grows);
+// the same element contributed by a LATER section merges into the
+// earlier one, so common (merged after host) wins conflicts — the
+// on-cluster keeper_config.d-over-conf.d precedence, kept intact in the
+// single file.
+func mergeXMLChildren(target *configXMLNode, incoming []*configXMLNode) {
+	// Snapshot the candidates: name+attrs → queue of child indices, in
+	// document order. Consumption erases from the queue head.
+	candidates := make(map[string][]int)
+	for i, child := range target.Children {
+		id := elementIdentity(child)
+		candidates[id] = append(candidates[id], i)
+	}
+
+	for _, node := range incoming {
+		if node.Name == "" {
+			continue
+		}
+		id := elementIdentity(node)
+		queue := candidates[id]
+		if isRemovedNode(node) {
+			// Removal directive: delete the matched target; nothing to
+			// add when there is no match (ConfigProcessor skips a remove
+			// node that finds no pair).
+			if len(queue) > 0 {
+				idx := queue[0]
+				candidates[id] = queue[1:]
+				target.Children = append(target.Children[:idx], target.Children[idx+1:]...)
+			}
+			continue
+		}
+		if len(queue) > 0 {
+			idx := queue[0]
+			candidates[id] = queue[1:]
+			if isReplaced(node) {
+				target.Children[idx] = node
+				continue
+			}
+			mergeInto(target.Children[idx], node)
+			continue
+		}
+		target.Children = append(target.Children, node)
+	}
+}
+
+// elementIdentity builds the merge match key: element name plus sorted
+// merge-control-free attributes — ConfigProcessor's getElementIdentifier.
+// Appended nodes are NOT added to any index (they are only matchable in
+// a later merge pass), which callers get by rebuilding candidates per
+// batch.
+func elementIdentity(node *configXMLNode) string {
+	var b strings.Builder
+	b.WriteString(node.Name)
+	attrs := mergeControlFreeAttrs(node.Attrs)
+	// Decoder order is document order; identifiers must be stable across
+	// documents, so sort (getElementIdentifier sorts attribute pairs).
+	sort.Slice(attrs, func(i, j int) bool {
+		return attrs[i].Name.Local < attrs[j].Name.Local
+	})
+	for _, attr := range attrs {
+		b.WriteString("\x00" + attr.Name.Local + "\x01" + attr.Value)
+	}
+	return b.String()
+}
+
+// mergeInto merges a matched pair: the incoming node's attributes copy
+// over the target's, non-empty incoming text replaces the target's text,
+// and children merge recursively.
+func mergeInto(target, incoming *configXMLNode) {
+	for _, attr := range incoming.Attrs {
+		replaced := false
+		for i, existing := range target.Attrs {
+			if existing.Name.Local == attr.Name.Local {
+				target.Attrs[i].Value = attr.Value
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			target.Attrs = append(target.Attrs, attr)
+		}
+	}
+	if strings.TrimSpace(incoming.Text) != "" {
+		target.Text = incoming.Text
+	}
+	mergeXMLChildren(target, incoming.Children)
+}
+
+// isRemovedNode reports whether the node carries remove="1" — the
+// preprocessor directive ClickHouse uses to delete a previously-defined
+// element (e.g. the plaintext <tcp_port> removal overlay).
+func isRemovedNode(node *configXMLNode) bool {
+	return mergeDirective(node, "remove")
+}
+
+// isReplaced reports whether the node carries replace="1".
+func isReplaced(node *configXMLNode) bool {
+	return mergeDirective(node, "replace")
+}
+
+// mergeDirective reports whether the node carries attr="1".
+func mergeDirective(node *configXMLNode, directive string) bool {
+	for _, attr := range node.Attrs {
+		if attr.Name.Local == directive {
+			return attr.Value == "1" || strings.EqualFold(attr.Value, "true")
+		}
+	}
+	return false
+}
+
+// mergeControlFreeAttrs strips remove/replace attributes — the merge
+// control directives ClickHouse's getElementIdentifier excludes so a
+// removal directive can match the plain element it deletes.
+func mergeControlFreeAttrs(attrs []xml.Attr) []xml.Attr {
+	filtered := make([]xml.Attr, 0, len(attrs))
+	for _, attr := range attrs {
+		switch attr.Name.Local {
+		case "remove", "replace":
+		default:
+			filtered = append(filtered, attr)
+		}
+	}
+	return filtered
+}
+
+// renderXMLDocument renders the merged DOM back to a stable, readable XML
+// document rooted at <clickhouse>, with the same 4-space indent the
+// operator's own generator emits.
+func renderXMLDocument(root *configXMLNode) string {
+	var b strings.Builder
+	b.WriteString("<?xml version=\"1.0\"?>\n")
+	writeXMLNode(&b, root, 0)
+	return b.String()
+}
+
+// writeXMLNode writes one node (and its subtree) at the given indent
+// level. Empty element text and childless leaves render compactly.
+func writeXMLNode(b *strings.Builder, node *configXMLNode, indent int) {
+	pad := strings.Repeat("    ", indent)
+	b.WriteString(pad)
+	b.WriteString("<" + node.Name)
+	for _, attr := range node.Attrs {
+		b.WriteString(" " + attr.Name.Local + "=\"" + xmlEscapeAttr(attr.Value) + "\"")
+	}
+	if len(node.Children) == 0 && strings.TrimSpace(node.Text) == "" {
+		b.WriteString("/>\n")
+		return
+	}
+	b.WriteString(">")
+	if len(node.Children) == 0 {
+		b.WriteString(xmlEscapeText(strings.TrimSpace(node.Text)))
+		b.WriteString("</" + node.Name + ">\n")
+		return
+	}
+	if node.Text != "" && strings.TrimSpace(node.Text) != "" {
+		b.WriteString(xmlEscapeText(strings.TrimSpace(node.Text)))
+	}
+	b.WriteString("\n")
+	for _, child := range node.Children {
+		writeXMLNode(b, child, indent+1)
+	}
+	b.WriteString(pad + "</" + node.Name + ">\n")
+}
+
+// xmlEscapeText escapes character data for element text.
+func xmlEscapeText(text string) string {
+	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(text)
+}
+
+// xmlEscapeAttr escapes a value for a double-quoted attribute.
+func xmlEscapeAttr(value string) string {
+	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", "\"", "&quot;").Replace(value)
+}
+
+// writeSingleFile writes the merged single-file keeper configuration.
+func writeSingleFile(path, content string) error {
+	if dir := filepath.Dir(path); dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", dir, err)
+		}
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return nil
 }
 
 // chiGeneratorOptions mirrors the CHI controller's configGeneratorOptions:
@@ -178,6 +611,98 @@ func chkGeneratorOptions(cr *chk.ClickHouseKeeperInstallation) *chkConfig.Genera
 		Settings: cr.GetSpecT().GetConfiguration().GetSettings(),
 		Files:    cr.GetSpecT().GetConfiguration().GetFiles(),
 	}
+}
+
+// injectUserPasswords deep-copies the users settings and injects one
+// password_sha256_hex per requested user, stripping every competing
+// password specification for that user.
+//
+// Why a settings copy (not post-processing the rendered XML): the
+// generator already owns the users XML — ordering, nesting, and value
+// escaping. Editing the settings before generation means the injected
+// hash is emitted by the operator's own emitter, byte-identical to how
+// an on-cluster spec-declared hash would be; a post-process pass would
+// re-implement XML editing (regex or re-parse) with new escaping and
+// tag-mismatch failure classes (the live cluster's SAXParseException).
+// The deep copy keeps the shared CR untouched — the same CR renders
+// again in the same process (common+users+host groups, -dry-run), and
+// in-place mutation would leak the injected hash into later renders.
+//
+// Without it: the spec would have to carry the password hash itself —
+// a runtime secret checked into the spec file, the exact thing the
+// cloud secret store exists to prevent; or plaintext `password` from a
+// hand-migrated spec would silently win and land in the rendered XML.
+func injectUserPasswords(users *v1.Settings, userPasswords map[string]string) (*v1.Settings, error) {
+	if users == nil {
+		users = v1.NewSettings()
+	}
+	// Typo guard: every requested user must be declared by the spec.
+	// A silent no-op would render a users.xml still carrying the spec's
+	// password while the operator believes the secret-file password is
+	// live — the account would run with a credential nobody set.
+	for _, name := range sortedKeys(userPasswords) {
+		if !userSettingsPrefixExists(users, name) {
+			return nil, fmt.Errorf(
+				"user %q from -user-password is not declared by the spec (spec users: %v)",
+				name, users.Prefixes(true))
+		}
+	}
+
+	// Deep copy: the CR renders again in this process (host group, later
+	// renders) and must never observe the injected hashes.
+	emitted := users.DeepCopy()
+	if emitted == nil {
+		emitted = v1.NewSettings()
+	}
+	for _, name := range sortedKeys(userPasswords) {
+		// SettingsUser keys fields by the "name/" storage-key prefix.
+		fields := v1.NewSettingsUser(emitted, name)
+		// Strip every competing password spec so the injected hash is
+		// the only credential ClickHouse can pick: a spec-declared
+		// password_double_sha1_hex would otherwise out-rank
+		// password_sha256_hex in ClickHouse's own priority order.
+		// (k8s_secret_* fields are already impossible here — the
+		// SpecLoader rejects that syntax at load time.)
+		fields.Delete("password")
+		fields.Delete("password_double_sha1_hex")
+		// Operator parity with the normalizer's removePlainPassword:
+		// "default" is the one user stock users.xml carries a <password>
+		// element for, so a hash must blank it via remove="1" or the
+		// users.d merge leaves two auth specs on the account. Custom
+		// users don't exist in stock users.xml — no stub, matching the
+		// on-cluster ConfigMap byte-for-byte.
+		if name == "default" {
+			fields.Set("password", v1.NewSettingScalar("").SetAttribute("remove", "1"))
+		}
+		fields.Set("password_sha256_hex", v1.NewSettingScalar(userPasswords[name]))
+	}
+	return emitted, nil
+}
+
+// userSettingsPrefixExists reports whether the users settings carry any
+// field for the named user (storage key prefix "name/").
+func userSettingsPrefixExists(users *v1.Settings, name string) bool {
+	if users == nil {
+		return false
+	}
+	prefix := name + "/"
+	found := false
+	users.WalkKeys(func(key string, _ *v1.Setting) {
+		if strings.HasPrefix(key, prefix) {
+			found = true
+		}
+	})
+	return found
+}
+
+// sortedKeys returns the map's keys sorted (deterministic error order).
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // hostInventory converts the port-level host list to the CR-name →
@@ -283,9 +808,65 @@ func toRenderedFiles(group string, files map[string]string) []port.RenderedFile 
 	return rendered
 }
 
+// injectReplicaCredentials splices <user>/<password> children into
+// every <replica> entry of the remote_servers.xml content carried by
+// rendered.
+//
+// Why string splicing over the GeneratorOptions: the operator's
+// generator has no per-replica credential support — its cluster-level
+// <secret> element is rejected by ClickHouse 26.8 — and injecting through
+// the shared generator options would fork generator behavior for every
+// downstream consumer. The generator emits each <replica> through one
+// deterministic function, so inserting two elements before each
+// </replica> close-tag produces byte-clean XML while leaving pkg/model
+// untouched.
+//
+// Without it: off-cluster peers reject distributed queries as
+// passwordless "default" (PASSWORD_REQUIRED) — the AWS stack worked
+// around this by hand-writing cluster.xml, which drifts from the spec
+// the moment topology changes.
+func injectReplicaCredentials(rendered []port.RenderedFile, user, password string) error {
+	var escapedUser, escapedPassword bytes.Buffer
+	if err := xml.EscapeText(&escapedUser, []byte(user)); err != nil {
+		return fmt.Errorf("XML-escape remote user: %w", err)
+	}
+	if err := xml.EscapeText(&escapedPassword, []byte(password)); err != nil {
+		// The error must not carry the value — secrets hygiene.
+		return fmt.Errorf("XML-escape remote password: %w", err)
+	}
+
+	for i, file := range rendered {
+		// Exact generated name (createConfigSectionFilename's output):
+		// a spec `files:` entry that merely ends in remote_servers.xml
+		// must not be mistaken for the generator's own cluster file.
+		if filepath.Base(file.Path) != "chop-generated-remote_servers.xml" {
+			continue
+		}
+		// The generator writes every </replica> as a newline plus 16
+		// spaces (util.Iline(b, 16, "</replica>")), and replica
+		// children carry 4 more (util.Iline(b, 16, "    <host>...")).
+		// Matching those exact forms keeps the splice byte-identical
+		// to generator style without a full XML re-serialization
+		// that would reformat the whole file.
+		const replicaClose = "\n                </replica>"
+		if !strings.Contains(file.Content, replicaClose) {
+			return fmt.Errorf("no <replica> entries found in %s", file.Path)
+		}
+		rendered[i].Content = strings.ReplaceAll(file.Content, replicaClose,
+			"\n                    <user>"+escapedUser.String()+"</user>\n"+
+				"                    <password>"+escapedPassword.String()+"</password>\n"+
+				"                </replica>")
+	}
+	return nil
+}
+
 // writeFiles writes rendered files to disk. users-group files go to
 // UsersDir (default OutputDir) so callers can keep config.d and users.d
-// apart.
+// apart. Files are 0640 (config and users alike): users XML carries
+// password_sha256_hex and remote_servers.xml may embed distributed-query
+// credentials, so rendered config must stay group-readable at most,
+// never world-readable. The service user reads via the clickhouse group;
+// the cloud-init step re-owns the tree anyway.
 func writeFiles(rendered []port.RenderedFile, outputDir, usersDir string) error {
 	if usersDir == "" {
 		usersDir = outputDir
@@ -299,7 +880,7 @@ func writeFiles(rendered []port.RenderedFile, outputDir, usersDir string) error 
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
 		}
-		if err := os.WriteFile(path, []byte(file.Content), 0o644); err != nil {
+		if err := os.WriteFile(path, []byte(file.Content), 0o640); err != nil {
 			return fmt.Errorf("write %s: %w", path, err)
 		}
 	}
