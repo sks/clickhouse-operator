@@ -1433,3 +1433,71 @@ func TestConfigRendererRemoteCredentialsWritten0640(t *testing.T) {
 			"%s must be 0640", file.Path)
 	}
 }
+
+func TestUsersRendererEmitsReferencedProfiles(t *testing.T) {
+	// A user referencing a spec profile must get that profile in the same
+	// file (Code 347: Profile was not found — the live finding for ingest).
+	spec := []byte(`
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: profiles-test
+spec:
+  configuration:
+    profiles:
+      ingest/insert_quorum: "auto"
+      ingest/select_sequential_consistency: "1"
+    users:
+      writer/passwordFrom: "writer-secret"
+      writer/profile: ingest
+`)
+	loader := NewSpecLoader()
+	crAny, err := loader.LoadCHI(context.Background(), port.LoadCHIRequest{
+		Spec: domain.SpecReference{Data: spec},
+	})
+	require.NoError(t, err)
+
+	rendered, err := NewUsersRenderer(fakeSecretsResolver{values: map[string]string{"writer-secret": "v"}}).RenderUsers(
+		context.Background(), port.RenderUsersRequest{NormalizedCR: crAny, OutputDir: t.TempDir()})
+	require.NoError(t, err)
+
+	content := rendered[0].Content
+	require.Contains(t, content, "<ingest>")
+	require.Contains(t, content, "insert_quorum")
+	// Well-formed XML.
+	decoder := xml.NewDecoder(strings.NewReader(content))
+	for {
+		if _, err := decoder.Token(); err == io.EOF {
+			break
+		} else {
+			require.NoError(t, err, "malformed users XML: %s", content)
+		}
+	}
+}
+
+func TestUsersRendererProfilesWrapped(t *testing.T) {
+	// Profiles must emit inside a <profiles> wrapper (live finding: the
+	// raw profile tree at the document root parses as a user entry).
+	spec := []byte(`
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: profiles-wrap
+spec:
+  configuration:
+    profiles:
+      ingest/insert_quorum: "auto"
+    users:
+      writer/passwordFrom: "s"
+      writer/profile: ingest
+`)
+	crAny, err := NewSpecLoader().LoadCHI(context.Background(), port.LoadCHIRequest{
+		Spec: domain.SpecReference{Data: spec},
+	})
+	require.NoError(t, err)
+	rendered, err := NewUsersRenderer(fakeSecretsResolver{values: map[string]string{"s": "v"}}).RenderUsers(
+		context.Background(), port.RenderUsersRequest{NormalizedCR: crAny, OutputDir: t.TempDir()})
+	require.NoError(t, err)
+	require.Contains(t, rendered[0].Content, "<profiles>")
+	require.Contains(t, rendered[0].Content, "<ingest>")
+}

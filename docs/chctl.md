@@ -11,9 +11,13 @@ runs on-cluster, using the exact same code paths.
 | You have | chctl replaces |
 |---|---|
 | Hand-written ClickHouse XML config templates | `chctl config render` — one CHI spec is the source of truth; the operator's generator produces the XML |
+| Hand-written keeper `config.xml` (raft list, `server_id`, logging) | `chctl config render -keeper -single-file` — the keeper generator emits ONE complete `<clickhouse>`-rooted file per node |
 | Boot scripts creating tables on new replicas | `chctl schema sync` — the operator's schema propagation (CREATE ... IF NOT EXISTS against `clusterAllReplicas`) |
 | Stale replicas after scale-in / spot reclaim | `chctl replica drop` — the operator's `SYSTEM DROP REPLICA` cleanup |
+| Scheduled bash loops that detect + drop stale replicas | `chctl replica gc` — detection and drop in one pass, behind a writer/keeper-safe name gate |
 | Runbook instructions "restart keepers one at a time" | `chctl keeper safe-to-stop` — a hard quorum gate; refuses (exit 2) if the stop would drop Raft majority |
+| `echo mntr \| nc host 9181 \| awk` in health scripts | `chctl keeper mntr` — parsed, sorted key=value (or `-json`) with a real exit code; the metric push stays in the caller |
+| Passwords baked into spec files or argv | `chctl config render -user-password` / `-remote-user` — files and env supply the secrets, the spec only declares the accounts |
 
 Anything you can express in a `ClickHouseInstallation`/`ClickHouseKeeperInstallation`
 spec works here — profiles, quotas, users, custom config files — and it is
@@ -67,7 +71,7 @@ the directories ClickHouse reads:
 ```bash
 chctl config render \
   -spec cluster.yaml \
-  -host chi-logs-logexplorer-0-0 \
+  -host 0-0 \
   -out /etc/clickhouse-server/config.d \
   -users-dir /etc/clickhouse-server/users.d
 ```
@@ -81,26 +85,170 @@ host: chop-generated-hostname-ports.xml
 host: chop-generated-macros.xml
 ```
 
-Each host gets its own macros/remote_servers — pass `-host` per node from
-your node bootstrap (cloud-init, ignition, whatever). Drop `-host` to
-render only the cluster-wide sections. Keeper specs render the same way
-with `-keeper`.
+Each host gets its own macros/remote_servers — pass a bare `-host 0-0`
+(the CR host name, `<shard>-<replica>`) per node from your node bootstrap
+(cloud-init, ignition, whatever). Drop `-host` to render only the
+cluster-wide sections. Keeper specs render the same way with `-keeper`.
 
 **Wire it into node bootstrap** (the pattern used by the AWS EC2 stack in
 `appcd-dev/langchain-examples`): upload the spec to S3/blob storage,
 download it in cloud-init, render per-role at boot, and re-render + restart
 on config change instead of rebuilding instances.
 
+### Cloud inventory and replica identity (`-host`, `-replica`)
+
+`-host` is dual-form. A **bare name** selects the host whose files render.
+A **`name=address`** pair adds a cloud inventory entry — and every place
+the render would otherwise emit an unresolvable Kubernetes pod pattern,
+the cloud address comes out instead:
+
+- `remote_servers` `<host>` entries
+- keeper raft `<hostname>` entries
+- `interserver_http_host`
+
+```bash
+chctl config render \
+  -spec cluster.yaml \
+  -host 0-0 \
+  -host 0-0=writer-0.ch.internal \
+  -host 0-1=writer-1.ch.internal \
+  -out /etc/clickhouse-server/config.d
+```
+
+`-replica name=cloudname` (repeatable) maps the same CR host to its
+**replica identity** — the value `macros.xml`'s `<replica>` must carry.
+On an existing cluster this is not cosmetic: Keeper replica paths and
+per-replica S3 backup prefixes encode `<replica>`, so a re-render that
+changes it silently re-identifies the node. Without the mapping the
+operator's pod pattern (`chi-logs-logexplorer-0-0`) lands in macros —
+correct on Kubernetes, an identity break off-cluster.
+
+Before/after in `chop-generated-macros.xml` with `-replica 0-0=writer-0`:
+
+```xml
+<!-- operator-native (no mapping) -->
+<replica>chi-logs-logexplorer-0-0</replica>
+
+<!-- with -replica 0-0=writer-0: the cloud short hostname exactly -->
+<replica>writer-0</replica>
+```
+
+Unmapped hosts keep operator-native output; a render with no mappings at
+all is byte-identical to the pre-inventory behavior.
+
+### Distributed-query credentials (`-remote-user`)
+
+Rendered `remote_servers.xml` carries one `<replica>` per host. Peers
+authenticate distributed queries against it — without credentials each
+peer connects as passwordless `default` and gets `PASSWORD_REQUIRED`.
+Pass the account once; chctl splices the XML-escaped `<user>/<password>`
+pair into every `<replica>` of every rendered cluster:
+
+```bash
+chctl config render \
+  -spec cluster.yaml -host 0-0 \
+  -host 0-0=writer-0.ch.internal -host 0-1=writer-1.ch.internal \
+  -remote-user distuser -remote-password-env CH_REMOTE_PASSWORD \
+  -out /etc/clickhouse-server/config.d
+```
+
+`-remote-password-env <VAR>` and `-remote-password-file <path>` are
+mutually exclusive; the password never appears in argv, the spec, or
+logs. Rendered files are written `0640` — they can carry credentials.
+
+### Runtime user passwords (`-user-password`)
+
+The spec declares **who exists**; the secret store supplies **what they
+authenticate with**. `-user-password name=path` (repeatable) reads each
+file, sha256-hashes it, and emits it as that user's `password_sha256_hex`
+— the spec never carries a runtime secret:
+
+```bash
+# your secret store drops per-role files at boot
+chctl config render \
+  -spec cluster.yaml -out /etc/clickhouse-server/config.d \
+  -user-password admin=/run/secrets/admin.pass \
+  -user-password writer=/run/secrets/writer.pass
+```
+
+Guards: the spec must declare the user (a typo fails the render instead
+of silently keeping the old password), and any spec-declared password
+for that user is stripped so the injected hash is the only credential
+in play. Trailing newlines are trimmed before hashing.
+
+### Keeper mode: one file, real identities (`-single-file`, `-server-id`, `-raft-id`)
+
+Keeper nodes run with an explicit `--config`, which **disables**
+ClickHouse's `config.d` auto-include — a per-group render is useless
+there. `-single-file <path>` merges the common + host sections into ONE
+complete `<clickhouse>`-rooted config instead (and skips `-out`):
+
+```bash
+chctl config render \
+  -spec keeper.yaml -keeper \
+  -host 0-1 \
+  -host 0-0=keeper-0.aws.internal \
+  -host 0-1=keeper-1.aws.internal \
+  -host 0-2=keeper-2.aws.internal \
+  -server-id 2 \
+  -raft-id 0-0=1 -raft-id 0-1=2 -raft-id 0-2=3 \
+  -single-file /etc/clickhouse-keeper/keeper_config.xml
+```
+
+producing:
+
+```xml
+<clickhouse>
+    <keeper_server>
+        <server_id>2</server_id>
+        <raft_configuration>
+            <server>
+                <id>1</id>
+                <hostname>keeper-0.aws.internal</hostname>
+                <port>9444</port>
+            </server>
+            <server>
+                <id>2</id>
+                <hostname>keeper-1.aws.internal</hostname>
+                <port>9444</port>
+            </server>
+            ...
+```
+
+`-server-id <n>` and `-raft-id name=id` (repeatable) exist for
+**existing ensembles**: the CR's zero-based replica indices are fine
+for a freshly created ensemble, but an ensemble already running has its
+member ids persisted in raft logs (typically 1-based, whatever the
+bootstrap wrote). A re-imaged keeper presenting a CR-derived id looks
+like a different member to its peers, breaking Raft recovery:
+
+- `-server-id` overrides this node's `<server_id>` with the persisted
+  identity (the `myid` file's value). `0`/unset keeps the CR index.
+- `-raft-id name=id` rewrites the `raft_configuration` `<server><id>`
+  values for the whole ensemble; unmapped hosts keep CR-derived ids.
+- consistency guard: `-server-id` must agree with the selected host's
+  `-raft-id` — a node with two identities is refused before any rewrite.
+
+These flags are keeper-mode only: against a CHI spec they are refused
+(`-single-file applies to keeper mode only: add -keeper`, etc.), and
+`-single-file`/`-server-id` require a `-host` selection (a single file
+is host-complete).
+
 ## 2. Bring up a new replica with the schema already in place
 
 A scaled-out reader must re-create every table before serving traffic.
+Inventory keys are CR host names (`<shard>-<replica>`) mapped to cloud
+addresses; the positional target accepts either a CR name or a cloud
+name, and comes after the flags:
 
 ```bash
-chctl schema sync chi-logs-logexplorer-0-1 \
+chctl schema sync \
+  -spec cluster.yaml \
   -cluster logexplorer \
-  -host chi-logs-logexplorer-0-0=10.0.1.10 \
-  -host chi-logs-logexplorer-0-1=10.0.2.10 \
-  -user default -password "$CH_PASSWORD"
+  -host 0-0=writer-0.ch.internal \
+  -host 0-1=reader-1.ch.internal \
+  -user default -password "$CH_PASSWORD" \
+  0-1
 ```
 
 This runs the operator's `HostCreateTables` — replicated and distributed
@@ -112,20 +260,88 @@ After spot reclaim or scale-in, drop the stale replica path from Keeper so
 DDL and future re-joins stay reliable:
 
 ```bash
-chctl replica drop chi-logs-logexplorer-0-1 \
-  -on chi-logs-logexplorer-0-0 \
+chctl replica drop \
+  -spec cluster.yaml \
+  -on 0-0 \
   -cluster logexplorer \
-  -host chi-logs-logexplorer-0-0=10.0.1.10 \
-  -user default -password "$CH_PASSWORD"
+  -host 0-0=writer-0.ch.internal \
+  -host 0-1=reader-1.ch.internal \
+  -user default -password "$CH_PASSWORD" \
+  reader-1
 ```
 
-After a planned restart, re-queue replication:
+The positional name goes into `SYSTEM DROP REPLICA '<name>'` verbatim, so
+it must be the identity your deployment's macros declare — the cloud
+name (`writer-1`, `reader-3`), not the CR ordinal. Addressing (the
+positional for `sync`, and `-on`) accepts either form: the CR name or a
+cloud name. After a planned restart, re-queue replication:
 
 ```bash
-chctl replica sync chi-logs-logexplorer-0-0 \
+chctl replica sync \
+  -spec cluster.yaml \
   -cluster logexplorer \
-  -host chi-logs-logexplorer-0-0=10.0.1.10 \
-  -user default -password "$CH_PASSWORD"
+  -host 0-0=writer-0.ch.internal \
+  -user default -password "$CH_PASSWORD" \
+  0-0
+```
+
+### Sweep stale replicas unattended (`replica gc`)
+
+`replica gc` does the whole loop in one pass: it detects names registered
+in the peer's `system.replicas` but absent from live cluster membership
+(`clusterAllReplicas` with `skip_unavailable_shards=1`, so one down peer
+doesn't fail the sweep), then drops each candidate with the same
+`SYSTEM DROP REPLICA` + `DROP DATABASE REPLICA` pair `replica drop` uses.
+
+```bash
+chctl replica gc \
+  -spec cluster.yaml \
+  -on writer-0 \
+  -cluster logexplorer \
+  -host 0-0=writer-0.ch.internal \
+  -host 0-1=writer-1.ch.internal \
+  -name-pattern 'reader-*'
+```
+
+Dropped names print to stdout as TSV — one per line — so pipes and logs
+keep their existing format; per-host failures and the
+`gc: N stale replica(s) detected, N dropped, N failed` summary go to
+stderr. A per-host failure doesn't abort the sweep. Exit 3 means an
+operational failure — unreachable peer, invalid pattern, or at least one
+drop that failed; missing required flags exit 1.
+
+`-name-pattern` is the safety gate: only hosts matching it (default
+`reader-*`, a `path.Match` glob) are dropped. Non-matching stale
+registrations — a writer, anything else — are reported but never
+dropped: a gate that silently reaped a writer registration would be
+worse than the garbage it removes.
+
+A systemd timer that runs it hourly on a writer:
+
+```ini
+# /etc/systemd/system/dead-replica-gc.service
+[Unit]
+Description=Drop stale reader replica registrations (chctl)
+
+[Service]
+Type=oneshot
+EnvironmentFile=/var/lib/clickhouse-bootstrap/env
+ExecStart=/usr/local/bin/chctl replica gc \
+  -spec /var/lib/clickhouse-bootstrap/chi.yaml \
+  -on writer-0 -cluster logexplorer \
+  -host 0-0=writer-0.ch.internal -host 0-1=writer-1.ch.internal \
+  -user admin -password ${CH_PASSWORD} \
+  -name-pattern 'reader-*'
+```
+
+```ini
+# /etc/systemd/system/dead-replica-gc.timer
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
 ```
 
 ## 4. Gate keeper maintenance on Raft quorum
@@ -152,20 +368,79 @@ for a flapping follower to re-sync before refusing. Ensembles smaller than
 3 are never gated (a 2-member ensemble can't survive any planned stop;
 holding it would just block maintenance).
 
+### Inspect a keeper from scripts (`keeper mntr`)
+
+`keeper mntr` fetches the same payload `safe-to-stop` reasons over and
+prints it parsed: sorted `key=value` lines, or one JSON object with
+`-json`. Exit `0` healthy, `3` unreachable/empty — the same contract as
+`safe-to-stop`, so a health script needs no special-casing:
+
+```bash
+chctl keeper mntr -keeper 10.0.3.10:9181
+# zk_approximate_data_size=1024
+# zk_avg_latency=1
+# zk_followers=2
+# ...
+
+chctl keeper mntr -keeper 10.0.3.10:9181 -timeout 2s -json
+# {"zk_approximate_data_size":"1024", ...}
+```
+
+It carries no decision logic — it replaces the
+`echo mntr | nc host 9181 | awk` plumbing in node bootstrap and health
+scripts. Pushing to CloudWatch/metrics stays in the caller:
+
+```bash
+if payload=$(chctl keeper mntr -keeper "$KEEPER" -json); then
+  aws cloudwatch put-metric-data --namespace "ClickHouse/Keeper" \
+    --metric-name avg_latency \
+    --value "$(echo "$payload" | jq -r .zk_avg_latency)"
+fi
+```
+
 ## Command reference
 
 ```
-chctl config render  -spec chi.yaml [-host 0-0] [-out config.d] [-users-dir users.d] [-dry-run] [-keeper]
+chctl config render  -spec chi.yaml [-host 0-0] [-host name=address]... [-replica name=cloudname]...
+                      [-user-password name=path]... [-out config.d] [-users-dir users.d] [-dry-run] [-keeper]
+                      [-remote-user <name> -remote-password-env <VAR> | -remote-password-file <path>]
+                      keeper mode: [-keeper] -host <host> [-server-id <n>] [-raft-id name=id]... [-single-file <path>]
 chctl schema sync    <host> -cluster <name> -host <name=addr>... [-user u] [-password p] [-port n] [-secure]
 chctl replica drop   <host> -on <peer> -cluster <name> -host <name=addr>...
 chctl replica sync   <host> -cluster <name> -host <name=addr>...
+chctl replica gc     -on <peer> -cluster <name> -host <name=addr>... [-name-pattern reader-*]
 chctl keeper safe-to-stop -keeper <host:port> [-members n] [-wait-timeout 2m]
+chctl keeper mntr    -keeper <host:port> [-timeout 5s] [-json]
 ```
 
-All schema/replica commands take the full host inventory as repeated
-`-host name=address` flags (they need peer addresses to run cluster SQL).
-Passwords via `-password` or stdin; never bake them into the spec — specs
-carry references, secret stores carry values.
+All schema/replica commands require `-spec` and take the full host
+inventory as repeated `-host name=address` flags (they need peer
+addresses to run cluster SQL). The positional host argument goes
+**after** the flags — Go's flag parsing stops at the first positional.
+Passwords via `-password` (prefer env/secrets over argv); never bake them
+into the spec — specs carry references, secret stores carry values.
+
+Render flags in detail:
+
+| Flag | Applies to | Meaning |
+|---|---|---|
+| `-spec chi.yaml` | all renders | CHI (or CHK with `-keeper`) spec, required |
+| `-host 0-0` | all renders | bare name: select the host whose host-scoped files render |
+| `-host name=address` | all renders | repeatable cloud inventory entry; `remote_servers`, keeper raft and `interserver_http_host` resolve to the cloud address |
+| `-replica name=cloudname` | CHI | repeatable; macros `<replica>` becomes the cloud short hostname — the replica identity |
+| `-user-password name=path` | CHI | repeatable; file is read, sha256-hashed, injected as `password_sha256_hex` |
+| `-remote-user` + `-remote-password-env` \| `-remote-password-file` | CHI | escaped `<user>/<password>` into every `remote_servers` `<replica>`; env/file mutually exclusive |
+| `-keeper` | — | spec is a `ClickHouseKeeperInstallation` |
+| `-server-id <n>` | keeper | overrides the CR's zero-based replica index with the persisted `myid` identity |
+| `-raft-id name=id` | keeper | repeatable; the ensemble's persisted raft ids; must agree with `-server-id` for the selected host |
+| `-single-file <path>` | keeper | ONE merged `<clickhouse>`-rooted config (common+host); requires `-host` |
+| `-keeper-address crName=address` | keeper | repeatable keeper-only inventory; same raft `<hostname>` effect as the shared `-host` inventory |
+| `-out`, `-users-dir`, `-dry-run` | all renders | config output dir, users group dir, print without writing |
+
+Exit codes: `0` ok · `1` usage error · `2` quorum gate held the node
+(`safe-to-stop` only) · `3` operational error — keeper unreachable
+(`keeper` subcommands), an unreachable peer or a failed drop
+(`replica gc`).
 
 ## Release / distribution
 
