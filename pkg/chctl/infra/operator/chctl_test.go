@@ -538,3 +538,40 @@ spec:
 		}
 	}
 }
+
+func TestSchemaRunnerHostResolvesCloudName(t *testing.T) {
+	// The real stack's inventory keys are CR ordinals (0-2) with cloud
+	// DNS addresses (reader-3.aws.internal); the GC detects system.replicas
+	// host_name values (reader-3). The first FQDN label must resolve the
+	// cloud name onto the CR host — otherwise the drop path can never
+	// address a stale replica.
+	cr := loadCHIFromFile(t, "ch-int-dev", "")
+	runnerAny, err := NewSchemaClientFactory().NewClient(context.Background(), port.NewSchemaClientRequest{
+		ClusterName:  "logexplorer",
+		Credentials:  domain.Credentials{Username: "default"},
+		Hosts:        []domain.HostIdentity{{Name: "0-0", Address: "writer-0.example.internal"}},
+		NormalizedCR: cr,
+	})
+	require.NoError(t, err)
+	runner := runnerAny.(*SchemaRunner)
+
+	host, err := runner.host("writer-0")
+	require.NoError(t, err, "cloud name must resolve via the FQDN first-label fallback")
+	require.Equal(t, "writer-0.example.internal", host.Runtime.Address.FQDN)
+
+	_, err = runner.host("reader-9")
+	require.ErrorContains(t, err, "not in inventory")
+}
+
+func TestSchemaRunnerDropReplicaUnknownHost(t *testing.T) {
+	// The AWS stack's GC detects cloud host_name values (reader-9);
+	// DropReplica must refuse a name the inventory does not know before
+	// any SQL runs — the gate that keeps a GC from dropping arbitrary
+	// registrations.
+	runner := newGCRunner(t)
+	err := runner.DropReplica(context.Background(), domain.ReplicaDropRequest{
+		HostName: "reader-9",
+		RunOn:    "writer-0",
+	})
+	require.ErrorContains(t, err, "not in inventory")
+}
