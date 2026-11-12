@@ -15,18 +15,33 @@ behaviors only exist on Kubernetes — everyone else reimplements them:
   its own `config.d` templates that drift from ClickHouse behavior and
   from each other. `chctl config render` replaces them with the operator's
   config generators: one CHI spec in, the same files out that the operator
-  would put in ConfigMaps on-cluster.
+  would put in ConfigMaps on-cluster. Cloud names arrive at render time
+  (`-host name=address` inventory, `-replica name=cloudname` identity),
+  not in the spec.
+- **Hand-written keeper XML.** Keeper nodes run with an explicit `--config`
+  (no `config.d` auto-include), so they need one complete file:
+  `chctl config render -keeper -single-file` emits it, with
+  `-server-id`/`-raft-id` preserving an existing ensemble's persisted ids.
 - **Boot-time schema scripts.** A scaled-out reader needs every table
   re-created before serving traffic; stacks usually hack this in bash.
   `chctl schema sync` runs the operator's `HostCreateTables` instead.
 - **Stale replicas after scale-in.** Dead nodes leave znode garbage that
   breaks DDL and re-joins until cleaned by hand. `chctl replica drop` is
-  the operator's `HostDropReplica` against a live peer.
+  the operator's `HostDropReplica` against a live peer; `chctl replica gc`
+  detects and drops them in one scheduled pass (non-readers protected by
+  the `-name-pattern` gate).
 - **Runbook-only keeper safety.** "Restart keepers one at a time" is
   procedure, not enforcement — one mistake drops Raft quorum and the whole
   cluster goes read-only. `chctl keeper safe-to-stop` reuses the
   controller's raft-quorum math, reads live ensemble state via Keeper
   `mntr`, and refuses (exit 2) when a stop would break majority.
+- **Bash mntr health scripts.** `echo mntr | nc host 9181 | awk` parsing
+  becomes `chctl keeper mntr` — sorted key=value or `-json`, exit 0
+  healthy / 3 unreachable; the CloudWatch push stays in the caller.
+- **Secrets in specs or argv.** `-user-password name=path` injects
+  sha256-hashed runtime passwords as `password_sha256_hex`;
+  `-remote-user` + `-remote-password-env|file` authenticates distributed
+  queries. The spec declares accounts; the secret store supplies values.
 
 ## What the GitHub Action is doing
 

@@ -111,8 +111,25 @@ func (r *UsersRenderer) RenderUsers(ctx context.Context, request port.RenderUser
 	raw := emitted.ClickHouseConfig()
 	body := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(raw), "</clickhouse>"))
 	body = strings.TrimSpace(strings.TrimPrefix(body, "<clickhouse>"))
+
+	// Profiles: the spec's profiles section (e.g. the ingest profile with
+	// synchronous-replication settings) rides the same users.d file —
+	// ClickHouse refuses the whole file when a user references a profile
+	// it does not define (Code 347: Profile was not found — the live
+	// finding for profile ingest).
+	profilesXML := ""
+	if profiles := cr.GetSpecT().GetConfiguration().GetProfiles(); profiles != nil && profiles.Len() > 0 {
+		profRaw := profiles.ClickHouseConfig()
+		profRaw = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(profRaw), "</clickhouse>"))
+		profRaw = strings.TrimSpace(strings.TrimPrefix(profRaw, "<clickhouse>"))
+		profilesXML = profRaw
+	}
+
 	var xml string
-	if body != "" {
+	switch {
+	case body != "" && profilesXML != "":
+		xml = "<clickhouse>\n" + profilesXML + "\n    <users>\n" + body + "\n    </users>\n</clickhouse>\n"
+	case body != "":
 		xml = "<clickhouse>\n    <users>\n" + body + "\n    </users>\n</clickhouse>\n"
 	}
 
