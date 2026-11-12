@@ -179,8 +179,10 @@ func TestUsageMentionsKeeperSingleFileFlags(t *testing.T) {
 	var out bytes.Buffer
 	usageWith(&out)
 	require.Contains(t, out.String(), "[-server-id <n>]")
+	require.Contains(t, out.String(), "[-raft-id name=id]")
 	require.Contains(t, out.String(), "[-single-file <path>]")
 	require.Contains(t, out.String(), "-single-file merges common+host sections")
+	require.Contains(t, out.String(), "-raft-id overrides the raft_configuration")
 }
 
 func writeSpecFile(t *testing.T, spec string) string {
@@ -236,6 +238,102 @@ func TestRunConfigNegativeServerIDRejected(t *testing.T) {
 	spec := writeSpecFile(t, appKeeperSpec)
 	err := runConfig([]string{"render", "-spec", spec, "-keeper", "-host", "0-0", "-server-id", "-1"})
 	require.ErrorContains(t, err, "-server-id must be positive")
+}
+
+func TestParseRaftIDFlags(t *testing.T) {
+	// Well-formed entries: name=id pairs, repeatable, later same-name
+	// flags win (map semantics, matching the other repeatable flags).
+	ids, err := parseRaftIDFlags([]string{"0-0=1", "0-1=2", "0-2=3"})
+	require.NoError(t, err)
+	require.Equal(t, map[string]int{"0-0": 1, "0-1": 2, "0-2": 3}, ids)
+
+	// Empty list: nil map, the no-override render.
+	ids, err = parseRaftIDFlags(nil)
+	require.NoError(t, err)
+	require.Nil(t, ids)
+
+	// Malformed entries are refused — a silent skip would renumber an
+	// ensemble's identity invisibly.
+	_, err = parseRaftIDFlags([]string{"0-0"})
+	require.ErrorContains(t, err, "must be name=id")
+	_, err = parseRaftIDFlags([]string{"0-0=x"})
+	require.ErrorContains(t, err, "integer id")
+	_, err = parseRaftIDFlags([]string{"=1"})
+	require.ErrorContains(t, err, "must be name=id")
+}
+
+func TestRunConfigRaftIDAppliesToKeeperModeOnly(t *testing.T) {
+	// Against a CHI spec the raft-id mapping has no meaning: refuse
+	// rather than silently ignoring it.
+	spec := writeSpecFile(t, appKeeperSpec)
+	err := runConfig([]string{"render", "-spec", spec, "-raft-id", "0-0=1"})
+	require.ErrorContains(t, err, "-raft-id applies to keeper mode only")
+}
+
+func TestRunConfigRaftIDNegativeRejected(t *testing.T) {
+	// Raft ids are positive integers (NuRaft member ids); a negative
+	// value would render an invalid <server><id>.
+	spec := writeSpecFile(t, appKeeperSpec)
+	err := runConfig([]string{"render", "-spec", spec, "-keeper", "-host", "0-0", "-raft-id", "0-0=-1"})
+	require.ErrorContains(t, err, "raft ids must be positive")
+}
+
+func TestRunConfigRaftIDAndServerIDMismatchRefused(t *testing.T) {
+	// The end-to-end guard: -server-id and this node's -raft-id must
+	// agree, or the operator is telling the node two different
+	// identities — the exact class of misconfiguration that partitions
+	// an ensemble after a re-image.
+	spec := writeSpecFile(t, appKeeperSpec)
+	err := runConfig([]string{
+		"render",
+		"-spec", spec,
+		"-keeper",
+		"-host", "0-0",
+		"-server-id", "1",
+		"-raft-id", "0-0=7",
+		"-single-file", filepath.Join(t.TempDir(), "keeper_config.xml"),
+	})
+	require.ErrorContains(t, err, "-server-id 1 disagrees with -raft-id 0-0=7")
+}
+
+func TestRunConfigRaftIDEndToEnd(t *testing.T) {
+	// The full flag wiring: -raft-id entries override the CR's
+	// zero-based replica indices in BOTH output modes.
+	spec := writeSpecFile(t, appKeeperSpec)
+	outDir := t.TempDir()
+	singlePath := filepath.Join(t.TempDir(), "keeper_config.xml")
+
+	// Per-group mode: the raft section carries the mapped ids.
+	err := runConfig([]string{
+		"render",
+		"-spec", spec,
+		"-keeper",
+		"-host", "0-0",
+		"-raft-id", "0-0=1",
+		"-out", outDir,
+	})
+	require.NoError(t, err)
+	data, err := os.ReadFile(filepath.Join(outDir, "chop-generated-raft.xml"))
+	require.NoError(t, err)
+	require.Contains(t, string(data), "<id>1</id>", "per-group raft section must carry the mapped id")
+
+	// Single-file mode: the merged document carries them too, agreeing
+	// with -server-id for the selected host.
+	err = runConfig([]string{
+		"render",
+		"-spec", spec,
+		"-keeper",
+		"-host", "0-0",
+		"-server-id", "1",
+		"-raft-id", "0-0=1",
+		"-single-file", singlePath,
+	})
+	require.NoError(t, err)
+	data, err = os.ReadFile(singlePath)
+	require.NoError(t, err)
+	merged := string(data)
+	require.Contains(t, merged, "<id>1</id>")
+	require.Contains(t, merged, "<server_id>1</server_id>")
 }
 
 func TestRunConfigSingleFileEndToEnd(t *testing.T) {

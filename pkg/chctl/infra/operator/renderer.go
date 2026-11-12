@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	chk "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse-keeper.altinity.com/v1"
@@ -32,6 +33,7 @@ import (
 	chiConfig "github.com/altinity/clickhouse-operator/pkg/model/chi/config"
 	chkConfig "github.com/altinity/clickhouse-operator/pkg/model/chk/config"
 	"github.com/altinity/clickhouse-operator/pkg/model/managers"
+	"github.com/altinity/clickhouse-operator/pkg/util"
 
 	"github.com/altinity/clickhouse-operator/pkg/chctl/domain"
 	"github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
@@ -182,11 +184,27 @@ func (r *ConfigRenderer) RenderCHK(ctx context.Context, request port.RenderCHKRe
 		rendered = append(rendered, toRenderedFiles("host", hostFiles)...)
 	}
 
-	// Single-file mode: apply the server-id override (the myid-derived
-	// identity is cloud state, authoritative across re-images — the CR's
-	// zero-based replica index must not clobber it), merge every
-	// rendered section into one complete document and write it to
-	// SingleFilePath. OutputDir is deliberately skipped.
+	// Identity overrides (cloud state, authoritative across re-images):
+	// the raft-id map rewrites the raft_configuration <server><id> values
+	// — an existing off-cluster ensemble persists ONE-based ids in its
+	// raft logs, and zero-based CR indices would present a different
+	// ensemble to surviving members, breaking Raft recovery. Applies to
+	// both output paths (per-group -out and single-file).
+	//
+	// The consistency guard runs before any rewrite: -server-id and
+	// -raft-id must tell the same story about the selected host.
+	if err := checkServerIDRaftIDConsistency(request.HostName, request.ServerID, request.RaftIDs); err != nil {
+		return nil, err
+	}
+	if len(request.RaftIDs) > 0 {
+		if err := applyRaftIDOverrides(rendered, request.RaftIDs, keeperHostNames(cr)); err != nil {
+			return nil, err
+		}
+	}
+
+	// Single-file mode: merge every rendered section into one complete
+	// document and write it to SingleFilePath. OutputDir is deliberately
+	// skipped.
 	if request.SingleFilePath != "" {
 		if host == nil {
 			return nil, fmt.Errorf("-single-file requires a keeper host: pass -host (name or name=address)")
@@ -246,6 +264,184 @@ func applyServerIDOverride(rendered []port.RenderedFile, serverID int) {
 	// host is required and its group always carries the section); kept
 	// defensive so a future call path cannot silently drop the
 	// override.
+}
+
+// checkServerIDRaftIDConsistency guards against a node being given two
+// different identities in one render: -server-id N (the local
+// <server_id>) and -raft-id <selectedHost>=N' (the ensemble's view of
+// this node) must agree when both are given. A mismatch means the
+// operator thinks this node is member N locally but member N' to the
+// ensemble — ClickHouse Keeper requires server_id to match the node's
+// own raft_configuration entry, and a mismatched pair fails at boot or,
+// worse, silently partitions the ensemble.
+//
+// Only the SELECTED host's pair is checked: -raft-id legitimately maps
+// other hosts (the whole ensemble's ids), while -server-id is always
+// about this node.
+func checkServerIDRaftIDConsistency(hostName string, serverID int, raftIDs map[string]int) error {
+	if serverID <= 0 || len(raftIDs) == 0 {
+		return nil
+	}
+	raftID, mapped := raftIDs[hostName]
+	if !mapped {
+		return nil
+	}
+	if raftID != serverID {
+		return fmt.Errorf(
+			"-server-id %d disagrees with -raft-id %s=%d for the selected host: a keeper node must have one identity (server_id must equal its raft_configuration id)",
+			serverID, hostName, raftID)
+	}
+	return nil
+}
+
+// applyRaftIDOverrides rewrites the raft_configuration <server><id>
+// values in the rendered raft section, deterministically and without
+// touching the CR.
+//
+// Why a section rebuild, not a regex on the rendered bytes: the ids
+// live in a machine-generated XML section the renderer already parses
+// (parseSectionChildren); a parse-rebuild round trip preserves the
+// CR's host order and every <server> child (hostname, port, secure)
+// exactly, where a regex would re-derive fragile assumptions about
+// indentation and nesting.
+//
+// Matching is POSITIONAL: the -raft-id flag keys by CR host name
+// ("0-0"), which never appears in the rendered section (only the
+// hostname does). The generator emits <server> entries in cr.WalkHosts
+// order with no exclusions (the render passes no raft selector), so
+// the i-th CR host corresponds to the i-th entry — the same order this
+// function re-derives from the CR.
+//
+// Unmapped hosts keep their CR-derived ids.
+func applyRaftIDOverrides(rendered []port.RenderedFile, raftIDs map[string]int, crHostNames []string) error {
+	const raftFilename = "chop-generated-raft.xml"
+	sectionIdx := -1
+	for i, file := range rendered {
+		if file.Group == "common" && file.Path == raftFilename {
+			sectionIdx = i
+			break
+		}
+	}
+	if sectionIdx < 0 {
+		// No raft section rendered (a CR without hosts is degenerate but
+		// not invalid): nothing to rewrite. The mapping is then inert.
+		return nil
+	}
+
+	servers, err := parseRaftServers(rendered[sectionIdx].Content)
+	if err != nil {
+		return fmt.Errorf("parse %s: %w", raftFilename, err)
+	}
+	if len(servers) != len(crHostNames) {
+		return fmt.Errorf("raft section has %d <server> entries but the CR walks %d hosts — refusing to rewrite ids positionally",
+			len(servers), len(crHostNames))
+	}
+
+	// Rebuild the section through the same Settings machinery the
+	// generator's getRaftConfig uses, preserving entry order and every
+	// non-id child (hostname, port, secure) verbatim.
+	body := &bytes.Buffer{}
+	// Indent 12 = 3-rd level (clickhouse/keeper_server/raft_configuration)
+	// by 4 spaces — matches Generator.getRaftConfig's convention so the
+	// replaced section is byte-identical in shape to the original.
+	for i, server := range servers {
+		id := server.id
+		if override, mapped := raftIDs[crHostNames[i]]; mapped {
+			id = override
+		}
+		util.Iline(body, 12, "<server>")
+		util.Iline(body, 12, "    <id>%d</id>", id)
+		util.Iline(body, 12, "    <hostname>%s</hostname>", server.hostname)
+		util.Iline(body, 12, "    <port>%d</port>", server.port)
+		if server.secure {
+			util.Iline(body, 12, "    <secure>1</secure>")
+		}
+		util.Iline(body, 12, "</server>")
+	}
+	replacement := v1.NewSettings().
+		Set("keeper_server/raft_configuration", v1.MustNewSettingScalarFromAny(body).SetEmbed()).
+		ClickHouseConfig()
+	rendered[sectionIdx].Content = replacement
+	return nil
+}
+
+// keeperHostNames walks the CR's hosts in generator order and returns
+// their CR names — the identity -raft-id keys by. Must stay in the same
+// walk order as Generator.getRaftConfig (plain cr.WalkHosts, no
+// exclusions) for the positional match in applyRaftIDOverrides.
+func keeperHostNames(cr *chk.ClickHouseKeeperInstallation) []string {
+	var names []string
+	_ = cr.WalkHosts(func(host *v1.Host) error {
+		names = append(names, host.Runtime.Address.HostName)
+		return nil
+	})
+	return names
+}
+
+// raftServer is one parsed raft_configuration <server> entry.
+type raftServer struct {
+	// id is the rendered <id> (CR-derived replica index).
+	id int
+	// hostname is the rendered <hostname> (cloud DNS name when an
+	// inventory was given).
+	hostname string
+	// port is the rendered raft <port>.
+	port int
+	// secure mirrors the <secure>1</secure> flag.
+	secure bool
+}
+
+// parseRaftServers parses the rendered raft section and extracts the
+// <server> entries in document order.
+func parseRaftServers(content string) ([]raftServer, error) {
+	children, err := parseSectionChildren(content)
+	if err != nil {
+		return nil, err
+	}
+	// Walk clickhouse → keeper_server → raft_configuration → server.
+	var servers []raftServer
+	var walk func(node *configXMLNode)
+	walk = func(node *configXMLNode) {
+		if node.Name == "raft_configuration" {
+			for _, child := range node.Children {
+				if child.Name != "server" {
+					continue
+				}
+				server := raftServer{}
+				for _, field := range child.Children {
+					switch field.Name {
+					case "id":
+						server.id = parseXMLInt(field.Text)
+					case "hostname":
+						server.hostname = strings.TrimSpace(field.Text)
+					case "port":
+						server.port = parseXMLInt(field.Text)
+					case "secure":
+						server.secure = strings.TrimSpace(field.Text) == "1"
+					}
+				}
+				servers = append(servers, server)
+			}
+			return
+		}
+		for _, child := range node.Children {
+			walk(child)
+		}
+	}
+	for _, child := range children {
+		walk(child)
+	}
+	return servers, nil
+}
+
+// parseXMLInt parses element text as an int; unparsable text yields 0
+// (the rebuild keeps the original bytes for non-id fields regardless).
+func parseXMLInt(text string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(text))
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // mergeRenderedSections merges every rendered section into ONE complete

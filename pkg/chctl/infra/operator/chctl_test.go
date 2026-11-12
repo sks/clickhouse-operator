@@ -875,6 +875,120 @@ func TestRenderCHKOutDirUnchangedBySingleFileFlags(t *testing.T) {
 	require.Contains(t, a["chop-generated-server-id.xml"], "<server_id>0</server_id>")
 }
 
+func TestRenderCHKRaftIDOverridesOutDir(t *testing.T) {
+	// An existing off-cluster ensemble persists ONE-based raft ids in
+	// its raft logs; the per-group render must carry those ids — the
+	// zero-based CR indices would present a different ensemble to
+	// surviving members and break Raft recovery on re-image.
+	cr := loadCHKFromSpec(t, keeperSingleFileSpec)
+	files := renderCHKFiles(t, port.RenderCHKRequest{
+		NormalizedCR: cr,
+		HostName:     "0-0",
+		OutputDir:    t.TempDir(),
+		DryRun:       true,
+		Hosts:        keeperInventory,
+		RaftIDs:      map[string]int{"0-0": 1, "0-1": 2, "0-2": 3},
+	})
+
+	raft := files["chop-generated-raft.xml"]
+	require.Contains(t, raft, "<id>1</id>", "0-0's raft entry must carry the mapped id")
+	require.Contains(t, raft, "<id>2</id>", "0-1's raft entry must carry the mapped id")
+	require.Contains(t, raft, "<id>3</id>", "0-2's raft entry must carry the mapped id")
+	require.NotContains(t, raft, "<id>0</id>", "unmapped zero-based ids must not leak into the ensemble view")
+	// Hostnames and ports are preserved verbatim — only ids change.
+	require.Contains(t, raft, "<hostname>keeper-0.aws.internal</hostname>")
+	require.Contains(t, raft, "<port>9444</port>")
+	requireWellFormedXML(t, raft)
+}
+
+func TestRenderCHKRaftIDOverridesSingleFile(t *testing.T) {
+	// The merged single file must reflect the overridden ids — a
+	// keeper booted from it presents the same ensemble members its
+	// peers have in their raft logs.
+	cr := loadCHKFromSpec(t, keeperSingleFileSpec)
+	rendered, err := NewConfigRenderer().RenderCHK(context.Background(), port.RenderCHKRequest{
+		NormalizedCR:   cr,
+		HostName:       "0-0",
+		OutputDir:      t.TempDir(),
+		Hosts:          keeperInventory,
+		ServerID:       1,
+		RaftIDs:        map[string]int{"0-0": 1, "0-1": 2, "0-2": 3},
+		SingleFilePath: filepath.Join(t.TempDir(), "keeper_config.xml"),
+	})
+	require.NoError(t, err)
+	var merged string
+	for _, f := range rendered {
+		if f.Group == "single" {
+			merged = f.Content
+		}
+	}
+	require.NotEmpty(t, merged)
+	requireWellFormedXML(t, merged)
+	require.Contains(t, merged, "<id>1</id>")
+	require.Contains(t, merged, "<id>2</id>")
+	require.Contains(t, merged, "<id>3</id>")
+	require.NotContains(t, merged, "<id>0</id>")
+	// Local and ensemble identities agree for the selected host.
+	require.Contains(t, merged, "<server_id>1</server_id>")
+	require.Equal(t, 3, strings.Count(merged, "<server>"))
+}
+
+func TestRenderCHKRaftIDPartialMappingKeepsCRIndices(t *testing.T) {
+	// Unmapped hosts keep their CR-derived zero-based ids — a partial
+	// mapping (adopting nodes one at a time) must not renumber the
+	// rest of the ensemble.
+	cr := loadCHKFromSpec(t, keeperSingleFileSpec)
+	files := renderCHKFiles(t, port.RenderCHKRequest{
+		NormalizedCR: cr,
+		HostName:     "0-0",
+		OutputDir:    t.TempDir(),
+		DryRun:       true,
+		Hosts:        keeperInventory,
+		RaftIDs:      map[string]int{"0-0": 1},
+	})
+	raft := files["chop-generated-raft.xml"]
+	// 0-0 maps to 1; unmapped 0-1 keeps CR index 1 → two entries with
+	// id 1; unmapped 0-2 keeps CR index 2 → one entry with id 2; the
+	// CR index 0 for 0-0 is replaced, so no id 0 remains.
+	require.Equal(t, 2, strings.Count(raft, "<id>1</id>"),
+		"mapped 0-0 (id 1) + unmapped 0-1 (CR index 1)")
+	require.Equal(t, 1, strings.Count(raft, "<id>2</id>"),
+		"unmapped 0-2 keeps CR index 2")
+	require.NotContains(t, raft, "<id>0</id>",
+		"the mapped host's CR index must be replaced, not duplicated")
+}
+
+func TestRenderCHKServerIDRaftIDConsistency(t *testing.T) {
+	// -server-id and this node's -raft-id must tell the same story: a
+	// mismatched pair means the operator thinks the node has two
+	// different identities, and keeper refuses to boot (server_id must
+	// equal its own raft_configuration id) or silently partitions the
+	// ensemble.
+	cr := loadCHKFromSpec(t, keeperSingleFileSpec)
+	base := port.RenderCHKRequest{
+		NormalizedCR:   cr,
+		HostName:       "0-0",
+		OutputDir:      t.TempDir(),
+		Hosts:          keeperInventory,
+		ServerID:       1,
+		RaftIDs:        map[string]int{"0-0": 1, "0-1": 2, "0-2": 3},
+		SingleFilePath: filepath.Join(t.TempDir(), "keeper_config.xml"),
+	}
+	_, err := NewConfigRenderer().RenderCHK(context.Background(), base)
+	require.NoError(t, err, "agreeing pair must render")
+
+	mismatched := base
+	mismatched.RaftIDs = map[string]int{"0-0": 7, "0-1": 2, "0-2": 3}
+	_, err = NewConfigRenderer().RenderCHK(context.Background(), mismatched)
+	require.ErrorContains(t, err, "-server-id 1 disagrees with -raft-id 0-0=7")
+
+	// Another host's -raft-id is not this node's identity: no conflict.
+	otherHost := base
+	otherHost.RaftIDs = map[string]int{"0-1": 5, "0-2": 3}
+	_, err = NewConfigRenderer().RenderCHK(context.Background(), otherHost)
+	require.NoError(t, err, "a raft-id for a NON-selected host must not conflict with -server-id")
+}
+
 // TestRenderCHKOutDirBytes pins the per-group output byte-for-byte: the
 // -server-id/-single-file flags may not perturb the original render path.
 // Golden bytes captured from the ebc4625 output.

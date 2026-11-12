@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -86,7 +87,7 @@ Usage:
   chctl config render -spec chi.yaml [-host 0-0] [-host name=address]... [-replica name=cloudname]...
                         [-user-password name=path]... [-out config.d] [-users-dir users.d] [-dry-run] [-keeper]
                         [-remote-user <name> -remote-password-env <VAR> | -remote-password-file <path>]
-                        keeper mode: [-keeper] -host <host> [-server-id <n>] [-single-file <path>]
+                        keeper mode: [-keeper] -host <host> [-server-id <n>] [-raft-id name=id]... [-single-file <path>]
   chctl schema sync <host> -cluster <name> -host <name=addr>... [-user u] [-password p] [-port n] [-secure]
   chctl replica drop <host> -on <peer> -cluster <name> -host <name=addr>...
   chctl replica sync <host> -cluster <name> -host <name=addr>...
@@ -106,7 +107,10 @@ Commands:
             <clickhouse>-rooted config for nodes running clickhouse-keeper with an
             explicit --config (which disables config.d auto-include); -server-id
             overrides the CR's zero-based replica index with the myid file's
-            authoritative identity
+            authoritative identity; -raft-id overrides the raft_configuration
+            <server><id> values for existing ensembles with ONE-based ids persisted
+            in raft logs (unmapped hosts keep CR-derived ids; -server-id and this
+            node's -raft-id must agree)
   schema    create all schema objects on a host from cluster peers (new-reader boot)
   replica   drop a dead replica's registration / re-sync a restarted one / gc stale ones
   keeper    Raft-quorum safety gate for planned keeper stop/replacement,
@@ -135,6 +139,7 @@ func runConfig(args []string) error {
 		hostFlags          hostList
 		replicaMap         replicaList
 		keeperAddrs        keeperAddrList
+		raftIDList         raftIDFlagList
 		userPasswords      userPasswordList
 		remoteUser         string
 		remotePasswordEnv  string
@@ -149,6 +154,7 @@ func runConfig(args []string) error {
 	fs.Var(&replicaMap, "replica", "CR host name to cloud short hostname mapping name=cloudname (repeatable; the rendered macros <replica> carries the cloud name)")
 	fs.Var(&keeperAddrs, "keeper-address", "CHK host cloud DNS mapping crName=address (repeatable; raft server entries use the cloud names)")
 	fs.IntVar(&serverID, "server-id", 0, "keeper mode: overrides the rendered <server_id> for the selected host (e.g. the myid file's 1-based value; 0 keeps the CR-derived replica index)")
+	fs.Var(&raftIDList, "raft-id", "keeper mode: CR host name to raft_configuration <server><id> mapping name=id (repeatable, e.g. 0-0=1; unmapped hosts keep CR-derived zero-based ids)")
 	fs.StringVar(&singleFile, "single-file", "", "keeper mode: write ONE complete <clickhouse>-rooted config file (common+host sections merged) to this path instead of per-group files in -out; requires -host")
 	fs.Var(&userPasswords, "user-password", "user name=password-file path (repeatable); the file is read, hashed sha256 and injected as password_sha256_hex for that user — never the spec")
 	fs.StringVar(&remoteUser, "remote-user", "", "ClickHouse user distributed queries authenticate as (with -remote-password-env/-remote-password-file)")
@@ -216,6 +222,9 @@ func runConfig(args []string) error {
 		if serverID != 0 {
 			return fmt.Errorf("-server-id applies to keeper mode only: add -keeper")
 		}
+		if len(raftIDList.values) > 0 {
+			return fmt.Errorf("-raft-id applies to keeper mode only: add -keeper")
+		}
 	}
 	if serverID < 0 {
 		return fmt.Errorf("-server-id must be positive, got %d", serverID)
@@ -235,6 +244,15 @@ func runConfig(args []string) error {
 		// shape.
 		if serverID != 0 && hostName == "" {
 			return fmt.Errorf("-server-id requires a keeper host: pass -host (name or name=address)")
+		}
+		raftIDs, err := parseRaftIDFlags(raftIDList.values)
+		if err != nil {
+			return err
+		}
+		for name, id := range raftIDs {
+			if id <= 0 {
+				return fmt.Errorf("-raft-id %s=%d: raft ids must be positive", name, id)
+			}
 		}
 		cr, err := loader.LoadCHK(ctx, port.LoadCHKRequest{Spec: specRef})
 		if err != nil {
@@ -256,6 +274,7 @@ func runConfig(args []string) error {
 			DryRun:          dryRun,
 			KeeperAddresses: keeperMap,
 			ServerID:        serverID,
+			RaftIDs:         raftIDs,
 			SingleFilePath:  singleFile,
 		})
 		if err != nil {
@@ -390,6 +409,43 @@ func (h *keeperAddrList) String() string { return strings.Join(h.values, ", ") }
 func (h *keeperAddrList) Set(value string) error {
 	h.values = append(h.values, value)
 	return nil
+}
+
+// raftIDFlagList collects repeated -raft-id name=id values.
+type raftIDFlagList struct {
+	values []string
+}
+
+// String implements flag.Value.
+func (r *raftIDFlagList) String() string { return strings.Join(r.values, ", ") }
+
+// Set implements flag.Value.
+func (r *raftIDFlagList) Set(value string) error {
+	r.values = append(r.values, value)
+	return nil
+}
+
+// parseRaftIDFlags converts the raw name=id flag values into the
+// RaftIDs map. Each value must be name=id with a positive integer id;
+// malformed entries are refused (a silent skip would renumber an
+// ensemble's identity invisibly).
+func parseRaftIDFlags(values []string) (map[string]int, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	raftIDs := make(map[string]int, len(values))
+	for _, value := range values {
+		name, idStr, ok := strings.Cut(value, "=")
+		if !ok || name == "" || idStr == "" {
+			return nil, fmt.Errorf("-raft-id %q must be name=id", value)
+		}
+		id, err := strconv.Atoi(idStr)
+		if err != nil {
+			return nil, fmt.Errorf("-raft-id %q must be name=id with an integer id", value)
+		}
+		raftIDs[name] = id
+	}
+	return raftIDs, nil
 }
 
 // userPasswordList collects repeated -user-password name=path values.

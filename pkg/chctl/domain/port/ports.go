@@ -130,6 +130,12 @@ type RenderCHKRequest struct {
 	// replica index must not clobber it. Zero keeps the CR-derived value.
 	// No effect without SingleFilePath.
 	ServerID int
+	// RaftIDs overrides the raft_configuration <server><id> values per
+	// CR host name. An existing off-cluster ensemble persists ONE-based
+	// raft ids in its raft logs; the CR's zero-based replica indices
+	// would present a different ensemble to surviving members and break
+	// Raft recovery on re-image. Unmapped hosts keep CR-derived ids.
+	RaftIDs map[string]int
 	// SingleFilePath, when non-empty, makes the renderer skip -out
 	// writing and instead write ONE complete <clickhouse>-rooted file
 	// (common + host sections merged) to this path — the shape

@@ -31,6 +31,7 @@ import (
 	"github.com/altinity/clickhouse-operator/pkg/util"
 
 	"github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chop"
 )
 
 // UsersRenderer implements port.UsersRenderer: builds the users.d XML from
@@ -78,11 +79,22 @@ func (r *UsersRenderer) RenderUsers(ctx context.Context, request port.RenderUser
 		return nil, fmt.Errorf("spec has no users section")
 	}
 
-	// Walk every user's settings: resolve passwordFrom into hashed
-	// password_sha256_hex; strip the reference field from the emitted tree.
+	// Walk every SPEC-DECLARED user: resolve passwordFrom into hashed
+	// password_sha256_hex; strip the reference field from the emitted
+	// tree. The normalizer also injects operator machinery users
+	// (clickhouse_operator with its operator profile) into the tree —
+	// on-cluster those are real pods' credentials; off-cluster they
+	// reference profiles the deployment never defined, and ClickHouse
+	// refuses the whole users.d file (Code 347: Profile was not found -
+	// the live finding). Only emit users the SPEC declared.
 	emitted := v1.NewSettings()
-	users := userSettings.Prefixes(false)
-	for _, user := range users {
+	for _, user := range userSettings.Prefixes(false) {
+		if user == chop.Config().ClickHouse.Access.Username {
+			continue // operator machinery user - not this deployment's user
+		}
+		if !specDeclaredUser(userSettings, user) {
+			continue
+		}
 		fields := v1.NewSettingsUser(userSettings, user)
 		if err := r.adaptUser(ctx, fields, user, request.Networks[user], emitted); err != nil {
 			return nil, err
@@ -126,6 +138,36 @@ func (r *UsersRenderer) RenderUsers(ctx context.Context, request port.RenderUser
 		}
 	}
 	return rendered, nil
+}
+
+// specDeclaredUser reports whether the user was declared in the spec's
+// users section (vs injected by the normalizer's defaulting). The
+// normalizer-added users carry only defaulted fields (profile/quota/
+// networks) — a spec-declared user has at least one field the spec set
+// (passwordFrom, profile, access_management...). Heuristic-free check:
+// the raw (pre-normalization) spec is unavailable here, so we treat a
+// user as spec-declared when it carries a passwordFrom reference or a
+// password/password_sha256_hex (the normalizer's defaults carry the
+// hash("default") password_sha256_hex ONLY for passwordless spec users,
+// so passwordFrom presence is the strong signal; users with any
+// non-default field also count).
+func specDeclaredUser(userSettings *v1.Settings, user string) bool {
+	fields := v1.NewSettingsUser(userSettings, user)
+	declared := false
+	fields.WalkSafe(func(name string, setting *v1.Setting) {
+		if setting == nil {
+			return
+		}
+		switch name {
+		case "passwordFrom", "password", "password_sha256_hex", "access_management":
+			declared = true
+		case "profile", "quota", "networks":
+			// normalizer defaults these too - not a signal
+		default:
+			declared = true // any other field means the spec set it
+		}
+	})
+	return declared
 }
 
 // adaptUser maps one user's settings onto the emitted tree, resolving the
