@@ -81,7 +81,8 @@ func usageWith(w io.Writer) {
 	fmt.Fprint(w, `chctl — off-cluster ClickHouse control, powered by the operator's own code
 
 Usage:
-  chctl config render -spec chi.yaml [-host 0-0] [-out config.d] [-users-dir users.d] [-dry-run] [-keeper]
+  chctl config render -spec chi.yaml [-host 0-0] [-host name=address]... [-replica name=cloudname]...
+                        [-out config.d] [-users-dir users.d] [-dry-run] [-keeper]
   chctl schema sync <host> -cluster <name> -host <name=addr>... [-user u] [-password p] [-port n] [-secure]
   chctl replica drop <host> -on <peer> -cluster <name> -host <name=addr>...
   chctl replica sync <host> -cluster <name> -host <name=addr>...
@@ -108,25 +109,46 @@ func runConfig(args []string) error {
 	fs := flag.NewFlagSet("config render", flag.ContinueOnError)
 	var (
 		specFile string
-		hostName string
 		outDir   string
 		usersDir string
 		dryRun   bool
 		isKeeper bool
 	)
-	var keeperAddrs keeperAddrList
+	var (
+		hostFlags   hostList
+		replicaMap  replicaList
+		keeperAddrs keeperAddrList
+	)
 	fs.StringVar(&specFile, "spec", "", "CHI/CHK spec file (YAML), required")
-	fs.StringVar(&hostName, "host", "", "render host-scoped files for this host (empty = common+users only)")
+	fs.Var(&hostFlags, "host", "render host-scoped files for this host; with name=address syntax (repeatable) also maps the CR host to its cloud DNS name/IP")
 	fs.StringVar(&outDir, "out", "out", "output directory for rendered files")
 	fs.StringVar(&usersDir, "users-dir", "", "output directory for users-group files (defaults to -out)")
 	fs.BoolVar(&dryRun, "dry-run", false, "print rendered files without writing")
 	fs.BoolVar(&isKeeper, "keeper", false, "spec is a ClickHouseKeeperInstallation (CHK)")
+	fs.Var(&replicaMap, "replica", "CR host name to cloud short hostname mapping name=cloudname (repeatable; the rendered macros <replica> carries the cloud name)")
 	fs.Var(&keeperAddrs, "keeper-address", "CHK host cloud DNS mapping crName=address (repeatable; raft server entries use the cloud names)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
 	if specFile == "" {
 		return fmt.Errorf("-spec is required")
+	}
+
+	// -host is dual-form: a bare name (e.g. "0-0") selects the host whose
+	// files render; a name=address pair adds the host to the cloud
+	// inventory instead. The live harness passes the bare form, so the
+	// selector must survive it.
+	hostName, hosts, err := parseRenderHosts(hostFlags.values)
+	if err != nil {
+		return err
+	}
+	replicas := make(map[string]string, len(replicaMap.values))
+	for _, entry := range replicaMap.values {
+		name, cloudName, ok := strings.Cut(entry, "=")
+		if !ok || name == "" || cloudName == "" {
+			return fmt.Errorf("-replica %q must be name=cloudname", entry)
+		}
+		replicas[name] = cloudName
 	}
 
 	specData, err := os.ReadFile(specFile)
@@ -154,6 +176,7 @@ func runConfig(args []string) error {
 		rendered, err := renderer.RenderCHK(ctx, port.RenderCHKRequest{
 			NormalizedCR:    cr,
 			HostName:        hostName,
+			Hosts:           hosts,
 			OutputDir:       outDir,
 			DryRun:          dryRun,
 			KeeperAddresses: keeperMap,
@@ -172,6 +195,8 @@ func runConfig(args []string) error {
 	rendered, err := renderer.RenderCHI(ctx, port.RenderCHIRequest{
 		NormalizedCR: cr,
 		HostName:     hostName,
+		Hosts:        hosts,
+		Replicas:     replicas,
 		OutputDir:    outDir,
 		UsersDir:     usersDir,
 		DryRun:       dryRun,
@@ -285,6 +310,51 @@ func (h *keeperAddrList) String() string { return strings.Join(h.values, ", ") }
 func (h *keeperAddrList) Set(value string) error {
 	h.values = append(h.values, value)
 	return nil
+}
+
+// replicaList collects repeated -replica name=cloudname values.
+type replicaList struct {
+	values []string
+}
+
+// String implements flag.Value.
+func (r *replicaList) String() string { return strings.Join(r.values, ", ") }
+
+// Set implements flag.Value.
+func (r *replicaList) Set(value string) error {
+	r.values = append(r.values, value)
+	return nil
+}
+
+// parseRenderHosts splits the config-render -host flag values into the
+// host selector and the cloud inventory. Each value is dual-form:
+//
+//	0-0                → selects host "0-0" (the pre-inventory behavior —
+//	                     the live harness passes this form)
+//	0-0=writer-0.ip    → inventory entry: CR host "0-0" resolves to
+//	                     cloud address "writer-0.ip" (repeatable)
+//
+// Only one bare selector is allowed; name=address entries may repeat.
+func parseRenderHosts(values []string) (hostName string, hosts []domain.HostIdentity, err error) {
+	hosts = make([]domain.HostIdentity, 0, len(values))
+	for _, value := range values {
+		name, address, ok := strings.Cut(value, "=")
+		if ok {
+			if name == "" || address == "" {
+				return "", nil, fmt.Errorf("-host %q must be name=address or a bare host name", value)
+			}
+			hosts = append(hosts, domain.HostIdentity{Name: name, Address: address})
+			continue
+		}
+		if value == "" {
+			return "", nil, fmt.Errorf("-host %q must be name=address or a bare host name", value)
+		}
+		if hostName != "" {
+			return "", nil, fmt.Errorf("only one bare -host selector allowed, got %q and %q", hostName, value)
+		}
+		hostName = value
+	}
+	return hostName, hosts, nil
 }
 
 // portNetworkList collects repeated -network user=ip flag values.

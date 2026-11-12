@@ -19,6 +19,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/altinity/clickhouse-operator/pkg/chctl/domain"
 	"github.com/altinity/clickhouse-operator/pkg/chctl/domain/service"
 
 	"github.com/stretchr/testify/require"
@@ -54,4 +55,44 @@ func TestUsageMentionsReplicaGc(t *testing.T) {
 	var out bytes.Buffer
 	usageWith(&out)
 	require.Contains(t, out.String(), "chctl replica gc -on <peer>")
+}
+
+func TestUsageMentionsRenderInventoryFlags(t *testing.T) {
+	// The render command's cloud inventory must appear in the help
+	// (docs update is a separate todo).
+	var out bytes.Buffer
+	usageWith(&out)
+	require.Contains(t, out.String(), "[-host name=address]...")
+	require.Contains(t, out.String(), "[-replica name=cloudname]")
+}
+
+func TestParseRenderHosts(t *testing.T) {
+	// Bare form: the live harness's host selector, unchanged.
+	name, hosts, err := parseRenderHosts([]string{"0-0"})
+	require.NoError(t, err)
+	require.Equal(t, "0-0", name)
+	require.Empty(t, hosts)
+
+	// Inventory form (repeatable): CR name → cloud address.
+	name, hosts, err = parseRenderHosts([]string{"0-0=writer-0.ip", "0-1=reader-0.ip"})
+	require.NoError(t, err)
+	require.Empty(t, name)
+	require.Equal(t, []domain.HostIdentity{
+		{Name: "0-0", Address: "writer-0.ip"},
+		{Name: "0-1", Address: "reader-0.ip"},
+	}, hosts)
+
+	// Mixed: selector plus inventory — the render-everything case.
+	name, hosts, err = parseRenderHosts([]string{"0-0", "0-1=reader-0.ip"})
+	require.NoError(t, err)
+	require.Equal(t, "0-0", name)
+	require.Equal(t, []domain.HostIdentity{{Name: "0-1", Address: "reader-0.ip"}}, hosts)
+
+	// Malformed and duplicate-selector inputs are rejected.
+	_, _, err = parseRenderHosts([]string{"0-0="})
+	require.ErrorContains(t, err, "name=address or a bare host name")
+	_, _, err = parseRenderHosts([]string{"=writer-0.ip"})
+	require.ErrorContains(t, err, "name=address or a bare host name")
+	_, _, err = parseRenderHosts([]string{"0-0", "0-1"})
+	require.ErrorContains(t, err, "only one bare -host selector")
 }

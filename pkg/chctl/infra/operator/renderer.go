@@ -29,6 +29,7 @@ import (
 	chkConfig "github.com/altinity/clickhouse-operator/pkg/model/chk/config"
 	"github.com/altinity/clickhouse-operator/pkg/model/managers"
 
+	"github.com/altinity/clickhouse-operator/pkg/chctl/domain"
 	"github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
 )
 
@@ -61,12 +62,21 @@ func (r *ConfigRenderer) RenderCHI(ctx context.Context, request port.RenderCHIRe
 		return nil, fmt.Errorf("output dir is empty")
 	}
 
-	options := chiGeneratorOptions(cr)
-	filesGenerator := managers.NewConfigFilesGenerator(
-		managers.FilesGeneratorTypeClickHouse,
-		cr,
-		options,
-	)
+	// CHI generator built manually (not via managers.NewConfigFilesGenerator)
+	// to inject the cloud-wrapped namer when a cloud inventory is given:
+	// remote_servers <host> entries and interserver_http_host resolve via
+	// NameInstanceHostname and macros <replica> via NamePodHostname — the
+	// operator's defaults render both as Kubernetes pod patterns, which
+	// are unresolvable (the former) and identity-breaking (the latter)
+	// off-cluster. Without an inventory the plain operator namer is used,
+	// keeping output identical to the pre-inventory render.
+	var namer interfaces.INameManager = managers.NewNameManager(managers.NameManagerTypeClickHouse)
+	if addresses := hostInventory(request.Hosts); len(addresses) > 0 || len(request.Replicas) > 0 {
+		namer = newCloudNamer(addresses).withReplicas(request.Replicas)
+	}
+	gen := chiConfig.NewGenerator(cr, namer, chiGeneratorOptions(cr))
+	genDomain := chiConfig.NewFilesGeneratorDomain(gen)
+	filesGenerator := chiConfig.NewFilesGenerator(gen, chop.Config().ClickHouse.Config.File.Runtime, genDomain)
 
 	rendered := make([]port.RenderedFile, 0, 16)
 
@@ -116,7 +126,7 @@ func (r *ConfigRenderer) RenderCHK(ctx context.Context, request port.RenderCHKRe
 	// NameInstanceHostname, which the default namer renders in the k8s
 	// service pattern — unresolvable off-cluster. The wrapped namer
 	// translates them to the cloud DNS names from KeeperAddresses.
-	keeperNamer := newKeeperCloudNamer(request.KeeperAddresses)
+	keeperNamer := newKeeperCloudNamer(mergeHostAddresses(hostInventory(request.Hosts), request.KeeperAddresses))
 	gen := chkConfig.NewGenerator(cr, keeperNamer, chkGeneratorOptions(cr))
 	genDomain := chkConfig.NewFilesGeneratorDomain(gen)
 	filesGenerator := chkConfig.NewFilesGenerator(gen, chop.Config().Keeper.Config.File.Runtime, genDomain)
@@ -168,6 +178,40 @@ func chkGeneratorOptions(cr *chk.ClickHouseKeeperInstallation) *chkConfig.Genera
 		Settings: cr.GetSpecT().GetConfiguration().GetSettings(),
 		Files:    cr.GetSpecT().GetConfiguration().GetFiles(),
 	}
+}
+
+// hostInventory converts the port-level host list to the CR-name →
+// cloud-address map the cloud namer keys by. Duplicate names keep the
+// last value (the schema/replica commands' inventory semantics).
+func hostInventory(hosts []domain.HostIdentity) map[string]string {
+	if len(hosts) == 0 {
+		return nil
+	}
+	addresses := make(map[string]string, len(hosts))
+	for _, h := range hosts {
+		if h.Name == "" || h.Address == "" {
+			continue
+		}
+		addresses[h.Name] = h.Address
+	}
+	return addresses
+}
+
+// mergeHostAddresses overlays the secondary map over the primary,
+// returning the merged CR-name → cloud-address map (nil when both are
+// empty, so the plain namer fast path stays).
+func mergeHostAddresses(primary, secondary map[string]string) map[string]string {
+	if len(primary) == 0 {
+		return secondary
+	}
+	merged := make(map[string]string, len(primary)+len(secondary))
+	for name, address := range primary {
+		merged[name] = address
+	}
+	for name, address := range secondary {
+		merged[name] = address
+	}
+	return merged
 }
 
 // findHost locates a host by name within a CHI.

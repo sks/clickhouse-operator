@@ -325,6 +325,92 @@ func TestConfigRendererWritesGroupedDirs(t *testing.T) {
 	}
 }
 
+// renderCHIFiles renders the example CHI with the given inventory and
+// replica mapping and returns the files keyed by file name.
+func renderCHIFiles(t *testing.T, request port.RenderCHIRequest) map[string]string {
+	t.Helper()
+	request.DryRun = true
+	if request.OutputDir == "" {
+		request.OutputDir = t.TempDir() // rendered content only; dry-run never writes
+	}
+	rendered, err := NewConfigRenderer().RenderCHI(context.Background(), request)
+	require.NoError(t, err)
+	files := make(map[string]string, len(rendered))
+	for _, file := range rendered {
+		files[filepath.Base(file.Path)] = file.Content
+	}
+	return files
+}
+
+// TestConfigRendererCloudInventory asserts the cloud-inventory render:
+// every remote_servers <host> entry and the interserver_http_host carry
+// the cloud address instead of the unresolvable pod pattern.
+func TestConfigRendererCloudInventory(t *testing.T) {
+	cr := loadCHIFromFile(t, "ch-int-dev", "")
+
+	files := renderCHIFiles(t, port.RenderCHIRequest{
+		NormalizedCR: cr,
+		HostName:     "0-0",
+		Hosts: []domain.HostIdentity{
+			{Name: "0-0", Address: "writer-0.ch-int-dev.clickhouse.internal"},
+		},
+	})
+
+	remote := files["chop-generated-remote_servers.xml"]
+	require.Contains(t, remote, "<host>writer-0.ch-int-dev.clickhouse.internal</host>",
+		"remote_servers host entries must resolve to the cloud address")
+	require.NotContains(t, remote, "chi-ch-int-dev-logexplorer-0-0",
+		"no pod-pattern names may leak into remote_servers")
+
+	ports := files["chop-generated-hostname-ports.xml"]
+	require.Contains(t, ports,
+		"<interserver_http_host>writer-0.ch-int-dev.clickhouse.internal</interserver_http_host>",
+		"interserver_http_host must resolve to the cloud address")
+}
+
+// TestConfigRendererReplicaIdentity asserts the CRITICAL invariant: with
+// a -replica mapping the macros <replica> is exactly the cloud short
+// hostname — Keeper replica paths and per-replica S3 prefixes on
+// existing clusters encode this identity.
+func TestConfigRendererReplicaIdentity(t *testing.T) {
+	cr := loadCHIFromFile(t, "ch-int-dev", "")
+
+	files := renderCHIFiles(t, port.RenderCHIRequest{
+		NormalizedCR: cr,
+		HostName:     "0-0",
+		Hosts: []domain.HostIdentity{
+			{Name: "0-0", Address: "writer-0.ch-int-dev.clickhouse.internal"},
+		},
+		Replicas: map[string]string{"0-0": "writer-0"},
+	})
+
+	macros := files["chop-generated-macros.xml"]
+	require.Contains(t, macros, "<replica>writer-0</replica>",
+		"macros replica must be the mapped cloud short hostname")
+	require.NotContains(t, macros, "chi-ch-int-dev-logexplorer-0-0",
+		"the operator pod pattern must never leak into macros")
+}
+
+// TestConfigRendererNoInventoryUnchanged asserts backwards compatibility:
+// without a mapping the render keeps the operator-native output
+// byte-for-byte (macros replica and remote_servers host keep the pod
+// pattern — the pre-inventory behavior).
+func TestConfigRendererNoInventoryUnchanged(t *testing.T) {
+	cr := loadCHIFromFile(t, "ch-int-dev", "")
+
+	files := renderCHIFiles(t, port.RenderCHIRequest{
+		NormalizedCR: cr,
+		HostName:     "0-0",
+	})
+
+	macros := files["chop-generated-macros.xml"]
+	require.Contains(t, macros, "<replica>chi-ch-int-dev-logexplorer-0-0</replica>",
+		"no mapping: operator-native replica identity must be kept")
+	remote := files["chop-generated-remote_servers.xml"]
+	require.Contains(t, remote, "<host>chi-ch-int-dev-logexplorer-0-0</host>",
+		"no inventory: operator-native host names must be kept")
+}
+
 func TestConfigRendererRenderCHK(t *testing.T) {
 	chkSpec := []byte(`
 apiVersion: clickhouse-keeper.altinity.com/v1
@@ -537,6 +623,45 @@ spec:
 			require.NoError(t, err, "malformed raft XML: %s", raft)
 		}
 	}
+}
+
+func TestRenderCHKHostInventoryRaftEntries(t *testing.T) {
+	// The same raft translation must flow from the shared -host inventory
+	// (the flag schema/replica commands use) — keepers join the cluster
+	// inventory rather than carrying a keeper-only address list.
+	spec := []byte(`
+apiVersion: clickhouse-keeper.altinity.com/v1
+kind: ClickHouseKeeperInstallation
+metadata:
+  name: keeper-inventory
+spec:
+  replicas: 1
+  configuration:
+    settings:
+      keeper_server/tcp_port: "9181"
+`)
+	loader := NewSpecLoader()
+	crAny, err := loader.LoadCHK(context.Background(), port.LoadCHKRequest{
+		Spec: domain.SpecReference{Data: spec},
+	})
+	require.NoError(t, err)
+
+	rendered, err := NewConfigRenderer().RenderCHK(context.Background(), port.RenderCHKRequest{
+		NormalizedCR: crAny,
+		OutputDir:    t.TempDir(),
+		DryRun:       true,
+		Hosts:        []domain.HostIdentity{{Name: "0-0", Address: "keeper-0.aws.internal"}},
+	})
+	require.NoError(t, err)
+
+	var raft string
+	for _, f := range rendered {
+		if strings.Contains(f.Path, "raft") {
+			raft += f.Content
+		}
+	}
+	require.Contains(t, raft, "<hostname>keeper-0.aws.internal</hostname>",
+		"-host inventory must resolve raft hostnames")
 }
 
 func TestSchemaRunnerHostResolvesCloudName(t *testing.T) {

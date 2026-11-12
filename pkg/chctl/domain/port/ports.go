@@ -67,6 +67,17 @@ type RenderCHIRequest struct {
 	// HostName selects the host whose host-scoped files are rendered;
 	// empty renders only the common and users groups.
 	HostName string
+	// Hosts is the cloud inventory: CR host name → resolvable cloud
+	// address (DNS name or IP). remote_servers <host> entries and
+	// interserver_http_host resolve through it. Empty keeps the
+	// operator's pod-pattern names.
+	Hosts []domain.HostIdentity
+	// Replicas maps CR host names to the short cloud hostname that
+	// ClickHouse replica identity must use: the rendered macros.xml
+	// <replica> becomes exactly this value. Hosts without a mapping
+	// keep the operator name — Keeper replica paths and per-replica
+	// S3 prefixes on existing clusters encode this identity.
+	Replicas map[string]string
 	// OutputDir is the directory files are written to.
 	OutputDir string
 	// UsersDir overrides the output directory for the users group when
@@ -82,6 +93,10 @@ type RenderCHKRequest struct {
 	NormalizedCR any
 	// HostName selects the keeper node whose server section is rendered.
 	HostName string
+	// Hosts is the cloud inventory: CR host name → resolvable cloud
+	// address. Raft <server><hostname> entries resolve through it.
+	// Empty keeps the operator's pod-pattern names.
+	Hosts []domain.HostIdentity
 	// OutputDir is the directory files are written to.
 	OutputDir string
 	// DryRun skips writing; rendered files are still returned.
