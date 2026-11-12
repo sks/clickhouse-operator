@@ -15,6 +15,9 @@ jobs:
   build_version:
     name: Build branch
     runs-on: ubuntu-latest
+    # Docker Hub publishing is upstream-only: forks lack the DOCKER_*
+    # secrets and must not spend runners on a build that can only fail.
+    if: github.repository_owner == 'Altinity'
     steps:
       - name: Checkout project
         uses: actions/checkout@v4
