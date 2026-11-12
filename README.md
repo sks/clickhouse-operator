@@ -2,6 +2,39 @@
 
 The Altinity Kubernetes Operator for ClickHouse creates, configures and manages ClickHouse clusters running on Kubernetes.
 
+> ## Fork notice
+>
+> This is the **`sks/clickhouse-operator` fork**, used as a Go-module
+> dependency by downstream tooling (the EC2/VMSS ClickHouse `control`
+> module). It tracks upstream `Altinity/clickhouse-operator` and diverges
+> **only** where upstream breaks library consumption. Divergence so far
+> (based on `release-0.27.4`):
+>
+> - **`995b7f7` — fix(library): vendor sunsingerus mergo fork so the
+>   operator imports as a Go module.** Upstream wires
+>   `mergo.WithSliceDeepMerge` (used by the exported API packages) through
+>   a `replace` directive, which does not propagate to library consumers —
+>   any `require` of upstream fails with `undefined: mergo.WithSliceDeepMerge`.
+>   This fork vendors the fork's stdlib-only sources at `pkg/util/mergo`.
+>   Proposed upstream as Altinity/clickhouse-operator#2150 (closed).
+>
+> - **`5c61eeb` — feat(chctl): off-cluster control CLI.** Adds `cmd/chctl` —
+>   the operator's config generation, schema propagation, replica cleanup
+>   and keeper Raft-quorum safety gate as a standalone binary for
+>   deployments outside Kubernetes (VMs, EC2 ASGs, VMSS). Usage:
+>   [docs/chctl.md](docs/chctl.md). Binaries ship as GitHub Releases on
+>   `chctl-v*` tags.
+>
+> ```go
+> // go.mod — the module path stays the upstream path; point it at this fork.
+> replace github.com/altinity/clickhouse-operator => github.com/sks/clickhouse-operator <pseudo-version>
+> ```
+>
+> Re-sync procedure: fast-forward `master` to the upstream release tag,
+> then verify an out-of-tree consumer module still builds with zero
+> consumer-side replaces; if a new non-propagating `replace` appears,
+> vendor/fix it here the same way and record it in this notice.
+
 [![Build Master](https://github.com/Altinity/clickhouse-operator/actions/workflows/build_master.yaml/badge.svg)](https://github.com/Altinity/clickhouse-operator/actions/workflows/build_master.yaml)
 [![GitHub release](https://img.shields.io/github/v/release/altinity/clickhouse-operator?include_prereleases)](https://img.shields.io/github/v/release/altinity/clickhouse-operator?include_prereleases)
 [![tags](https://img.shields.io/github/tag/altinity/clickhouse-operator.svg)](https://github.com/altinity/clickhouse-operator/tags)

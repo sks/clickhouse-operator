@@ -5,7 +5,6 @@ go 1.26.8
 replace (
 	github.com/emicklei/go-restful/v3 => github.com/emicklei/go-restful/v3 v3.10.0
 	github.com/golang/glog => github.com/sunsingerus/glog v1.0.1-0.20220103184348-48242e35873d
-	github.com/imdario/mergo => github.com/sunsingerus/mergo v0.0.0-20230507185449-fc6fffa94450
 )
 
 require github.com/altinity/queue v0.0.0-20210114142043-ddb7da66064f
@@ -21,11 +20,12 @@ require (
 require (
 	github.com/MakeNowJust/heredoc v1.0.0
 	github.com/Masterminds/semver/v3 v3.2.0
+	github.com/aws/aws-sdk-go-v2/config v1.33.18
+	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.51.0
 	github.com/go-logr/logr v1.4.4
 	github.com/go-zookeeper/zk v1.0.3
 	github.com/golang/glog v1.1.0
 	github.com/google/uuid v1.6.0
-	github.com/imdario/mergo v0.3.15
 	github.com/juliangruber/go-intersect v1.0.0
 	github.com/kubernetes-sigs/yaml v1.1.0
 	github.com/mailru/go-clickhouse/v2 v2.1.0
@@ -47,6 +47,19 @@ require (
 )
 
 require (
+	github.com/aws/aws-sdk-go-v2 v1.48.0 // indirect
+	github.com/aws/aws-sdk-go-v2/credentials v1.21.0 // indirect
+	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.20.9 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/configsources v1.5.12 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.8.12 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/v4a v1.5.12 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.13.25 // indirect
+	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.14.12 // indirect
+	github.com/aws/aws-sdk-go-v2/service/signin v1.13.1 // indirect
+	github.com/aws/aws-sdk-go-v2/service/sso v1.39.5 // indirect
+	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.44.5 // indirect
+	github.com/aws/aws-sdk-go-v2/service/sts v1.52.0 // indirect
+	github.com/aws/smithy-go v1.28.9 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bmizerany/assert v0.0.0-20160611221934-b7ed37b82869 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
@@ -68,6 +81,7 @@ require (
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/gofuzz v1.2.0 // indirect
 	github.com/gookit/color v1.4.2 // indirect
+	github.com/imdario/mergo v0.3.15 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
