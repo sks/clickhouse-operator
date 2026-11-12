@@ -20,7 +20,8 @@ jobs:
   cosign_sign:
     name: cosign_sign
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    # Image signing is upstream-only (forks never publish images to sign).
+    if: ${{ github.repository_owner == 'Altinity' && (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success') }}
     steps:
       - name: Checkout project
         uses: actions/checkout@v4
