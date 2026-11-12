@@ -58,3 +58,6 @@ AGENTS.md
 .claude
 
 /.cr-release-packages
+
+# local build output (cmd/chctl) - root-anchored so pkg/chctl stays tracked
+/chctl
