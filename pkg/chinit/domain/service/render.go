@@ -73,25 +73,32 @@ func (b *Boot) renderNodeConfig(ctx context.Context) error {
 	return nil
 }
 
-// clusterHosts builds the CR inventory (writers + readers, DNS names).
+// clusterHosts builds the CR inventory: the namer keys entries by the
+// operator CR host name ({shard}-{index}, writers 01-0.. then readers
+// 01-(writer_count+i).. in shard-replica order — the same order CRName()
+// derives), with the stack's private-zone DNS as the address. Keying by
+// hostname instead of CR name renders remote_servers <host> entries as
+// unresolvable chi-<chi>-<cluster>-<shard>-<replica> pod names (the
+// live boot finding: server crash-loops on DNS_ERROR Code 198).
 func (b *Boot) clusterHosts() []domain.HostIdentity {
 	var hosts []domain.HostIdentity
-	for _, name := range b.Spec.WriterNodes {
+	for i, name := range b.Spec.WriterNodes {
 		hosts = append(hosts, domain.HostIdentity{
 			Cloud:   b.Provider.Name(),
 			Region:  b.Meta.Region,
-			Name:    name,
+			Name:    fmt.Sprintf("01-%d", i),
 			Address: fmt.Sprintf("%s.%s", name, b.Spec.DNSZoneName),
 			Role:    domain.RoleWriter,
 		})
 	}
-	// Readers: the ordinals the CR covers (reader_count).
+	// Readers: the ordinals the CR covers, continuing the replica list
+	// AFTER the writers (CRName()'s ordering contract).
 	for i := 0; i < b.Spec.ReaderCount; i++ {
 		name := fmt.Sprintf("%s%d", b.Spec.ReaderHostPrefix, i)
 		hosts = append(hosts, domain.HostIdentity{
 			Cloud:   b.Provider.Name(),
 			Region:  b.Meta.Region,
-			Name:    name,
+			Name:    fmt.Sprintf("01-%d", len(b.Spec.WriterNodes)+i),
 			Address: fmt.Sprintf("%s.%s", name, b.Spec.DNSZoneName),
 			Role:    domain.RoleReader,
 		})
@@ -183,15 +190,42 @@ func (b *Boot) healthGate(ctx context.Context) error {
 	// (it needs the probe over the cluster driver); the boot reports
 	// the summary the CLI printed. A thin exec keeps the port boundary
 	// while the library wiring lands — the TODO the conformance suite
-	// covers is replacing this with the direct service call.
-	out, err := runCommand(ctx, "chctl", "health",
+	// covers is replacing this with the direct service call. NOTE
+	// chctl health has no -password-file flag (plain -password only):
+	// the file is read here so the value never hits another process's
+	// argv.
+	pw, err := os.ReadFile(BootstrapDir + "/admin-password")
+	if err != nil {
+		return fmt.Errorf("read admin password file: %w", err)
+	}
+	// chctl health requires the -host inventory (the same CR-name →
+	// address map the render uses) and refuses to run without it.
+	args := []string{"health",
 		"-cluster", b.Spec.ClusterName,
 		"-user", "admin",
-		"-password-file", BootstrapDir+"/admin-password",
-		"-spec", BootstrapDir+"/chi.yaml")
+		"-password", strings.TrimSpace(string(pw)),
+		"-self", b.Identity.Hostname,
+		"-spec", BootstrapDir + "/chi.yaml"}
+	if b.Spec.Role != model.RoleKeeper && len(b.Spec.KeeperNodes) > 0 {
+		// chctl health's -keeper takes ONE mntr address (string, not
+		// repeatable — the ensemble's quorum math lives in the keeper
+		// health cron, not here). Pinning the ensemble's entrypoint
+		// exercises the reachability+mntr path; per-member liveness is
+		// the deadline for the dedicated gate. The server fan-out below
+		// still covers every host.
+		args = append(args, "-keeper",
+			fmt.Sprintf("%s.%s:9181", b.Spec.KeeperNodes[0], b.Spec.DNSZoneName))
+	}
+	for _, h := range b.clusterHosts() {
+		args = append(args, "-host", h.Name+"="+h.Address)
+	}
+	out, err := runCommand(ctx, "chctl", args...)
 	fmt.Fprintf(os.Stderr, "chctl health verdict:\n%s\n", out)
 	if err != nil {
-		return fmt.Errorf("post-boot cluster health check reported degradation (boot continues; investigate via RUNBOOK_CLUSTER_HEALTH.md): %w", err)
+		// Redact: the exec error text echoes the full argv, which
+		// carries the admin password on the -password flag. Never
+		// leak credentials into the boot log.
+		return fmt.Errorf("post-boot cluster health check reported degradation (boot continues; investigate via RUNBOOK_CLUSTER_HEALTH.md): chctl health exited %w", err)
 	}
 	return nil
 }
