@@ -1,5 +1,10 @@
 # chinit — cloud-adaptive node bootstrapper
 
+> Contributor-facing internals — layers, pipeline, identity contract,
+> the conformance suite — live in
+> [chinit-architecture.md](chinit-architecture.md). This page is the
+> operator's manual.
+
 `chinit` is a single Go binary that bootstraps a ClickHouse node on **any**
 cloud: it detects the platform it runs on (AWS, Azure; more via the provider
 factory), fetches its configuration bundle, converges the node to a

@@ -25,6 +25,15 @@ The Altinity Kubernetes Operator for ClickHouse creates, configures and manages 
 >   [docs/chctl.md](docs/chctl.md). Binaries ship as GitHub Releases on
 >   `chctl-v*` tags.
 >
+> - **`c6dfdc8` — feat(chinit): cloud-adaptive node bootstrapper.** Adds
+>   `cmd/chinit` — the node bootstrap as one binary: cloud detection via a
+>   provider factory, a SHA-gated config bundle, a convergent 21-step boot
+>   pipeline with state-aware resume, and the recurring maintenance jobs
+>   (schema/replica sync, GCs, lease renewal, spot drain) as subcommands.
+>   Usage: [docs/chinit.md](docs/chinit.md); internals:
+>   [docs/chinit-architecture.md](docs/chinit-architecture.md).
+>   Binaries ship as GitHub Releases on `chinit-v*` tags.
+>
 > ```go
 > // go.mod — the module path stays the upstream path; point it at this fork.
 > replace github.com/altinity/clickhouse-operator => github.com/sks/clickhouse-operator <pseudo-version>
