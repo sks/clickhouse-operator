@@ -445,9 +445,15 @@ func TestCloudNamerTranslatesFQDNs(t *testing.T) {
 	n := newCloudNamer(map[string]string{
 		"0-0": "writer-0.ch-int-dev.clickhouse.internal",
 	})
-	// Pass a host-shaped param; translate only reacts to *v1.Host.
+	// With no Host param the CR ordinal is parsed from the pod-pattern
+	// name itself (scope-object lists pass no per-host param): the
+	// schema-sync peer list translates correctly (the live reader-0
+	// finding — peers collapsing onto self).
 	fqdn := n.translate("chi-ch-int-dev-ch-int-dev-0-0.default.svc.cluster.local", nil)
-	require.Equal(t, "chi-ch-int-dev-ch-int-dev-0-0.default.svc.cluster.local", fqdn, "no host param: pass-through")
+	require.Equal(t, "writer-0.ch-int-dev.clickhouse.internal", fqdn, "ordinal-parse: translated to the mapped address")
+	// A name whose trailing parts are not ordinals passes through.
+	fqdn = n.translate("chi-ch-int-dev-ch-int-dev-writer.default.svc.cluster.local", nil)
+	require.Equal(t, "chi-ch-int-dev-ch-int-dev-writer.default.svc.cluster.local", fqdn, "non-ordinal label: pass-through")
 }
 
 // fakeSecretsResolver stubs the secrets resolver for users tests.

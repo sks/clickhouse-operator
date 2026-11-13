@@ -15,6 +15,8 @@
 package operator
 
 import (
+	"strings"
+
 	v1 "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse.altinity.com/v1"
 	"github.com/altinity/clickhouse-operator/pkg/interfaces"
 	"github.com/altinity/clickhouse-operator/pkg/model/managers"
@@ -116,7 +118,45 @@ func (n *cloudNamer) Name(what interfaces.NameType, params ...any) string {
 // call's host param carries a CR name we know. Unknown hosts pass
 // through (a host outside the inventory keeps the operator name —
 // callers rely on the error downstream).
-func (n *cloudNamer) translate(fqdn string, params ...any) string {
+// translate maps one pod-pattern name to its cloud value. Matching:
+//  1. the call's Host params whose NATIVE name equals the output name
+//     (NameFQDN / NamePodHostname / NameInstanceHostname) — an output
+//     name belongs to exactly one of the hosts in the params;
+//  2. the CR ordinal parsed from the pod-pattern name itself
+//     (chi-{CR}-{cluster}-{shard}-{replica}...) — Names() calls that
+//     build lists from cluster/shard scope objects pass NO host param
+//     for the listed hosts;
+//  3. legacy first-Host fallback for single-target calls (ExecHost).
+//
+// Picking the first Host param unconditionally collapses every name in a
+// multi-host Names(NameFQDNs, host, scope, excludeSelf) list onto the
+// first host's address — the schema-sync peer list (excludeSelf=true
+// passes the SELF host first) degenerated to [self] and QueryAny
+// queried an empty fresh replica as the only "peer" (the live reader-0
+// finding: zero schema propagated).
+func (n *cloudNamer) translate(name string, params ...any) string {
+	for _, param := range params {
+		host, ok := param.(*v1.Host)
+		if !ok {
+			continue
+		}
+		if n.inner.Name(interfaces.NameFQDN, host) != name && n.inner.Name(interfaces.NamePodHostname, host) != name && n.inner.Name(interfaces.NameInstanceHostname, host) != name {
+			// Not the host whose native name this is — keep looking.
+			continue
+		}
+		if address, found := n.addresses[host.Runtime.Address.HostName]; found {
+			return address
+		}
+		return name
+	}
+	// Scope-object lists carry no Host param per output name: parse the
+	// CR ordinal from the pod-pattern name (chi-...-{shard}-{replica}).
+	if crHost := crHostFromPodPattern(name); crHost != "" {
+		if address, found := n.addresses[crHost]; found {
+			return address
+		}
+	}
+	// Single-target calls (ExecHost): the first Host param IS the target.
 	for _, param := range params {
 		host, ok := param.(*v1.Host)
 		if !ok {
@@ -125,8 +165,42 @@ func (n *cloudNamer) translate(fqdn string, params ...any) string {
 		if address, found := n.addresses[host.Runtime.Address.HostName]; found {
 			return address
 		}
+		break
 	}
-	return fqdn
+	return name
+}
+
+// crHostFromPodPattern extracts the CR host ordinal (shard-replica,
+// e.g. "0-1") from a pod-pattern name. The pod hostname pattern is
+// chi-{CR}-{cluster}-{shard}-{replica} and the FQDN appends the
+// namespace domain; the trailing "-{shard}-{replica}" of the first
+// label is the CR host name the addresses map is keyed by. Non-matching
+// shapes (custom patterns) yield "" and translation falls through.
+func crHostFromPodPattern(name string) string {
+	label := strings.SplitN(name, ".", 2)[0]
+	parts := strings.Split(label, "-")
+	if len(parts) < 2 {
+		return ""
+	}
+	shard, replica := parts[len(parts)-2], parts[len(parts)-1]
+	if !isOrdinal(shard) || !isOrdinal(replica) {
+		return ""
+	}
+	return shard + "-" + replica
+}
+
+// isOrdinal reports whether s is a non-negative integer (the shard and
+// replica components of a CR host name are numeric).
+func isOrdinal(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // replicaName returns the mapped cloud short hostname for the call's
