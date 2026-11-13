@@ -65,6 +65,17 @@ func (b *Boot) renderNodeConfig(ctx context.Context) error {
 		HostName:     crName,
 		OutputDir:    ConfigDir,
 		UsersDir:     UsersDir,
+		// Per-user IP allowlists from the spec: the users.d render
+		// defaults to localhost-only when the map is empty, which
+		// breaks every cross-node distributed query (Code 516
+		// Authentication failed — the interserver peer arrives from
+		// the VPC CIDR, not 127.0.0.1; the live chinit-cutover
+		// finding). The bash era passed the same lists via -networks.
+		Networks: map[string][]string{
+			"admin":   withSubnet(b.Spec.Network.AdminAllowedNetworks, b.Spec.Network.SubnetCIDR),
+			"writer":  withSubnet(b.Spec.Network.WriterAllowedNetworks, b.Spec.Network.SubnetCIDR),
+			"default": withSubnet(b.Spec.Network.DefaultUserAllowedNetworks, b.Spec.Network.SubnetCIDR),
+		},
 	}
 	if b.Spec.Role != model.RoleBackup {
 		// The inventory host list renders remote_servers; writers and
@@ -121,6 +132,24 @@ func (b *Boot) clusterHosts() []domain.HostIdentity {
 		})
 	}
 	return hosts
+}
+
+// withSubnet merges the node subnet CIDR into a user's allowlist: the
+// cluster's own peers, the NLB health checks and the config refresher
+// all arrive from the subnet — without it every cross-node query is
+// Code 516 Authentication failed.
+func withSubnet(networks []string, subnetCIDR string) []string {
+	if subnetCIDR == "" {
+		return networks
+	}
+	for _, n := range networks {
+		if n == subnetCIDR {
+			return networks
+		}
+	}
+	out := make([]string, 0, len(networks)+1)
+	out = append(out, networks...)
+	return append(out, subnetCIDR)
 }
 
 // configureKeeper renders the keeper single-file config, enables the
