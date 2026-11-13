@@ -64,9 +64,16 @@ func (b *Boot) Steps(ctx context.Context) ([]Step, error) {
 			return tuner.Tune(ctx)
 		}),
 		StepFunc("require_binaries", Critical, onceFatal, func(ctx context.Context) error {
-			return tuner.RequireBinaries(ctx, []string{
-				"clickhouse-server", "clickhouse-client", "chctl", "aws",
-			})
+			// chctl + clickhouse binaries: every cloud (the render goes
+			// through chctl's library but the recurring-job subcommands
+			// exec the chctl CLI). The `aws` CLI is AWS-only — an Azure
+			// node never has it, and requiring it there would fail every
+			// boot fatally.
+			bins := []string{"clickhouse-server", "clickhouse-client", "chctl"}
+			if b.Provider.Name() == "aws" {
+				bins = append(bins, "aws")
+			}
+			return tuner.RequireBinaries(ctx, bins)
 		}),
 
 		// 4. Mount data disks (metadata Critical; cache/keeper degrade
