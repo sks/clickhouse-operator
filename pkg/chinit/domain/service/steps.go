@@ -96,6 +96,13 @@ func (b *Boot) Steps(ctx context.Context) ([]Step, error) {
 		// keepers, backup) needs no claim.
 		StepFunc("settle_identity", Critical, claimSweep, b.settleIdentity),
 
+		// 5b. Peer /etc/hosts entries: short names must resolve
+		// locally (systemd-resolved's stub breaks short-name DNS and
+		// the replication queue addresses the leader by its SHORT
+		// name — Cannot resolve host writer-0 stalls every part
+		// fetch; the bash era's configure_peer_hosts step).
+		StepFunc("configure_peer_hosts", Critical, onceFatal, b.configurePeerHosts),
+
 		// 7. Passwords land BEFORE the render (passwordFrom refs and
 		// the distributed-query password files the render consumes).
 		StepFunc("retrieve_passwords", Critical, apiRetry, b.retrievePasswords),
@@ -426,5 +433,38 @@ func setSystemHostname(ctx context.Context, hostname string) error {
 		}
 	}
 	_, _ = runCommand(ctx, "hostnamectl", "set-hostname", hostname, "--transient")
+	return nil
+}
+
+// configurePeerHosts writes /etc/hosts entries for the WRITER short
+// names: the replication queue addresses the leader by its short name
+// and systemd-resolved's stub resolver does not answer short names —
+// Cannot resolve host writer-0 stalls every part fetch (the bash era's
+// configure_peer_hosts step, restored for the chinit cutover finding).
+func (b *Boot) configurePeerHosts(ctx context.Context) error {
+	// Keepers register themselves in Keeper's own host records; the
+	// short-name problem is a server-node concern.
+	if b.Spec.Role == model.RoleKeeper {
+		return nil
+	}
+	existing, _ := os.ReadFile("/etc/hosts")
+	for i, name := range b.Spec.WriterNodes {
+		ip := fmt.Sprintf("10.0.1.%d", 10+i)
+		fqdn := fmt.Sprintf("%s.%s", name, b.Spec.DNSZoneName)
+		if strings.Contains(string(existing), " "+name+" ") ||
+			strings.Contains(string(existing), " "+fqdn) {
+			continue
+		}
+		entry := fmt.Sprintf("%s %s %s\n", ip, name, fqdn)
+		f, err := os.OpenFile("/etc/hosts", os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			return Fatal(fmt.Errorf("open /etc/hosts: %w", err))
+		}
+		if _, err := f.WriteString(entry); err != nil {
+			_ = f.Close()
+			return Fatal(fmt.Errorf("append /etc/hosts: %w", err))
+		}
+		_ = f.Close()
+	}
 	return nil
 }

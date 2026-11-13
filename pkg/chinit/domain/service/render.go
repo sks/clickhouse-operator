@@ -82,6 +82,18 @@ func (b *Boot) renderNodeConfig(ctx context.Context) error {
 		// readers are both CR members. The DNS-zone addressing is the
 		// same convention the CHI spec's templates carry.
 		request.Hosts = b.clusterHosts()
+		// Replica names (the {replica} macro value): without this map
+		// the macros render the operator's POD pattern
+		// (chi-<chi>-<cluster>-<shard>-<replica>) as the replica
+		// identity — the keeper replica_path then registers under a
+		// name no cloud tooling recognizes, and SYSTEM SYNC REPLICA
+		// / DROP REPLICA operate on the wrong identity (the live
+		// chinit-cutover finding). The bash era passed -replica
+		// 01-$idx=$hostname.
+		request.Replicas = map[string]string{}
+		for _, h := range b.clusterHosts() {
+			request.Replicas[h.Name] = strings.SplitN(h.Address, ".", 2)[0]
+		}
 		// Distributed-query credentials: without an injected
 		// <user>/<password> in remote_servers, every cross-node query
 		// authenticates as the passwordless default against nodes
