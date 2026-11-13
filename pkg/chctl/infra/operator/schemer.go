@@ -17,6 +17,7 @@ package operator
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -310,5 +311,25 @@ func (r *SchemaRunner) host(name string) (*v1.Host, error) {
 			return host, nil
 		}
 	}
-	return nil, fmt.Errorf("host %q not in inventory", name)
+	// The miss must name what IS valid: an operator reading this from a
+	// node bootstrap log has no other way to learn the inventory's
+	// names (the live finding — "host \"ip-10-0-1-53\" not in inventory"
+	// gave no clue what the valid names were). CR names and cloud short
+	// names both address the same host, so both are listed.
+	return nil, fmt.Errorf("host %q not in inventory (available: %s)", name, strings.Join(r.inventoryNames(), ", "))
+}
+
+// inventoryNames lists every name that host() would accept, sorted
+// (deterministic for logs and tests) — the CR name plus the cloud short
+// name (first FQDN label) of every host in the inventory.
+func (r *SchemaRunner) inventoryNames() []string {
+	names := make([]string, 0, 2*len(r.hosts))
+	for name, host := range r.hosts {
+		names = append(names, name)
+		if short := strings.Split(host.Runtime.Address.FQDN, ".")[0]; short != "" && short != name {
+			names = append(names, short)
+		}
+	}
+	sort.Strings(names)
+	return names
 }

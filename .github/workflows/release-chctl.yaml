@@ -48,7 +48,11 @@ jobs:
       - name: Cross-build
         run: |
           VERSION="${GITHUB_REF_NAME#chctl-v}"
-          LDFLAGS="-s -w"
+          # Version injection: node bootstrap compares the installed
+          # binary's version against the targeted release (chctl version)
+          # instead of unconditionally overwriting. -s -w keep the
+          # stripped static binary behavior.
+          LDFLAGS="-s -w -X github.com/altinity/clickhouse-operator/pkg/chctl/app.Version=${VERSION}"
           mkdir -p dist
           for target in linux/arm64 linux/amd64 darwin/arm64 darwin/amd64; do
             os="${target%/*}"; arch="${target#*/}"
@@ -80,9 +84,6 @@ jobs:
             --repo "${GITHUB_REPOSITORY}" \
             --title "chctl ${VERSION}" \
             --notes "$(cat <<NOTES
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "chctl ${VERSION}" \
-            --notes "$(cat <<NOTES
           ## chctl ${VERSION}
 
           Off-cluster ClickHouse control CLI — renders node configs and runs
@@ -101,6 +102,11 @@ jobs:
           \`\`\`bash
           curl -fsSL -o SHA256SUMS https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/chctl-SHA256SUMS
           sha256sum -c --ignore-missing SHA256SUMS
+          \`\`\`
+
+          Version check (bootstrap scripts compare before overwriting):
+          \`\`\`bash
+          ./chctl version   # chctl ${VERSION}
           \`\`\`
 
           Built from \`${GITHUB_SHA}\` at tag \`${GITHUB_REF_NAME}\`.

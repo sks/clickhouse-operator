@@ -163,6 +163,12 @@ func (r *ConfigRenderer) RenderCHK(ctx context.Context, request port.RenderCHKRe
 	// service pattern — unresolvable off-cluster. The wrapped namer
 	// translates them to the cloud DNS names from KeeperAddresses.
 	keeperNamer := newKeeperCloudNamer(mergeHostAddresses(hostInventory(request.Hosts), request.KeeperAddresses))
+	if warning := keeperListenHostWarning(cr); warning != "" {
+		// Lint, not a gate: the render stays valid output; the warning
+		// tells the operator the config will not listen as intended
+		// before the fleet finds out empirically.
+		fmt.Fprintln(os.Stderr, warning)
+	}
 	gen := chkConfig.NewGenerator(cr, keeperNamer, chkGeneratorOptions(cr))
 	genDomain := chkConfig.NewFilesGeneratorDomain(gen)
 	filesGenerator := chkConfig.NewFilesGenerator(gen, chop.Config().Keeper.Config.File.Runtime, genDomain)
@@ -238,6 +244,54 @@ func (r *ConfigRenderer) RenderCHK(ctx context.Context, request port.RenderCHKRe
 	}
 
 	return rendered, nil
+}
+
+// keeperListenHostSetting is the settings key the live AWS stack put
+// under keeper_server — the exact key keeper IGNORES.
+const keeperListenHostSetting = "keeper_server/listen_host"
+
+// keeperListenHostWarning reports the keeper_server/listen_host gotcha:
+// clickhouse-keeper ignores the setting, so a spec carrying it renders
+// a config whose client port stays on 127.0.0.1 — no fleet node can
+// reach mntr or replication until listen_host moves to a ROOT-level
+// files entry (<clickhouse><listen_host>).
+//
+// Why a render-time warning (not a gate): the render is still valid
+// output and the CR must never be modified in place. The check is
+// surgical — the normalized settings trees are queried for exactly
+// this key: the CR-level configuration settings (where the CHK
+// generator reads them, so every host inherits the misplacement) and
+// each host's own settings (a host-scoped spec puts the key there
+// instead). The named hosts make the warning actionable; a bare
+// "check your spec" would force the operator to re-derive which host
+// they belong to.
+//
+// Without it: nothing surfaces the misconfiguration until every keeper
+// in the fleet is unreachable and the error has to be re-derived by
+// hand (the live finding: no mntr, no replication, from one nesting
+// mistake).
+func keeperListenHostWarning(cr *chk.ClickHouseKeeperInstallation) string {
+	var offenders []string
+	cr.WalkHosts(func(host *v1.Host) error {
+		if host.GetSettings().Has(keeperListenHostSetting) {
+			offenders = append(offenders, host.Runtime.Address.HostName)
+			return nil
+		}
+		// The CR-level settings apply cluster-wide: every host inherits
+		// a misplaced key there, so each host is named once.
+		if cr.GetSpecT().GetConfiguration().GetSettings().Has(keeperListenHostSetting) {
+			offenders = append(offenders, host.Runtime.Address.HostName)
+		}
+		return nil
+	})
+	if len(offenders) == 0 {
+		return ""
+	}
+	sort.Strings(offenders)
+	return fmt.Sprintf(
+		"WARNING: keeper_server/listen_host is IGNORED by clickhouse-keeper (it is a ROOT-level setting; "+
+			"put <listen_host> in a root-level files entry in the spec) — the rendered config will not listen as intended (hosts: %s)",
+		strings.Join(offenders, ", "))
 }
 
 // applyServerIDOverride replaces the rendered host server-id section's

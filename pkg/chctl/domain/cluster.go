@@ -77,8 +77,36 @@ type Credentials struct {
 // SchemaSyncRequest asks the schema service to create all objects on a host.
 type SchemaSyncRequest struct {
 	// HostName is the node whose schema is (re)created from cluster peers
-	// (the new-reader boot case).
+	// (the new-reader boot case). Either a CR name ("0-1") or a cloud name
+	// ("reader-0") resolves; for PruneStaleSelf it must be the replica
+	// identity the deployment's macros declare (the cloud short name) —
+	// the same name `replica drop` takes.
 	HostName string
+	// Retries bounds the number of full create passes (0 = the service
+	// default, 2). A pass that succeeds ends the loop early; the last
+	// pass's error is returned.
+	//
+	// Why more than one pass: the operator's per-SQL retry re-runs failed
+	// statements, but ordering across a fresh pass is not guaranteed — a
+	// materialized view whose TO-target table lands later in the same
+	// batch needs a second deterministic pass (the live finding: one MV
+	// left uncreated until a manual second run).
+	Retries int
+	// PruneStaleSelf reclaims the target's OWN stale Keeper registration
+	// when a create pass fails with Code 253 ("Replica
+	// .../replicas/<host> already exists") — an ASG/VMSS replacement node
+	// re-claiming an ordinal whose dead predecessor left a PERSISTENT
+	// znode. The service runs the `replica drop` pair for the name the
+	// failed pass reports, then retries the create pass. Safe by
+	// construction: only the registration the target itself is about to
+	// claim is ever dropped, never any other host's.
+	PruneStaleSelf bool
+	// RunOn is the host the prune drop executes on. Empty = HostName: the
+	// same host the create pass executes on (HostCreateTables runs its SQL
+	// on the target itself). A fresh replacement node is schemaless, so
+	// running the drop there removes only the dead predecessor's
+	// registration — no peer flag is needed.
+	RunOn string
 }
 
 // ReplicaDropRequest asks the schema service to remove a dead replica's

@@ -48,9 +48,18 @@ type fakeSchemaRunner struct {
 	dropErrs map[string]error
 	// drops records every drop attempt, in order.
 	drops []domain.ReplicaDropRequest
+	// syncErrs maps pass numbers (0-based) to the error that pass of
+	// SyncSchema returns; passes without an entry succeed.
+	syncErrs map[int]error
+	// syncs records the schema sync requests served, in order.
+	syncs []domain.SchemaSyncRequest
 }
 
 func (f *fakeSchemaRunner) SyncSchema(ctx context.Context, request domain.SchemaSyncRequest) error {
+	f.syncs = append(f.syncs, request)
+	if err, ok := f.syncErrs[len(f.syncs)-1]; ok {
+		return err
+	}
 	return nil
 }
 
@@ -295,4 +304,206 @@ func TestGcReplicaPropagatesDetectionError(t *testing.T) {
 	_, err := svc.GcReplica(context.Background(), request, domain.ReplicaGcRequest{RunOn: "writer-0"})
 	require.ErrorContains(t, err, "no such host")
 	require.Empty(t, runner.drops)
+}
+
+func TestSyncSchemaOneCleanPass(t *testing.T) {
+	// The default behavior: a single clean create pass ends the loop —
+	// no second pass, no drop attempts.
+	runner := &fakeSchemaRunner{}
+	svc, request := gcTestService(runner)
+
+	err := svc.SyncSchema(context.Background(), request, domain.SchemaSyncRequest{
+		HostName: "reader-0",
+		Retries:  3,
+	})
+	require.NoError(t, err)
+	require.Len(t, runner.syncs, 1, "early stop: one pass must not be followed by more")
+	require.Empty(t, runner.drops)
+}
+
+func TestSyncSchemaRetriesUntilCleanPass(t *testing.T) {
+	// The MV finding: pass 1 fails (the TO-target table lands later in
+	// the same batch), pass 2 sees it existing and succeeds. Without the
+	// retry loop a manual second run was the only fix.
+	runner := &fakeSchemaRunner{syncErrs: map[int]error{
+		0: errors.New("Code: 60. Table db.mv does not exist"),
+	}}
+	svc, request := gcTestService(runner)
+
+	err := svc.SyncSchema(context.Background(), request, domain.SchemaSyncRequest{
+		HostName: "reader-0",
+		Retries:  3,
+	})
+	require.NoError(t, err)
+	require.Len(t, runner.syncs, 2, "the second pass must run and succeed")
+	require.Empty(t, runner.drops, "a non-253 failure never prunes")
+}
+
+func TestSyncSchemaLastPassErrorIsReturned(t *testing.T) {
+	// Every pass failing returns the LAST pass's error after exactly
+	// Retries passes (0 = the default, 2).
+	runner := &fakeSchemaRunner{syncErrs: map[int]error{
+		0: errors.New("pass one: connection refused"),
+		1: errors.New("pass two: connection refused"),
+		2: errors.New("pass three must never run"),
+	}}
+	svc, request := gcTestService(runner)
+
+	err := svc.SyncSchema(context.Background(), request, domain.SchemaSyncRequest{HostName: "reader-0"})
+	require.ErrorContains(t, err, "pass two")
+	require.Len(t, runner.syncs, 2, "Retries 0 must normalize to the default 2")
+}
+
+func TestSyncSchemaDefaultRetries(t *testing.T) {
+	// The default loop count is a named constant the flag default binds
+	// to — the app flag and the service must not drift apart.
+	require.Equal(t, 2, DefaultSchemaSyncRetries)
+}
+
+func TestSyncSchemaPruneStaleSelfDropsAndRetries(t *testing.T) {
+	// The ASG-replacement finding: the create pass fails with Code 253
+	// naming the target's own registration. With the flag set, the stale
+	// registration is dropped (the target's own name, run on the target)
+	// and the create pass retries — the manual `replica drop` recovery
+	// automated.
+	runner := &fakeSchemaRunner{syncErrs: map[int]error{
+		0: errors.New("Code: 253. Replica /clickhouse/tables/1/logexplorer/replicas/reader-0 already exists"),
+	}}
+	svc, request := gcTestService(runner)
+
+	err := svc.SyncSchema(context.Background(), request, domain.SchemaSyncRequest{
+		HostName:       "reader-0",
+		Retries:        2,
+		PruneStaleSelf: true,
+	})
+	require.NoError(t, err, "the retry pass must succeed once the stale znode is reclaimed")
+	require.Len(t, runner.syncs, 2)
+	require.Len(t, runner.drops, 1)
+	require.Equal(t, "reader-0", runner.drops[0].HostName,
+		"only the target's own replica name is ever dropped")
+	require.Equal(t, "reader-0", runner.drops[0].RunOn,
+		"the drop runs on the target itself — HostCreateTables executes there")
+}
+
+func TestSyncSchemaPruneStaleSelfUnflaggedNeverDrops(t *testing.T) {
+	// The flag is opt-in (destructive-adjacent): the identical 253 error
+	// without the flag surfaces immediately, naming the recovery flag —
+	// and no drop attempt may ever run.
+	runner := &fakeSchemaRunner{syncErrs: map[int]error{
+		0: errors.New("Code: 253. Replica /clickhouse/tables/1/logexplorer/replicas/reader-0 already exists"),
+	}}
+	svc, request := gcTestService(runner)
+
+	err := svc.SyncSchema(context.Background(), request, domain.SchemaSyncRequest{
+		HostName: "reader-0",
+		Retries:  2,
+	})
+	require.Error(t, err, "unflagged: the 253 error is returned, never worked around")
+	require.ErrorContains(t, err, "-prune-stale-self")
+	require.Empty(t, runner.drops, "unflagged: no DropReplica may ever run")
+	require.Len(t, runner.syncs, 1, "retrying the same znode is pointless — the error surfaces after the first pass")
+}
+
+func TestSyncSchemaPruneStaleSelfSkipsNonRegistrationErrors(t *testing.T) {
+	// A failure that is not an already-exists registration (a connection
+	// refusal, a missing target table) must never prune, even flagged.
+	runner := &fakeSchemaRunner{syncErrs: map[int]error{
+		0: errors.New("Code: 60. Table db.mv does not exist"),
+		1: errors.New("Code: 60. Table db.mv does not exist"),
+	}}
+	svc, request := gcTestService(runner)
+
+	err := svc.SyncSchema(context.Background(), request, domain.SchemaSyncRequest{
+		HostName:       "reader-0",
+		Retries:        2,
+		PruneStaleSelf: true,
+	})
+	require.ErrorContains(t, err, "db.mv")
+	require.Empty(t, runner.drops, "a non-253 error must never prune")
+}
+
+func TestSyncSchemaPruneStaleSelfDropFailureSurfacesBoth(t *testing.T) {
+	// When the prune drop itself fails (keeper unreachable), the error
+	// must name the prune AND keep the create failure it was responding
+	// to — an operator reading one line has both halves.
+	runner := &fakeSchemaRunner{
+		syncErrs: map[int]error{
+			0: errors.New("Code: 253. Replica /clickhouse/tables/1/logexplorer/replicas/reader-0 already exists"),
+		},
+		dropErrs: map[string]error{"reader-0": errors.New("keeper unreachable")},
+	}
+	svc, request := gcTestService(runner)
+
+	err := svc.SyncSchema(context.Background(), request, domain.SchemaSyncRequest{
+		HostName:       "reader-0",
+		Retries:        2,
+		PruneStaleSelf: true,
+	})
+	require.ErrorContains(t, err, "prune stale self")
+	require.ErrorContains(t, err, "keeper unreachable")
+	require.ErrorContains(t, err, "already exists")
+}
+
+func TestSyncSchemaPruneStaleSelfRespectsCustomRunOn(t *testing.T) {
+	// RunOn steers the prune drop to a peer when the caller needs the SQL
+	// executed elsewhere (empty RunOn = the target itself).
+	runner := &fakeSchemaRunner{syncErrs: map[int]error{
+		0: errors.New("Code: 253. Replica /clickhouse/tables/1/logexplorer/replicas/reader-0 already exists"),
+	}}
+	svc, request := gcTestService(runner)
+
+	err := svc.SyncSchema(context.Background(), request, domain.SchemaSyncRequest{
+		HostName:       "reader-0",
+		RunOn:          "writer-0",
+		Retries:        2,
+		PruneStaleSelf: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, runner.drops, 1)
+	require.Equal(t, "reader-0", runner.drops[0].HostName)
+	require.Equal(t, "writer-0", runner.drops[0].RunOn)
+}
+
+func TestStaleSelfRegistration(t *testing.T) {
+	// The error-shape extraction: the replica name is the final path
+	// segment after /replicas/ in the Code 253 message the driver
+	// surfaces, or the quoted replica argument.
+	cases := []struct {
+		name     string
+		err      error
+		expected string
+		found    bool
+	}{
+		{
+			name:     "the live path shape",
+			err:      errors.New("Code: 253. Replica /clickhouse/tables/1/logexplorer/replicas/reader-0 already exists"),
+			expected: "reader-0",
+			found:    true,
+		},
+		{
+			name:     "quoted replica form",
+			err:      errors.New("Code: 253: Replica 'reader-0' already exists"),
+			expected: "reader-0",
+			found:    true,
+		},
+		{
+			name:     "not a 253",
+			err:      errors.New("Code: 60. Table db.mv does not exist"),
+			expected: "",
+			found:    false,
+		},
+		{
+			name:     "nil error",
+			err:      nil,
+			expected: "",
+			found:    false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			name, found := staleSelfRegistration(c.err)
+			require.Equal(t, c.found, found)
+			require.Equal(t, c.expected, name)
+		})
+	}
 }

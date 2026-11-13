@@ -30,6 +30,7 @@ import (
 	"strings"
 	"testing"
 
+	chk "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse-keeper.altinity.com/v1"
 	v1 "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse.altinity.com/v1"
 	"github.com/altinity/clickhouse-operator/pkg/chctl/domain"
 	"github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
@@ -1066,6 +1067,62 @@ func renderCHKFiles(t *testing.T, request port.RenderCHKRequest) map[string]stri
 	return files
 }
 
+func TestKeeperListenHostWarningWithTheKey(t *testing.T) {
+	// The live finding: keeper IGNORES keeper_server/listen_host — the
+	// client port stayed on 127.0.0.1 and no fleet node could reach
+	// mntr or replication until the setting moved to a root-level files
+	// entry. The render must warn, name every offending host, and stay
+	// a successful render.
+	cr := loadCHKFromSpec(t, keeperSingleFileSpec)
+	warning := keeperListenHostWarning(cr.(*chk.ClickHouseKeeperInstallation))
+	require.Contains(t, warning, "keeper_server/listen_host is IGNORED by clickhouse-keeper")
+	require.Contains(t, warning, "ROOT-level setting")
+	require.Contains(t, warning, "0-0, 0-1, 0-2", "the warning names the offending hosts, sorted")
+}
+
+func TestKeeperListenHostWarningWithoutTheKey(t *testing.T) {
+	// A spec without the key renders silently — no false-positive noise
+	// on healthy specs.
+	cr := loadCHKFromSpec(t, `
+apiVersion: clickhouse-keeper.altinity.com/v1
+kind: ClickHouseKeeperInstallation
+metadata:
+  name: keeper-clean
+spec:
+  configuration:
+    clusters:
+      - name: keeper
+        layout:
+          replicasCount: 2
+    settings:
+      keeper_server/tcp_port: "9181"
+`)
+	require.Empty(t, keeperListenHostWarning(cr.(*chk.ClickHouseKeeperInstallation)))
+}
+
+func TestRenderCHKPrintsListenHostWarningToStderr(t *testing.T) {
+	// The end-to-end wiring: RenderCHK writes the warning to stderr and
+	// still returns a successful render — the check never gates output.
+	cr := loadCHKFromSpec(t, keeperSingleFileSpec)
+
+	original := os.Stderr
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	os.Stderr = w
+	rendered, renderErr := NewConfigRenderer().RenderCHK(context.Background(), port.RenderCHKRequest{
+		NormalizedCR: cr,
+		OutputDir:    t.TempDir(),
+		DryRun:       true,
+	})
+	_ = w.Close()
+	os.Stderr = original
+	require.NoError(t, renderErr)
+	require.NotEmpty(t, rendered)
+
+	captured, _ := io.ReadAll(r)
+	require.Contains(t, string(captured), "keeper_server/listen_host is IGNORED")
+}
+
 func TestSchemaRunnerHostResolvesCloudName(t *testing.T) {
 	// The real stack's inventory keys are CR ordinals (0-2) with cloud
 	// DNS addresses (reader-3.aws.internal); the GC detects system.replicas
@@ -1088,6 +1145,30 @@ func TestSchemaRunnerHostResolvesCloudName(t *testing.T) {
 
 	_, err = runner.host("reader-9")
 	require.ErrorContains(t, err, "not in inventory")
+}
+
+func TestSchemaRunnerHostMissListsAvailableNames(t *testing.T) {
+	// The live finding: "host \"ip-10-0-1-53\" not in inventory" gave
+	// no clue what the valid names are. The miss must name every form
+	// host() accepts — CR names AND cloud short names, sorted — so an
+	// operator reading a bootstrap log can fix the call without
+	// re-deriving the inventory.
+	runner := newGCRunner(t)
+	_, err := runner.host("ip-10-0-1-53")
+	require.ErrorContains(t, err, `host "ip-10-0-1-53" not in inventory (available: 0-0, writer-0)`,
+		"the miss must carry the deterministic available-names suffix")
+
+	// Deterministic: the same runner reports the same suffix twice.
+	_, err2 := runner.host("other")
+	require.ErrorContains(t, err2, "(available: 0-0, writer-0)")
+}
+
+func TestSchemaRunnerHostMissSingleLine(t *testing.T) {
+	// The error stays single-line: node bootstrap logs paste it whole
+	// into issue trackers and one-line greps.
+	runner := newGCRunner(t)
+	_, err := runner.host("nope")
+	require.NotContains(t, err.Error(), "\n")
 }
 
 func TestSchemaRunnerDropReplicaUnknownHost(t *testing.T) {

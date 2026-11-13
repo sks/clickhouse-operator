@@ -512,3 +512,231 @@ func TestReadUserPasswordHashesNeverEchoesBytes(t *testing.T) {
 	require.NotContains(t, err.Error(), "super-secret",
 		"password bytes never appear in error messages")
 }
+
+func TestPrintVersionPrintsBuildVersion(t *testing.T) {
+	// The version line is machine-comparable for bootstrap scripts: it
+	// starts with `chctl <version>` — the build-injected value, verbatim;
+	// the Go toolchain, when available, only follows it.
+	var out bytes.Buffer
+	printVersion(&out)
+	line := strings.TrimRight(out.String(), "\n")
+	require.NotEmpty(t, line, "printVersion must write a version line")
+	require.True(t, strings.HasPrefix(line, "chctl "+Version),
+		"line %q must start with chctl %s", line, Version)
+}
+
+func TestRunVersionDispatch(t *testing.T) {
+	// `chctl version` must dispatch without touching the filesystem or
+	// the other subcommands (an unknown command must NOT print it).
+	err := Run([]string{"version"})
+	require.NoError(t, err)
+}
+
+func TestUsageMentionsVersionAndSchemaSyncFlags(t *testing.T) {
+	// The help must list the version subcommand and the new schema sync
+	// flags (docs update is a separate todo).
+	var out bytes.Buffer
+	usageWith(&out)
+	require.Contains(t, out.String(), "chctl version")
+	require.Contains(t, out.String(), "[-retries 2]")
+	require.Contains(t, out.String(), "[-prune-stale-self]")
+	require.Contains(t, out.String(), Version, "the version line carries the build version")
+	// The ordering note replaced the old "positional after flags" warning.
+	require.Contains(t, out.String(), "ANY order")
+	require.NotContains(t, out.String(), "comes after the flags")
+}
+
+func TestSeparatePositionals(t *testing.T) {
+	// Table-driven over the shapes the pre-scan must handle: positional
+	// first/last, bool flags (no value), repeatable -host Var flags
+	// (value-consuming), the -- terminator, a value that looks like a
+	// name, and self-contained =value forms.
+	cases := []struct {
+		name        string
+		args        []string
+		flagsOnly   []string
+		positionals []string
+	}{
+		{
+			name:        "positional last",
+			args:        []string{"-cluster", "x", "-secure", "reader-0"},
+			flagsOnly:   []string{"-cluster", "x", "-secure"},
+			positionals: []string{"reader-0"},
+		},
+		{
+			name:        "positional first (the live finding)",
+			args:        []string{"reader-0", "-cluster", "x", "-secure"},
+			flagsOnly:   []string{"-cluster", "x", "-secure"},
+			positionals: []string{"reader-0"},
+		},
+		{
+			name:        "positional between flags",
+			args:        []string{"-cluster", "x", "reader-0", "-secure"},
+			flagsOnly:   []string{"-cluster", "x", "-secure"},
+			positionals: []string{"reader-0"},
+		},
+		{
+			name:        "repeatable -host Var flags consume their values",
+			args:        []string{"reader-0", "-host", "0-0=w.ip", "-host", "0-1=r.ip", "-cluster", "x"},
+			flagsOnly:   []string{"-host", "0-0=w.ip", "-host", "0-1=r.ip", "-cluster", "x"},
+			positionals: []string{"reader-0"},
+		},
+		{
+			name:        "bool flag takes no value",
+			args:        []string{"-secure", "reader-0"},
+			flagsOnly:   []string{"-secure"},
+			positionals: []string{"reader-0"},
+		},
+		{
+			name:        "-- terminator ends flag scanning",
+			args:        []string{"-cluster", "x", "--", "-secure", "reader-0"},
+			flagsOnly:   []string{"-cluster", "x", "--", "-secure", "reader-0"},
+			positionals: []string{"-secure", "reader-0"},
+		},
+		{
+			name:        "a flag value that looks like a name stays a value",
+			args:        []string{"-user", "admin", "reader-0"},
+			flagsOnly:   []string{"-user", "admin"},
+			positionals: []string{"reader-0"},
+		},
+		{
+			name:        "self-contained =value form",
+			args:        []string{"-cluster=x", "reader-0", "-user=admin"},
+			flagsOnly:   []string{"-cluster=x", "-user=admin"},
+			positionals: []string{"reader-0"},
+		},
+		{
+			name:        "double-dash flag form",
+			args:        []string{"--cluster", "x", "--secure", "reader-0"},
+			flagsOnly:   []string{"--cluster", "x", "--secure"},
+			positionals: []string{"reader-0"},
+		},
+		{
+			name:        "no flags at all",
+			args:        []string{"reader-0", "reader-1"},
+			flagsOnly:   []string{},
+			positionals: []string{"reader-0", "reader-1"},
+		},
+		{
+			name:        "int flag consumes its value",
+			args:        []string{"reader-0", "-port", "8443", "-retries", "3"},
+			flagsOnly:   []string{"-port", "8443", "-retries", "3"},
+			positionals: []string{"reader-0"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fs, _, _, _, _, _, _, _, err := newSchemaFlagSet("test")
+			require.NoError(t, err)
+			// The -retries/-prune-stale-self/-on/-name-pattern flags the
+			// real command sets: bound through the same FlagSet the scan
+			// reads.
+			var retries int
+			var prune bool
+			var runOn string
+			var pattern string
+			fs.IntVar(&retries, "retries", 2, "")
+			fs.BoolVar(&prune, "prune-stale-self", false, "")
+			fs.StringVar(&runOn, "on", "", "")
+			fs.StringVar(&pattern, "name-pattern", "reader-*", "")
+
+			flagArgs, positionals := separatePositionals(fs, c.args)
+			require.Equal(t, c.flagsOnly, flagArgs)
+			require.Equal(t, c.positionals, positionals)
+
+			// The pre-scan never executes flags; fs.Parse over the
+			// stripped list must accept every case and bind the values.
+			require.NoError(t, fs.Parse(flagArgs))
+		})
+	}
+}
+
+func TestSeparatePositionalsLeavesUnknownFlagsToParse(t *testing.T) {
+	// A typo'd flag must keep flag-package semantics: left for fs.Parse
+	// to reject with its own message, never mistaken for a positional.
+	// Its value token is positional by shape (a bare word) — fs.Parse
+	// rejects the unknown flag first.
+	fs, _, _, _, _, _, _, _, err := newSchemaFlagSet("test")
+	require.NoError(t, err)
+	flagArgs, positionals := separatePositionals(fs, []string{"reader-0", "-clustr"})
+	require.Equal(t, []string{"-clustr"}, flagArgs)
+	require.Equal(t, []string{"reader-0"}, positionals)
+	require.Error(t, fs.Parse(flagArgs))
+}
+
+func schemaTestSpec(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "chi.yaml")
+	// A minimal-but-parseable CHI: the schema commands load the spec
+	// AFTER flag validation, so the file only needs to exist.
+	require.NoError(t, os.WriteFile(path, []byte(`
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: pos
+spec:
+  configuration:
+    clusters:
+      - name: logexplorer
+        layout: { shardsCount: 1, replicasCount: 1 }
+`), 0o600))
+	return path
+}
+
+func TestRunReplicaDropAcceptsPositionalFirst(t *testing.T) {
+	// The live finding, end-to-end: `replica drop reader-0 -spec ...`
+	// previously failed with "-cluster is required" (Go's flag package
+	// stops at the first positional). Now the spec-read stage is reached
+	// — proving the -cluster flag was parsed and bound.
+	err := runReplicaDrop([]string{
+		"reader-0", "-spec", schemaTestSpec(t), "-cluster", "logexplorer", "-on", "0-0",
+	})
+	// The failure must be past flag validation (an inventory/host
+	// error), never "-cluster is required".
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "-cluster is required")
+	require.NotContains(t, err.Error(), "-spec is required")
+	require.NotContains(t, err.Error(), "-on is required")
+}
+
+func TestRunSchemaSyncFlagsAfterPositionalReachSpecRead(t *testing.T) {
+	// The same pre-scan for schema sync: flags after the positional are
+	// bound (the runner-build stage is reached, not flag validation).
+	err := runSchema([]string{
+		"sync", "0-1", "-spec", schemaTestSpec(t), "-cluster", "logexplorer",
+		"-host", "0-0=writer-0.example.internal", "-secure",
+	})
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "-cluster is required")
+	require.NotContains(t, err.Error(), "usage:")
+}
+
+func TestRunSchemaSyncRejectsRetriesBelowOne(t *testing.T) {
+	// -retries 0 (or negative) is a usage error: zero passes would mean
+	// "do nothing and report success", which no caller wants.
+	err := runSchema([]string{
+		"sync", "0-1", "-spec", schemaTestSpec(t), "-cluster", "logexplorer", "-retries", "0",
+	})
+	require.ErrorContains(t, err, "-retries must be at least 1")
+}
+
+func TestRunSchemaSyncExactOnePositionalValidation(t *testing.T) {
+	// Both missing and multiple positionals stay usage errors under the
+	// pre-scan (the positionals are counted before any spec load).
+	err := runSchema([]string{"sync", "-spec", schemaTestSpec(t), "-cluster", "logexplorer"})
+	require.ErrorContains(t, err, "got 0 positional argument(s)")
+	err = runSchema([]string{
+		"sync", "0-1", "0-2", "-spec", schemaTestSpec(t), "-cluster", "logexplorer",
+	})
+	require.ErrorContains(t, err, "got 2 positional argument(s)")
+}
+
+func TestRunReplicaGcRejectsStrayPositional(t *testing.T) {
+	// gc is flag-only: a stray positional must fail as a usage error, not
+	// be silently swallowed as a flag value (the pre-scan surfaces it).
+	err := runReplicaGc([]string{
+		"writer-0", "-spec", schemaTestSpec(t), "-cluster", "logexplorer", "-on", "0-0",
+	})
+	require.ErrorContains(t, err, "no positional argument")
+	require.ErrorContains(t, err, "writer-0")
+}

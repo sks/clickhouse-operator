@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -36,6 +37,15 @@ import (
 	"github.com/altinity/clickhouse-operator/pkg/chctl/infra/keeper"
 	"github.com/altinity/clickhouse-operator/pkg/chctl/infra/operator"
 )
+
+// Version is the chctl build version. The release workflow overrides it
+// at build time via -ldflags "-X .../app.Version=<tag>"; locally it stays
+// "dev".
+//
+// Why a build-time var: node bootstrap needs to compare the installed
+// binary's version against the targeted release instead of
+// unconditionally overwriting (and re-rendering configs) on every boot.
+var Version = "dev"
 
 // Exit codes for scripts and lifecycle hooks. Keeping the two failure modes
 // apart stops a broken probe from being misread as "safe" or as a gate
@@ -65,6 +75,9 @@ func Run(args []string) error {
 		return runReplica(rest)
 	case "keeper":
 		return runKeeper(rest)
+	case "version":
+		printVersion(os.Stdout)
+		return nil
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -74,6 +87,17 @@ func Run(args []string) error {
 	}
 }
 
+// printVersion writes the binary's version line — machine-comparable for
+// bootstrap scripts (`chctl version` alone), with the Go toolchain build
+// info when available.
+func printVersion(w io.Writer) {
+	if info, ok := debug.ReadBuildInfo(); ok && info.GoVersion != "" {
+		fmt.Fprintf(w, "chctl %s (%s)\n", Version, info.GoVersion)
+		return
+	}
+	fmt.Fprintf(w, "chctl %s\n", Version)
+}
+
 // usage prints the top-level help.
 func usage() {
 	usageWith(os.Stdout)
@@ -81,7 +105,7 @@ func usage() {
 
 // usageWith writes the top-level help to a writer (testability).
 func usageWith(w io.Writer) {
-	fmt.Fprint(w, `chctl — off-cluster ClickHouse control, powered by the operator's own code
+	fmt.Fprintf(w, `chctl %s — off-cluster ClickHouse control, powered by the operator's own code
 
 Usage:
   chctl config render -spec chi.yaml [-host 0-0] [-host name=address]... [-replica name=cloudname]...
@@ -89,11 +113,15 @@ Usage:
                         [-remote-user <name> -remote-password-env <VAR> | -remote-password-file <path>]
                         keeper mode: [-keeper] -host <host> [-server-id <n>] [-raft-id name=id]... [-single-file <path>]
   chctl schema sync <host> -cluster <name> -host <name=addr>... [-user u] [-password p] [-port n] [-secure]
+                        [-retries 2] [-prune-stale-self]
   chctl replica drop <host> -on <peer> -cluster <name> -host <name=addr>...
   chctl replica sync <host> -cluster <name> -host <name=addr>...
   chctl replica gc -on <peer> -cluster <name> -host <name=addr>... [-name-pattern reader-*]
   chctl keeper safe-to-stop -keeper <host:port> [-members n] [-wait-timeout 2m]
   chctl keeper mntr -keeper <host:port> [-timeout 5s] [-json]
+  chctl version
+
+The <host> positional and the flags may appear in ANY order.
 
 Commands:
   config    render config.d/users.d XML for a cluster or host from a CHI/CHK spec
@@ -112,12 +140,19 @@ Commands:
             in raft logs (unmapped hosts keep CR-derived ids; -server-id and this
             node's -raft-id must agree)
   schema    create all schema objects on a host from cluster peers (new-reader boot)
+            -retries bounds the number of full create passes (a materialized view
+            whose TO-target table lands later in the same batch needs the second);
+            -prune-stale-self reclaims this host's OWN stale Keeper registration
+            when the create fails with Code 253 — an ASG/VMSS replacement node
+            re-claiming an ordinal whose dead predecessor left a znode
   replica   drop a dead replica's registration / re-sync a restarted one / gc stale ones
   keeper    Raft-quorum safety gate for planned keeper stop/replacement,
             plus mntr payload inspection for health scripts
+  version   print the binary version (build-time injected; for bootstrap
+            scripts comparing against a target release)
 
 Docs: docs/chctl.md
-`)
+`, Version)
 }
 
 // runConfig implements `chctl config render`.
@@ -317,6 +352,91 @@ func splitSubcommand(command string, args []string) (string, []string, error) {
 		return "", nil, fmt.Errorf("usage: chctl %s <subcommand> ...", command)
 	}
 	return args[0], args[1:], nil
+}
+
+// boolFlagger is the flag package's own marker for flags that take no
+// separate value (the flag package's IsBoolFlag). Everything else —
+// string flags, int flags, and repeatable fs.Var flags like -host —
+// consumes the next token as its value.
+type boolFlagger interface {
+	IsBoolFlag() bool
+}
+
+// separatePositionals pre-scans raw args against a constructed FlagSet and
+// returns (flagsOnly, positionals): the flag tokens plus their consumed
+// values in order, and every token that is neither a flag nor a consumed
+// value.
+//
+// Why the pre-scan: Go's flag package stops parsing at the first
+// non-flag token, so `chctl replica drop reader-0 -cluster x` fails with
+// "-cluster is required" even though the flag was passed (the live
+// finding). The CLI accepts flags and positionals in any order by
+// stripping the positionals BEFORE fs.Parse. The FlagSet is never
+// executed against here — parsing (and its errors) stay with fs.Parse.
+//
+// The scan is conservative and shape-driven:
+//   - "--" ends flag scanning; everything after it is positional.
+//   - "--flag" and "-flag" forms are recognized; a token that is not a
+//     known flag name, not a consumed value, and not "-" or "--" is
+//     positional.
+//   - "--flag=value" and "-flag=value" self-contain their value.
+//   - bool flags take no value; everything else consumes the next token
+//     (flag.Value's IsBoolFlag is the marker — repeatable fs.Var flags
+//     like -host consume a value too).
+//   - an unknown flag-looking token (e.g. "-cluster" with a typo) is
+//     treated as a flag and left for fs.Parse to reject — errors keep
+//     their existing messages and surface before any positional
+//     validation runs.
+//   - a consumed value that looks like a name (e.g. `-user admin`) is
+//     skipped as a value, never mistaken for a positional.
+//
+// Without it: every positional-after-flags command line that worked in
+// practice breaks the moment a script puts the host first — with no
+// remedy other than re-ordering the caller.
+func separatePositionals(fs *flag.FlagSet, args []string) (flagsOnly []string, positionals []string) {
+	// flag.Value kinds: bool flags take no value; everything else
+	// (string, int, duration, fs.Var repeatables) consumes the next
+	// token.
+	consumesValue := make(map[string]bool)
+	fs.VisitAll(func(f *flag.Flag) {
+		if bf, ok := f.Value.(boolFlagger); ok && bf.IsBoolFlag() {
+			consumesValue[f.Name] = false
+			return
+		}
+		consumesValue[f.Name] = true
+	})
+
+	flagsOnly = make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		token := args[i]
+		if token == "--" {
+			// Conventional terminator: everything after is positional.
+			flagsOnly = append(flagsOnly, args[i:]...)
+			positionals = append(positionals, args[i+1:]...)
+			return flagsOnly, positionals
+		}
+		if !strings.HasPrefix(token, "-") || token == "-" {
+			positionals = append(positionals, token)
+			continue
+		}
+		name := strings.TrimLeft(token, "-")
+		if eq := strings.IndexByte(name, '='); eq >= 0 {
+			// Self-contained value: the whole token stays a flag token.
+			flagsOnly = append(flagsOnly, token)
+			continue
+		}
+		flagsOnly = append(flagsOnly, token)
+		if consumesValue[name] {
+			// The value may be a "-"-prefixed negative number or a name
+			// that looks like a flag: consumed unconditionally, matching
+			// the flag package's own behavior.
+			if i+1 < len(args) {
+				i++
+				flagsOnly = append(flagsOnly, args[i])
+			}
+		}
+	}
+	return flagsOnly, positionals
 }
 
 // runUsers implements `chctl users render`.
@@ -622,6 +742,10 @@ func (refusingResolver) ResolveSecret(ctx context.Context, request port.SecretRe
 }
 
 // runSchema implements `chctl schema sync <host>`.
+//
+// The <host> positional and the flags may appear in any order (the
+// pre-scan strips positionals before fs.Parse — Go's flag package stops
+// at the first positional otherwise).
 func runSchema(args []string) error {
 	sub, rest, err := splitSubcommand("schema", args)
 	if err != nil {
@@ -634,19 +758,39 @@ func runSchema(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := fs.Parse(rest); err != nil {
+	var (
+		retries        int
+		pruneStaleSelf bool
+	)
+	fs.IntVar(&retries, "retries", service.DefaultSchemaSyncRetries,
+		"full create passes (min 1; a pass that succeeds ends the loop early). A materialized view whose "+
+			"TO-target table lands later in the same batch needs the second pass")
+	fs.BoolVar(&pruneStaleSelf, "prune-stale-self", false,
+		"when the create pass fails with Code 253 (this host's replica registration already exists in Keeper — "+
+			"an ASG/VMSS replacement re-claiming an ordinal), drop THAT registration and retry; only the "+
+			"target's own name is ever dropped")
+	flagArgs, positional := separatePositionals(fs, rest)
+	if err := fs.Parse(flagArgs); err != nil {
 		return err
 	}
 	parsed, err := finishSchemaFlags(fs, cluster, user, password, hosts, portNum, secure, spec)
 	if err != nil {
 		return err
 	}
-	positional := fs.Args()
 	if len(positional) != 1 {
-		return fmt.Errorf("usage: chctl schema sync <host-name>")
+		return fmt.Errorf("usage: chctl schema sync <host-name> (got %d positional argument(s): %v)",
+			len(positional), positional)
+	}
+	if retries < 1 {
+		return fmt.Errorf("-retries must be at least 1, got %d", retries)
 	}
 	return newSchemaService().SyncSchema(
-		context.Background(), parsed, domain.SchemaSyncRequest{HostName: positional[0]},
+		context.Background(), parsed,
+		domain.SchemaSyncRequest{
+			HostName:       positional[0],
+			Retries:        retries,
+			PruneStaleSelf: pruneStaleSelf,
+		},
 	)
 }
 
@@ -669,6 +813,7 @@ func runReplica(args []string) error {
 }
 
 // runReplicaDrop implements `chctl replica drop <host> -on <peer>`.
+// Positional and flags may appear in any order.
 func runReplicaDrop(args []string) error {
 	fs, cluster, user, password, hosts, portNum, secure, spec, err := newSchemaFlagSet("replica drop")
 	if err != nil {
@@ -676,7 +821,8 @@ func runReplicaDrop(args []string) error {
 	}
 	var runOn string
 	fs.StringVar(&runOn, "on", "", "peer host that executes the operation, required")
-	if err := fs.Parse(args); err != nil {
+	flagArgs, positional := separatePositionals(fs, args)
+	if err := fs.Parse(flagArgs); err != nil {
 		return err
 	}
 	parsed, err := finishSchemaFlags(fs, cluster, user, password, hosts, portNum, secure, spec)
@@ -686,40 +832,46 @@ func runReplicaDrop(args []string) error {
 	if runOn == "" {
 		return fmt.Errorf("-on is required")
 	}
-	rest := fs.Args()
-	if len(rest) != 1 {
-		return fmt.Errorf("usage: chctl replica drop <host-name> -on <peer>")
+	if len(positional) != 1 {
+		return fmt.Errorf("usage: chctl replica drop <host-name> -on <peer> (got %d positional argument(s): %v)",
+			len(positional), positional)
 	}
 	return newSchemaService().DropReplica(
 		context.Background(), parsed,
-		domain.ReplicaDropRequest{HostName: rest[0], RunOn: runOn},
+		domain.ReplicaDropRequest{HostName: positional[0], RunOn: runOn},
 	)
 }
 
 // runReplicaSync implements `chctl replica sync <host>`.
+// Positional and flags may appear in any order.
 func runReplicaSync(args []string) error {
 	fs, cluster, user, password, hosts, portNum, secure, spec, err := newSchemaFlagSet("replica sync")
 	if err != nil {
 		return err
 	}
-	if err := fs.Parse(args); err != nil {
+	flagArgs, positional := separatePositionals(fs, args)
+	if err := fs.Parse(flagArgs); err != nil {
 		return err
 	}
 	parsed, err := finishSchemaFlags(fs, cluster, user, password, hosts, portNum, secure, spec)
 	if err != nil {
 		return err
 	}
-	rest := fs.Args()
-	if len(rest) != 1 {
-		return fmt.Errorf("usage: chctl replica sync <host-name>")
+	if len(positional) != 1 {
+		return fmt.Errorf("usage: chctl replica sync <host-name> (got %d positional argument(s): %v)",
+			len(positional), positional)
 	}
 	return newSchemaService().SyncReplica(
-		context.Background(), parsed, domain.ReplicaSyncRequest{HostName: rest[0]},
+		context.Background(), parsed, domain.ReplicaSyncRequest{HostName: positional[0]},
 	)
 }
 
 // runReplicaGc implements `chctl replica gc -on <peer>`: detect stale
 // replica registrations on the peer and drop them in one pass.
+//
+// gc is flag-only — it takes no positional. The pre-scan still runs so a
+// stray positional fails with a clear usage error instead of being
+// silently swallowed as a flag value.
 //
 // Output contract (the systemd timer logs both streams): dropped hosts
 // go to stdout as TSV, one per line — the pipe format the previous
@@ -739,12 +891,16 @@ func runReplicaGc(args []string) error {
 	fs.StringVar(&namePattern, "name-pattern", "reader-*",
 		"glob (path.Match: * and ? wildcards, case-sensitive) a stale host must match to be dropped; "+
 			"non-matching hosts are reported but never dropped (keeps writers/keepers safe)")
-	if err := fs.Parse(args); err != nil {
+	flagArgs, positional := separatePositionals(fs, args)
+	if err := fs.Parse(flagArgs); err != nil {
 		return err
 	}
 	parsed, err := finishSchemaFlags(fs, cluster, user, password, hosts, portNum, secure, spec)
 	if err != nil {
 		return err
+	}
+	if len(positional) != 0 {
+		return fmt.Errorf("usage: chctl replica gc -on <peer> (no positional argument; got %v)", positional)
 	}
 	if runOn == "" {
 		return fmt.Errorf("-on is required")

@@ -234,12 +234,45 @@ These flags are keeper-mode only: against a CHI spec they are refused
 `-single-file`/`-server-id` require a `-host` selection (a single file
 is host-complete).
 
+#### The `keeper_server/listen_host` gotcha (render-time warning)
+
+clickhouse-keeper **ignores** `keeper_server/listen_host` — `listen_host`
+is a ROOT-level setting. Specifying it nested under `keeper_server`
+renders fine but leaves the client port on `127.0.0.1`: no fleet node
+can reach `mntr` or replication. Live finding: the whole ensemble was
+unreachable until the setting moved to a root-level `files` entry.
+
+`chctl config render -keeper` warns at render time when it sees the key:
+
+```
+WARNING: keeper_server/listen_host is IGNORED by clickhouse-keeper (it is a
+ROOT-level setting; put <listen_host> in a root-level files entry in the
+spec) — the rendered config will not listen as intended (hosts: 0-0, 0-1)
+```
+
+The fix is in the spec, not the flag list — a root-level `files` entry:
+
+```yaml
+spec:
+  configuration:
+    settings:
+      keeper_server/tcp_port: "9181"
+    files:
+      listen.xml: |
+        <clickhouse>
+            <listen_host>0.0.0.0</listen_host>
+        </clickhouse>
+```
+
+The render is never failed on this key (output stays valid) — the
+warning is the early signal, not the gate.
+
 ## 2. Bring up a new replica with the schema already in place
 
 A scaled-out reader must re-create every table before serving traffic.
 Inventory keys are CR host names (`<shard>-<replica>`) mapped to cloud
 addresses; the positional target accepts either a CR name or a cloud
-name, and comes after the flags:
+name, and the positional and the flags may appear in any order:
 
 ```bash
 chctl schema sync \
@@ -253,6 +286,47 @@ chctl schema sync \
 
 This runs the operator's `HostCreateTables` — replicated and distributed
 objects get created on the target host from cluster peers.
+
+### `-retries` — deterministic MV-target ordering (default 2)
+
+The operator's per-SQL retry re-runs failed statements, but ordering
+across a *fresh pass* is not guaranteed. Live finding: one materialized
+view was left uncreated because its `TO`-target table landed later in
+the same batch — a manual second run created it. `-retries N` (default
+`2`, min `1`) runs the full create pass up to N times, stopping early on
+the first clean pass:
+
+```bash
+chctl schema sync -spec cluster.yaml -cluster logexplorer ... reader-0 -retries 3
+```
+
+### `-prune-stale-self` — reclaim a recycled ordinal's stale znode
+
+An ASG/VMSS replacement node re-claims its ordinal (say `reader-0`). If
+the dead predecessor's Keeper registration survived — a PERSISTENT
+znode — the fresh node's `CREATE` fails with Code 253 (`Replica
+/clickhouse/tables/.../replicas/reader-0 already exists`), the auto
+`ATTACH` fallback fails too (fresh disk, nothing to attach), and the
+node stays schemaless until someone runs `replica drop reader-0` on a
+peer.
+
+`-prune-stale-self` (default `false`, opt-in) automates that recovery:
+when the create pass fails with a 253 for the **target's own replica
+name**, chctl runs the same `SYSTEM DROP REPLICA` + `DROP DATABASE
+REPLICA` pair `replica drop` uses — on the target itself, for exactly
+the name the failed pass reported — then retries the create pass:
+
+```bash
+# ASG replacement node bootstrapping as reader-0, whose dead
+# predecessor left its znode behind:
+chctl schema sync -spec cluster.yaml -cluster logexplorer ... reader-0 -prune-stale-self
+```
+
+Safe by construction: it only ever drops the replica name the target
+itself is about to claim (its OWN identity), never any other host's,
+and only after the CREATE pass reports that the registration already
+exists. Use it on replacement nodes; it is destructive-adjacent, so it
+stays opt-in.
 
 ## 3. Clean up after a dead node
 
@@ -406,19 +480,28 @@ chctl config render  -spec chi.yaml [-host 0-0] [-host name=address]... [-replic
                       [-remote-user <name> -remote-password-env <VAR> | -remote-password-file <path>]
                       keeper mode: [-keeper] -host <host> [-server-id <n>] [-raft-id name=id]... [-single-file <path>]
 chctl schema sync    <host> -cluster <name> -host <name=addr>... [-user u] [-password p] [-port n] [-secure]
+                      [-retries 2] [-prune-stale-self]
 chctl replica drop   <host> -on <peer> -cluster <name> -host <name=addr>...
 chctl replica sync   <host> -cluster <name> -host <name=addr>...
 chctl replica gc     -on <peer> -cluster <name> -host <name=addr>... [-name-pattern reader-*]
 chctl keeper safe-to-stop -keeper <host:port> [-members n] [-wait-timeout 2m]
 chctl keeper mntr    -keeper <host:port> [-timeout 5s] [-json]
+chctl version
 ```
 
 All schema/replica commands require `-spec` and take the full host
 inventory as repeated `-host name=address` flags (they need peer
-addresses to run cluster SQL). The positional host argument goes
-**after** the flags — Go's flag parsing stops at the first positional.
-Passwords via `-password` (prefer env/secrets over argv); never bake them
-into the spec — specs carry references, secret stores carry values.
+addresses to run cluster SQL). The positional host argument and the
+flags may appear in **any order** — chctl pre-scans the tokens before
+parsing, so `chctl replica drop reader-0 -cluster x ...` works the same
+as flags-first. Passwords via `-password` (prefer env/secrets over
+argv); never bake them into the spec — specs carry references, secret
+stores carry values.
+
+`chctl version` prints the binary's version (`chctl <version>`, plus the
+Go toolchain when available) — releases inject the tag version at build
+time, so node bootstrap can compare the installed binary against the
+targeted release instead of unconditionally overwriting.
 
 Render flags in detail:
 
@@ -436,6 +519,15 @@ Render flags in detail:
 | `-single-file <path>` | keeper | ONE merged `<clickhouse>`-rooted config (common+host); requires `-host` |
 | `-keeper-address crName=address` | keeper | repeatable keeper-only inventory; same raft `<hostname>` effect as the shared `-host` inventory |
 | `-out`, `-users-dir`, `-dry-run` | all renders | config output dir, users group dir, print without writing |
+
+Schema/replica flags in detail:
+
+| Flag | Applies to | Meaning |
+|---|---|---|
+| `-retries 2` | `schema sync` | full create passes (min 1); early-stops on the first clean pass. Covers the MV whose `TO`-target lands later in the same batch |
+| `-prune-stale-self` | `schema sync` | opt-in: on a Code 253 (the target's own registration already exists — a recycled ordinal), drop that registration and retry. Only ever the target's own name |
+| `-on <peer>` | `replica drop`, `replica gc` | host that executes the SQL (either CR or cloud name) |
+| `-name-pattern reader-*` | `replica gc` | the safety gate: only matching stale hosts are dropped |
 
 Exit codes: `0` ok · `1` usage error · `2` quorum gate held the node
 (`safe-to-stop` only) · `3` operational error — keeper unreachable

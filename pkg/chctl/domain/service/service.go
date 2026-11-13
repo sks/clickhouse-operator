@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"strings"
 	"time"
 
 	"github.com/altinity/clickhouse-operator/pkg/chctl/domain"
@@ -207,14 +208,144 @@ func (s *SchemaService) runner(ctx context.Context, request SchemaRequest) (port
 	})
 }
 
+// DefaultSchemaSyncRetries is the default -retries for schema sync: two
+// full create passes. One pass re-runs the operator's per-SQL retry, but a
+// materialized view whose TO-target table lands later in the same batch
+// stays uncreated until a fresh pass re-orders the batch against the now
+// existing targets (the live finding).
+const DefaultSchemaSyncRetries = 2
+
 // SyncSchema creates all schema objects on a target host from cluster
 // peers — the new-reader boot case (HostCreateTables).
+//
+// Retries: up to sync.Retries full create passes (0 = DefaultSchemaSyncRetries),
+// stopping early on the first clean pass. The operator's ExecHost retry
+// re-runs failed SQLs, but ordering across a fresh pass is not guaranteed —
+// the retry loop makes the second pass deterministic instead of relying on
+// a manual re-run.
+//
+// PruneStaleSelf: when a pass fails with Code 253 (the target's replica
+// registration already exists in Keeper — an ASG/VMSS replacement node
+// re-claiming an ordinal whose dead predecessor left a PERSISTENT znode),
+// the service runs the DropReplica pair for the failed registration and
+// continues the loop. The drop name comes from the error the pass
+// reported; the runner's DropReplica refuses any name not in the
+// inventory, and the flag is opt-in (default false). Unflagged, the 253
+// error returns immediately with the flag named — every retry would hit
+// the same znode, so a retry would only burn a pass.
+//
+// Non-253 failures retry through every pass: the MV whose TO-target
+// lands later in the batch is what the NEXT pass fixes.
+//
+// Without the retry loop: a single-pass failure leaves the node schemaless
+// until a human re-runs the command (the live MV finding). Without
+// PruneStaleSelf: a recycled ordinal cannot recover its own registration
+// at all — CREATE and the auto-ATTACH fallback both fail on a fresh disk,
+// and only a manual `replica drop` on a peer unblocks it.
 func (s *SchemaService) SyncSchema(ctx context.Context, request SchemaRequest, sync domain.SchemaSyncRequest) error {
 	runner, err := s.runner(ctx, request)
 	if err != nil {
 		return err
 	}
-	return runner.SyncSchema(ctx, sync)
+	retries := sync.Retries
+	if retries <= 0 {
+		retries = DefaultSchemaSyncRetries
+	}
+	runOn := sync.RunOn
+	if runOn == "" {
+		runOn = sync.HostName
+	}
+
+	var lastErr error
+	for pass := 0; pass < retries; pass++ {
+		lastErr = runner.SyncSchema(ctx, sync)
+		if lastErr == nil {
+			return nil
+		}
+		staleName, stale := staleSelfRegistration(lastErr)
+		if !stale {
+			// A non-253 failure (e.g. an MV whose TO-target table lands
+			// later in the batch) is what the NEXT pass fixes — the loop
+			// continues; only the last pass's error is returned.
+			continue
+		}
+		if !sync.PruneStaleSelf {
+			// The registration already exists and the caller did not
+			// opt into reclaiming it: retrying without the drop is
+			// pointless (every pass hits the same znode), so the error
+			// surfaces immediately with the recovery flag named.
+			return fmt.Errorf("%w (pass %d/%d — reclaim it with -prune-stale-self)", lastErr, pass+1, retries)
+		}
+		// The failed pass named the registration the target could not
+		// claim. Drop exactly that one — the runner's DropReplica
+		// validates it against the inventory before any SQL runs.
+		if err := runner.DropReplica(ctx, domain.ReplicaDropRequest{HostName: staleName, RunOn: runOn}); err != nil {
+			return fmt.Errorf("prune stale self: %w (after %w)", err, lastErr)
+		}
+	}
+	return lastErr
+}
+
+// staleSelfRegistration extracts the replica name a failed create pass
+// reported as already registered (Code 253) — the live error shape is
+// Replica /clickhouse/tables/.../replicas/<name> already exists (the
+// znode path form), or the quoted Replica '<name>' already exists form
+// some drivers wrap it in.
+func staleSelfRegistration(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "Code: 253") && !strings.Contains(msg, "already exists") {
+		return "", false
+	}
+	for _, marker := range []string{"/replicas/", "'"} {
+		if !strings.Contains(msg, marker) {
+			continue
+		}
+		if name := extractReplicaName(msg, marker); name != "" {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+// extractReplicaName returns the replica name named by the marker's
+// segment in msg: for "/replicas/" it is the token after the LAST
+// occurrence (the znode path's final component — the path prefix can
+// itself contain the marker on deeper trees, while the replica segment
+// is always last); for "'" the quoted name between the LAST-but-one
+// and the LAST quote (the closing quote of Replica '<name>').
+func extractReplicaName(msg, marker string) string {
+	if marker == "'" {
+		// Quoted form: the name sits between the closing pair of quotes.
+		second := strings.LastIndexByte(msg, '\'')
+		if second <= 0 {
+			return ""
+		}
+		first := strings.LastIndexByte(msg[:second], '\'')
+		if first < 0 {
+			return ""
+		}
+		return msg[first+1 : second]
+	}
+	idx := strings.LastIndex(msg, marker)
+	if idx < 0 {
+		return ""
+	}
+	rest := msg[idx+len(marker):]
+	// The replica name ends at the first character that cannot appear
+	// in a znode name (the path ends at whitespace or the next path
+	// boundary).
+	end := strings.IndexAny(rest, " \t\r\n:\"<>")
+	if end < 0 {
+		end = len(rest)
+	}
+	name := rest[:end]
+	if name == "" || strings.Contains(name, "/") {
+		return ""
+	}
+	return name
 }
 
 // DropReplica removes a dead replica's Keeper registration via a live peer
