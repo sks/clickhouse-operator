@@ -46,7 +46,7 @@ var (
 // retry classification and the fatal/best-effort split.
 func (b *Boot) Steps(ctx context.Context) ([]Step, error) {
 	runner := system.ExecRunner{}
-	disks := system.NewDiskManager(runner)
+	disks := system.NewDiskManager(runner).WithPlatform(b.Provider.Name())
 	tuner := system.NewOSTuner(runner)
 	configs := system.NewStaticConfigInstaller(runner)
 

@@ -35,6 +35,10 @@ import (
 //   - fstab already has LABEL= → skip the append
 type DiskManager struct {
 	runner Runner
+	// Platform selects the first-boot device-candidate set ("azure"
+	// mounts by SCSI LUN; empty/aws use the EBS names). The boot wires
+	// it from the detected cloud.
+	Platform string
 	// fsPath exists for tests to simulate /proc/mounts; empty → the
 	// mountpoint check shells out to mountpoint(1).
 }
@@ -44,14 +48,24 @@ func NewDiskManager(runner Runner) *DiskManager {
 	return &DiskManager{runner: runner}
 }
 
-// deviceCandidates are the first-boot fallback paths per role. On first
-// boot the EBS volume is blank — no filesystem, no label — so the label
-// lookup finds nothing and the EC2 EBS device name is the only hint.
-// (The original bash resolved these per-role; the sets overlap.)
+// deviceCandidates are the first-boot fallback paths per role, ordered
+// per platform (the first existing device wins). On first boot the
+// volume is blank — no filesystem, no label — so the label lookup finds
+// nothing and the platform's stable device naming is the only hint:
+//   - AWS: the EBS device name (which the NVMe driver exposes, making
+//     the raw sd/xvd path unstable — Graviton renames)
+//   - Azure: the SCSI LUN symlink (stable: lunN follows the VMSS data
+//     disk's declared LUN, unlike /dev/sd* which reorders)
+// The label check still wins when present; candidates only cover
+// first-boot formatting.
 const (
-	metadataCandidates = "/dev/sdf /dev/sdb /dev/nvme1n1 /dev/xvdf /dev/xvdb"
-	cacheCandidates    = "/dev/sdg /dev/sdc /dev/nvme2n1 /dev/xvdg /dev/xvdc"
-	keeperCandidates   = "/dev/sdf /dev/sdb /dev/nvme1n1 /dev/xvdf /dev/xvdb"
+	awsMetadataCandidates = "/dev/sdf /dev/sdb /dev/nvme1n1 /dev/xvdf /dev/xvdb"
+	awsCacheCandidates    = "/dev/sdg /dev/sdc /dev/nvme2n1 /dev/xvdg /dev/xvdc"
+	awsKeeperCandidates   = "/dev/sdf /dev/sdb /dev/nvme1n1 /dev/xvdf /dev/xvdb"
+
+	azureMetadataCandidates = "/dev/disk/azure/scsi1/lun0"
+	azureCacheCandidates    = "/dev/disk/azure/scsi1/lun1"
+	azureKeeperCandidates   = "/dev/disk/azure/scsi1/lun2"
 )
 
 // MountedDisk describes what a successful mount produced.
@@ -161,6 +175,17 @@ func (d *DiskManager) MountDisk(ctx context.Context, label, mountPoint, device s
 	return res, nil
 }
 
+// candidatesFor returns the platform's first-boot device candidates.
+// Azure VMs (detected by the Lun0 device existing) mount by SCSI LUN;
+// everything else uses the AWS-shaped EBS names. The LUN path is a
+// topology convention, not a provider API — no port needed.
+func (d *DiskManager) candidatesFor(platform string) (meta, cache, keeper string) {
+	if platform == "azure" {
+		return azureMetadataCandidates, azureCacheCandidates, azureKeeperCandidates
+	}
+	return awsMetadataCandidates, awsCacheCandidates, awsKeeperCandidates
+}
+
 // MountAll mounts the role's disks. The metadata disk is Critical (its
 // loss makes S3 data an unreadable pile of parts); cache is BestEffort
 // (falls back to a metadata-disk subdirectory); keeper is BestEffort
@@ -168,10 +193,12 @@ func (d *DiskManager) MountDisk(ctx context.Context, label, mountPoint, device s
 // with an IOPS-contention warning). The caller (boot step) supplies the
 // retry policy; this function is one convergent pass.
 func (d *DiskManager) MountAll(ctx context.Context, spec model.BootSpec, hostnameSet func()) ([]MountedDisk, error) {
+	metaCands, cacheCands, keeperCands := d.candidatesFor(d.Platform)
+
 	var mounted []MountedDisk
 
 	// Metadata: must succeed.
-	dev, err := d.ResolveDevice(ctx, spec.Disks.MetadataLabel, metadataCandidates)
+	dev, err := d.ResolveDevice(ctx, spec.Disks.MetadataLabel, metaCands)
 	if err != nil {
 		return mounted, err
 	}
@@ -186,7 +213,7 @@ func (d *DiskManager) MountAll(ctx context.Context, spec model.BootSpec, hostnam
 
 	// Cache: optional; falls back to a subdirectory on the metadata disk.
 	if spec.Disks.CacheLabel != "" {
-		cacheDev, err := d.ResolveDevice(ctx, spec.Disks.CacheLabel, cacheCandidates)
+		cacheDev, err := d.ResolveDevice(ctx, spec.Disks.CacheLabel, cacheCands)
 		if err != nil {
 			return mounted, err
 		}
@@ -208,7 +235,7 @@ func (d *DiskManager) MountAll(ctx context.Context, spec model.BootSpec, hostnam
 
 	// Keeper: keepers only, dedicated disk for fsync latency isolation.
 	if spec.Role == model.RoleKeeper && spec.Disks.KeeperLabel != "" {
-		kDev, err := d.ResolveDevice(ctx, spec.Disks.KeeperLabel, keeperCandidates)
+		kDev, err := d.ResolveDevice(ctx, spec.Disks.KeeperLabel, keeperCands)
 		if err != nil {
 			return mounted, err
 		}
@@ -234,4 +261,11 @@ func (d *DiskManager) MountAll(ctx context.Context, spec model.BootSpec, hostnam
 	}
 
 	return mounted, nil
+}
+
+// WithPlatform pins the first-boot device-candidate selection (the boot
+// wires it from the detected cloud; empty = the AWS-shaped defaults).
+func (d *DiskManager) WithPlatform(platform string) *DiskManager {
+	d.Platform = platform
+	return d
 }

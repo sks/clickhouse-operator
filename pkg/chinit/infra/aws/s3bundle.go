@@ -32,13 +32,22 @@ import (
 
 // bundleFiles are the known members of the config bundle. The list is
 // closed (the Terraform bundle layout is fixed): chinit.yaml is NOT in
-// the bundle — it arrives via user-data and names the bundle.
-var bundleFiles = []string{
-	"network.xml",
-	"ssl.xml",
-	"storage.xml",
-	"chi.yaml",
-	"keeper.yaml",
+// the bundle — it arrives via user-data and names the bundle. The
+// static XMLs live under configs/ in the bundle prefix (the same keys
+// the refresh path and the pre-chinit cloud-init consumed); the specs
+// sit at the prefix root. NoSuchKey names use the SHORT name for
+// chi/keeper (the missing-spec case) so the log stays stable.
+var bundleFiles = []bundleFile{
+	{key: "configs/network.xml", name: "network.xml"},
+	{key: "configs/ssl.xml", name: "ssl.xml"},
+	{key: "configs/storage.xml", name: "storage.xml"},
+	{key: "chi.yaml", name: "chi.yaml"},
+	{key: "keeper.yaml", name: "keeper.yaml"},
+}
+
+type bundleFile struct {
+	key  string // S3 key suffix under the bundle prefix
+	name string // on-disk name in the staging dir
 }
 
 // S3API is the S3 surface the bundle fetcher needs (s3.Client satisfies
@@ -95,8 +104,8 @@ func (s *S3BundleSource) FetchBundle(ctx context.Context, bundle model.ConfigBun
 
 	var written []string
 	hasher := sha256.New()
-	for _, name := range bundleFiles {
-		key := strings.TrimPrefix(bundle.Prefix+"/", "/") + name
+	for _, bf := range bundleFiles {
+		key := strings.TrimPrefix(bundle.Prefix+"/", "/") + bf.key
 		out, err := client.GetObject(ctx, &s3.GetObjectInput{
 			Bucket: awsString(bundle.Bucket),
 			Key:    awsString(key),
@@ -105,7 +114,7 @@ func (s *S3BundleSource) FetchBundle(ctx context.Context, bundle model.ConfigBun
 			// NoSuchKey for chi.yaml/keeper.yaml on single-role stacks
 			// is benign (writers skip keeper.yaml); missing static
 			// XMLs are fatal. The error text distinguishes them.
-			if strings.Contains(err.Error(), "NoSuchKey") && (name == "chi.yaml" || name == "keeper.yaml") {
+			if strings.Contains(err.Error(), "NoSuchKey") && (bf.name == "chi.yaml" || bf.name == "keeper.yaml") {
 				continue
 			}
 			return nil, fmt.Errorf("fetch s3://%s/%s: %w", bundle.Bucket, key, err)
@@ -118,7 +127,7 @@ func (s *S3BundleSource) FetchBundle(ctx context.Context, bundle model.ConfigBun
 		if len(body) == 0 {
 			return nil, fmt.Errorf("s3://%s/%s is empty", bundle.Bucket, key)
 		}
-		dest := filepath.Join(destDir, name)
+		dest := filepath.Join(destDir, bf.name)
 		if err := os.WriteFile(dest, body, 0644); err != nil {
 			return nil, chinitsvc.Fatal(fmt.Errorf("write %s: %w", dest, err))
 		}
