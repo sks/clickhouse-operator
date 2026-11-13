@@ -139,3 +139,22 @@ type ReplicaGcRequest struct {
 	// sensitive.
 	NamePattern string
 }
+
+// TableRef names one table (database + name) — the unit of the
+// tables-present health check: expected names parsed from the spec's
+// SQL files vs. existing names read from system.tables.
+type TableRef struct {
+	// Database is the table's database (empty for server-default).
+	Database string
+	// Name is the table name.
+	Name string
+}
+
+// String renders database.table (or the bare name for the default db) —
+// the form the human output and the missing-table detail use.
+func (t TableRef) String() string {
+	if t.Database == "" {
+		return t.Name
+	}
+	return t.Database + "." + t.Name
+}

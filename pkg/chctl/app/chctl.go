@@ -20,16 +20,19 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
 
+	v1 "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse.altinity.com/v1"
 	"github.com/altinity/clickhouse-operator/pkg/chctl/domain"
 	"github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
 	"github.com/altinity/clickhouse-operator/pkg/chctl/domain/service"
@@ -47,14 +50,15 @@ import (
 // unconditionally overwriting (and re-rendering configs) on every boot.
 var Version = "dev"
 
-// Exit codes for scripts and lifecycle hooks. Keeping the two failure modes
+// Exit codes for scripts and lifecycle hooks. Keeping the failure modes
 // apart stops a broken probe from being misread as "safe" or as a gate
-// hold.
+// hold, and keeps the drift answer (0) apart from re-render-needed (4).
 const (
-	exitOK         = 0
-	exitUsageError = 1
-	exitQuorumHeld = 2
-	exitOpError    = 3
+	exitOK          = 0
+	exitUsageError  = 1
+	exitQuorumHeld  = 2
+	exitOpError     = 3
+	exitConfigDrift = 4
 )
 
 // Run parses arguments and dispatches to a subcommand.
@@ -75,6 +79,8 @@ func Run(args []string) error {
 		return runReplica(rest)
 	case "keeper":
 		return runKeeper(rest)
+	case "health":
+		return runHealth(rest)
 	case "version":
 		printVersion(os.Stdout)
 		return nil
@@ -109,9 +115,14 @@ func usageWith(w io.Writer) {
 
 Usage:
   chctl config render -spec chi.yaml [-host 0-0] [-host name=address]... [-replica name=cloudname]...
-                        [-user-password name=path]... [-out config.d] [-users-dir users.d] [-dry-run] [-keeper]
+                        [-user-password name=path]... [-out config.d] [-users-dir users.d] [-dry-run] [-check] [-keeper]
                         [-remote-user <name> -remote-password-env <VAR> | -remote-password-file <path>]
                         keeper mode: [-keeper] -host <host> [-server-id <n>] [-raft-id name=id]... [-single-file <path>]
+  chctl config render-node -spec chi.yaml -host <host> [-host name=address]... [-replica name=cloudname]...
+                        -out config.d [-users-dir users.d] [-user clickhouse] [-node-type writer|reader|backup|keeper]
+                        [-user-password name=path]... [-remote-user <name> -remote-password-env <VAR> | -remote-password-file <path>]
+                        [-network user=ip]... [-secrets aws|none] [-region r] [-dry-run] [-check]
+                        keeper mode: -keeper -node-type keeper -single-file <path> [-server-id <n>] [-raft-id name=id]... [-keeper-address name=addr]...
   chctl schema sync <host> -cluster <name> -host <name=addr>... [-user u] [-password p] [-port n] [-secure]
                         [-retries 2] [-prune-stale-self]
   chctl replica drop <host> -on <peer> -cluster <name> -host <name=addr>...
@@ -119,6 +130,8 @@ Usage:
   chctl replica gc -on <peer> -cluster <name> -host <name=addr>... [-name-pattern reader-*]
   chctl keeper safe-to-stop -keeper <host:port> [-members n] [-wait-timeout 2m]
   chctl keeper mntr -keeper <host:port> [-timeout 5s] [-json]
+  chctl health -cluster <name> -host <name=addr>... [-user u] [-password p] [-port n] [-secure]
+               [-spec chi.yaml] [-keeper <host:port>] [-self <replica>] [-json] [-timeout 5s]
   chctl version
 
 The <host> positional and the flags may appear in ANY order.
@@ -131,6 +144,12 @@ Commands:
             -remote-user with -remote-password-env/-remote-password-file injects
             <user>/<password> into every remote_servers <replica> so
             distributed queries authenticate (never argv passwords)
+            -check renders to memory and byte-compares each would-be-installed
+            file against -out (users group against -users-dir): prints
+            IN SYNC / DRIFTED <file> / MISSING <file> per file and exits
+            0 in sync, 4 on any drift — nothing is written (the config
+            refresher and health runbook's probe; a wiped or hand-edited
+            config.d is drift, never "in sync")
             keeper mode: -single-file merges common+host sections into ONE complete
             <clickhouse>-rooted config for nodes running clickhouse-keeper with an
             explicit --config (which disables config.d auto-include); -server-id
@@ -139,6 +158,21 @@ Commands:
             <server><id> values for existing ensembles with ONE-based ids persisted
             in raft logs (unmapped hosts keep CR-derived ids; -server-id and this
             node's -raft-id must agree)
+            render-node renders EVERYTHING for ONE node in a single invocation and
+            installs it: the host-selected sections (macros/zookeeper/settings/
+            profiles/files) AND the inventory sections (remote_servers with
+            credentials) AND the users.d files — or, for a keeper node (-keeper
+            -node-type keeper -single-file), the merged single config file.
+            Install discipline is built in: staged writes renamed into place
+            atomically, every file chown'd to the service account (-user, default
+            clickhouse), 0640 for credential-bearing files (remote_servers with
+            a password, users files with password hashes) and 0644 for the rest
+            — a render or XML-validation failure installs NOTHING and names the
+            offending section; -check diffs the render against the installed
+            tree and exits 0 in sync, 4 with the per-file delta (nothing written);
+            -dry-run prints the plan; files a previous render-node installed but
+            this one no longer produces are pruned (manifest-tracked —
+            hand-maintained files are never touched)
   schema    create all schema objects on a host from cluster peers (new-reader boot)
             -retries bounds the number of full create passes (a materialized view
             whose TO-target table lands later in the same batch needs the second);
@@ -148,6 +182,11 @@ Commands:
   replica   drop a dead replica's registration / re-sync a restarted one / gc stale ones
   keeper    Raft-quorum safety gate for planned keeper stop/replacement,
             plus mntr payload inspection for health scripts
+  health    verify the stack in one pass: every inventory host serves SQL,
+            replicas are writable (is_readonly=0), keeper mntr answers
+            (-keeper), the spec's tables exist (-spec), and this node's
+            replica is registered (-self). Exit 0 all-pass, 3 any-degraded,
+            1 usage. -json emits {"status","checks":[{name,status,detail}]}
   version   print the binary version (build-time injected; for bootstrap
             scripts comparing against a target release)
 
@@ -155,10 +194,13 @@ Docs: docs/chctl.md
 `, Version)
 }
 
-// runConfig implements `chctl config render`.
+// runConfig implements `chctl config render` and `chctl config render-node`.
 func runConfig(args []string) error {
-	if len(args) == 0 || args[0] != "render" {
-		return fmt.Errorf("usage: chctl config render -spec chi.yaml ...")
+	if len(args) == 0 || (args[0] != "render" && args[0] != "render-node") {
+		return fmt.Errorf("usage: chctl config render -spec chi.yaml ... | chctl config render-node -spec chi.yaml ...")
+	}
+	if args[0] == "render-node" {
+		return runRenderNode(args[1:])
 	}
 	fs := flag.NewFlagSet("config render", flag.ContinueOnError)
 	var (
@@ -166,6 +208,7 @@ func runConfig(args []string) error {
 		outDir     string
 		usersDir   string
 		dryRun     bool
+		check      bool
 		isKeeper   bool
 		serverID   int
 		singleFile string
@@ -185,6 +228,7 @@ func runConfig(args []string) error {
 	fs.StringVar(&outDir, "out", "out", "output directory for rendered files")
 	fs.StringVar(&usersDir, "users-dir", "", "output directory for users-group files (defaults to -out)")
 	fs.BoolVar(&dryRun, "dry-run", false, "print rendered files without writing")
+	fs.BoolVar(&check, "check", false, "compare the would-be-rendered files against -out (and -users-dir) without writing anything: exit 0 in sync, 4 if any file drifted or is missing on disk")
 	fs.BoolVar(&isKeeper, "keeper", false, "spec is a ClickHouseKeeperInstallation (CHK)")
 	fs.Var(&replicaMap, "replica", "CR host name to cloud short hostname mapping name=cloudname (repeatable; the rendered macros <replica> carries the cloud name)")
 	fs.Var(&keeperAddrs, "keeper-address", "CHK host cloud DNS mapping crName=address (repeatable; raft server entries use the cloud names)")
@@ -200,6 +244,11 @@ func runConfig(args []string) error {
 	}
 	if specFile == "" {
 		return fmt.Errorf("-spec is required")
+	}
+	// -check is a stricter -dry-run: it shares the no-writes guarantee,
+	// and running both is the caller asking twice for nothing.
+	if check && dryRun {
+		return fmt.Errorf("-check and -dry-run are mutually exclusive: -check already writes nothing")
 	}
 
 	// Distributed-query credentials: resolve the password once, from
@@ -274,6 +323,13 @@ func runConfig(args []string) error {
 		if singleFile != "" && hostName == "" {
 			return fmt.Errorf("-single-file requires a keeper host: pass -host (name or name=address)")
 		}
+		// -check compares the per-group files the config render command
+		// installs to -out; a single-file render never writes them, so
+		// the comparison would report every file MISSING by definition.
+		// Single-file drift is the render-node surface.
+		if singleFile != "" && check {
+			return fmt.Errorf("-check with -single-file is not supported here: the single-file drift check is the render-node -check surface")
+		}
 		// The server-id override targets the selected host's
 		// <server_id> section; without a host there is no section to
 		// shape.
@@ -306,7 +362,7 @@ func runConfig(args []string) error {
 			HostName:        hostName,
 			Hosts:           hosts,
 			OutputDir:       outDir,
-			DryRun:          dryRun,
+			DryRun:          dryRun || check,
 			KeeperAddresses: keeperMap,
 			ServerID:        serverID,
 			RaftIDs:         raftIDs,
@@ -314,6 +370,14 @@ func runConfig(args []string) error {
 		})
 		if err != nil {
 			return err
+		}
+		if check {
+			// -single-file is the render-node surface (a host-complete
+			// file outside -out); here the per-group comparison against
+			// -out is what -check sees. The single-file entry the render
+			// appends would compare a destination the config render
+			// command never installs, so it is excluded.
+			return runCheck(filterSingleFile(rendered), outDir, "", os.Stdout)
 		}
 		printRendered(rendered)
 		return nil
@@ -333,13 +397,319 @@ func runConfig(args []string) error {
 		RemotePassword: remotePassword,
 		OutputDir:      outDir,
 		UsersDir:       usersDir,
-		DryRun:         dryRun,
+		DryRun:         dryRun || check,
 	})
 	if err != nil {
 		return err
 	}
+	if check {
+		return runCheck(rendered, outDir, usersDir, os.Stdout)
+	}
 	printRendered(rendered)
 	return nil
+}
+
+// filterSingleFile drops the merged single-file entry a keeper render
+// appends (Group "single") so the -check comparison covers only the
+// per-group files the config render command installs to -out.
+func filterSingleFile(rendered []port.RenderedFile) []port.RenderedFile {
+	filtered := make([]port.RenderedFile, 0, len(rendered))
+	for _, file := range rendered {
+		if file.Group != "single" {
+			filtered = append(filtered, file)
+		}
+	}
+	return filtered
+}
+
+// renderNodeFlagSurface is the `config render-node` flag set: the full
+// surface the node bootstrap passes — spec, destinations, host
+// selection/inventory, credentials, users, keeper identity, install
+// discipline and the check/dry-run modes.
+type renderNodeFlagSurface struct {
+	specFile           string
+	outDir             string
+	usersDir           string
+	owner              string
+	nodeType           string
+	dryRun             bool
+	check              bool
+	keeper             bool
+	serverID           int
+	singleFile         string
+	remoteUser         string
+	remotePasswordEnv  string
+	remotePasswordFile string
+	region             string
+	secrets            string
+	hostFlags          hostList
+	replicaMap         replicaList
+	keeperAddrs        keeperAddrList
+	raftIDList         raftIDFlagList
+	userPasswords      userPasswordList
+	networks           portNetworkList
+}
+
+// newRenderNodeFlagSet builds the flag set over the surface struct.
+func newRenderNodeFlagSet() (*flag.FlagSet, *renderNodeFlagSurface) {
+	fs := flag.NewFlagSet("config render-node", flag.ContinueOnError)
+	s := &renderNodeFlagSurface{}
+	fs.StringVar(&s.specFile, "spec", "", "CHI/CHK spec file (YAML), required")
+	fs.StringVar(&s.outDir, "out", "", "config.d directory the rendered files install to, required")
+	fs.StringVar(&s.usersDir, "users-dir", "", "users.d directory (defaults to the 'users.d' sibling of -out)")
+	fs.StringVar(&s.owner, "user", "clickhouse",
+		"account every installed file is chown'd to (name, uid, or uid:gid — numeric forms escape distros with odd name resolution)")
+	fs.StringVar(&s.nodeType, "node-type", "writer",
+		"informational node role: writer|reader|backup|keeper (gates the keeper single-file flow and documents intent in the summary)")
+	fs.BoolVar(&s.dryRun, "dry-run", false, "print the render plan (destinations and modes) without writing")
+	fs.BoolVar(&s.check, "check", false, "render to staging and diff the installed files without writing anything: exit 0 in sync, 4 with the delta on drift")
+	fs.BoolVar(&s.keeper, "keeper", false, "spec is a ClickHouseKeeperInstallation (CHK): renders the merged single file, no users render")
+	fs.IntVar(&s.serverID, "server-id", 0, "keeper mode: overrides the rendered <server_id> (e.g. the myid file's 1-based value; 0 keeps the CR-derived replica index)")
+	fs.StringVar(&s.singleFile, "single-file", "", "keeper mode: destination of the ONE complete <clickhouse>-rooted keeper config (required in keeper mode)")
+	fs.Var(&s.hostFlags, "host", "host this node renders (bare name); with name=address syntax (repeatable) adds the cloud inventory entry")
+	fs.Var(&s.replicaMap, "replica", "CR host name to cloud short hostname mapping name=cloudname (repeatable; the rendered macros <replica> carries the cloud name)")
+	fs.Var(&s.keeperAddrs, "keeper-address", "CHK host cloud DNS mapping crName=address (repeatable; raft server entries use the cloud names)")
+	fs.Var(&s.raftIDList, "raft-id", "keeper mode: CR host name to raft_configuration <server><id> mapping name=id (repeatable)")
+	fs.Var(&s.userPasswords, "user-password", "user name=password-file path (repeatable); read, sha256-hashed and injected as password_sha256_hex for that user")
+	fs.StringVar(&s.remoteUser, "remote-user", "", "ClickHouse user distributed queries authenticate as (with -remote-password-env/-remote-password-file)")
+	fs.StringVar(&s.remotePasswordEnv, "remote-password-env", "", "environment variable holding the distributed-query password")
+	fs.StringVar(&s.remotePasswordFile, "remote-password-file", "", "file holding the distributed-query password")
+	fs.Var(&s.networks, "network", "user=ip users.d allowlist entry (repeatable; localhost is always appended)")
+	fs.StringVar(&s.secrets, "secrets", "aws", "secret source for passwordFrom refs: aws (Secrets Manager) | none (fail on refs)")
+	fs.StringVar(&s.region, "region", "", "cloud region (empty = SDK default chain)")
+	return fs, s
+}
+
+// runRenderNode implements `chctl config render-node`: ONE invocation
+// renders EVERYTHING for a node and installs it with correct ownership
+// and permissions — the host-selected sections AND the inventory
+// sections AND the users.d files (or, for a keeper node, the merged
+// single config file) — replacing the several render calls plus
+// per-site prune lists and chmod/chown lines the calling stack
+// previously assembled (one site forgetting the chmod being the live
+// root-owned-0640 crash class).
+//
+// Everything renders into memory first; the install writes staged files
+// and renames them into place, then applies the exact mode and the
+// service-account ownership. A render or validation failure installs
+// NOTHING and names the offending section. -check computes the same
+// install plan and diffs it against the installed tree without writing;
+// a non-empty drift exits 4 with the per-file delta.
+func runRenderNode(args []string) error {
+	fs, s := newRenderNodeFlagSet()
+	// The pre-scan keeps flags and positionals order-independent for
+	// this subcommand too (a stray positional is a usage error below).
+	flagArgs, positionals := separatePositionals(fs, args)
+	if err := fs.Parse(flagArgs); err != nil {
+		return err
+	}
+	if len(positionals) != 0 {
+		return fmt.Errorf("usage: chctl config render-node -spec chi.yaml -out config.d ... (no positional argument; got %v)", positionals)
+	}
+	if s.specFile == "" {
+		return fmt.Errorf("-spec is required")
+	}
+	if s.outDir == "" {
+		return fmt.Errorf("-out is required (the config.d directory)")
+	}
+	if s.check && s.dryRun {
+		return fmt.Errorf("-check and -dry-run are mutually exclusive: -check already writes nothing")
+	}
+	if s.nodeType == "" {
+		return fmt.Errorf("-node-type is required: writer|reader|backup|keeper")
+	}
+	switch s.nodeType {
+	case "writer", "reader", "backup", "keeper":
+	default:
+		return fmt.Errorf("-node-type must be writer|reader|backup|keeper, got %q", s.nodeType)
+	}
+	if s.keeper && s.nodeType != "keeper" {
+		return fmt.Errorf("-keeper with -node-type %q: a CHK spec renders keeper nodes only", s.nodeType)
+	}
+	if !s.keeper && s.nodeType == "keeper" {
+		return fmt.Errorf("-node-type keeper requires -keeper (the spec is a ClickHouseKeeperInstallation)")
+	}
+	// -users-dir defaults to the users.d sibling of -out — the stack's
+	// standard layout (/etc/clickhouse-server/{config.d,users.d}).
+	if s.usersDir == "" {
+		s.usersDir = filepath.Join(filepath.Dir(s.outDir), "users.d")
+	}
+	if s.keeper && s.singleFile == "" {
+		return fmt.Errorf("keeper mode requires -single-file (the keeper's --config destination)")
+	}
+	if !s.keeper && s.singleFile != "" {
+		return fmt.Errorf("-single-file applies to keeper mode only: add -keeper")
+	}
+	if s.serverID < 0 {
+		return fmt.Errorf("-server-id must be positive, got %d", s.serverID)
+	}
+	if !s.keeper {
+		if s.serverID != 0 || len(s.raftIDList.values) > 0 || len(s.keeperAddrs.values) > 0 {
+			return fmt.Errorf("-server-id/-raft-id/-keeper-address apply to keeper mode only: add -keeper")
+		}
+	}
+
+	// Distributed-query credentials: resolved once, from exactly one
+	// source, before anything renders (see readRemotePassword).
+	remotePassword, err := readRemotePassword(s.remoteUser, s.remotePasswordEnv, s.remotePasswordFile)
+	if err != nil {
+		return err
+	}
+
+	hostName, hosts, err := parseRenderHosts(s.hostFlags.values)
+	if err != nil {
+		return err
+	}
+	if hostName == "" {
+		return fmt.Errorf("render-node requires a host: pass -host (bare name or name=address)")
+	}
+	replicas := make(map[string]string, len(s.replicaMap.values))
+	for _, entry := range s.replicaMap.values {
+		name, cloudName, ok := strings.Cut(entry, "=")
+		if !ok || name == "" || cloudName == "" {
+			return fmt.Errorf("-replica %q must be name=cloudname", entry)
+		}
+		replicas[name] = cloudName
+	}
+	userPasswordHashes, err := readUserPasswordHashes(s.userPasswords.values)
+	if err != nil {
+		return err
+	}
+	if s.keeper && len(userPasswordHashes) > 0 {
+		return fmt.Errorf("-user-password is not applicable to a CHK spec (keeper installations carry no ClickHouse users)")
+	}
+	nets := make(map[string][]string, len(s.networks.values))
+	for _, entry := range s.networks.values {
+		user, ip, ok := strings.Cut(entry, "=")
+		if !ok || user == "" || ip == "" {
+			return fmt.Errorf("-network %q must be user=ip", entry)
+		}
+		nets[user] = append(nets[user], ip)
+	}
+
+	// Secrets resolver for passwordFrom refs: AWS Secrets Manager by
+	// default; "none" renders only specs without references (the
+	// offline mode the validate harness uses).
+	var resolver port.SecretsResolver
+	switch s.secrets {
+	case "aws":
+		resolver = secretSourceAdapter{awsinfra.NewSecretsManagerSource(s.region)}
+	case "none":
+		resolver = refusingResolver{}
+	default:
+		return fmt.Errorf("unknown -secrets backend %q (aws|none)", s.secrets)
+	}
+
+	specData, err := os.ReadFile(s.specFile)
+	if err != nil {
+		return fmt.Errorf("read spec: %w", err)
+	}
+	specRef := domain.SpecReference{Data: specData}
+	loader := operator.NewSpecLoader()
+	ctx := context.Background()
+
+	if s.keeper {
+		raftIDs, err := parseRaftIDFlags(s.raftIDList.values)
+		if err != nil {
+			return err
+		}
+		for name, id := range raftIDs {
+			if id <= 0 {
+				return fmt.Errorf("-raft-id %s=%d: raft ids must be positive", name, id)
+			}
+		}
+		cr, err := loader.LoadCHK(ctx, port.LoadCHKRequest{Spec: specRef})
+		if err != nil {
+			return err
+		}
+		keeperMap := map[string]string{}
+		for _, entry := range s.keeperAddrs.values {
+			name, address, ok := strings.Cut(entry, "=")
+			if !ok || name == "" || address == "" {
+				return fmt.Errorf("-keeper-address %q must be crName=address", entry)
+			}
+			keeperMap[name] = address
+		}
+		result, err := operator.NewNodeRenderer(operator.NewConfigRenderer(), nil).RenderNode(ctx, port.RenderNodeRequest{
+			NormalizedCR:    cr,
+			Keeper:          true,
+			NodeType:        s.nodeType,
+			HostName:        hostName,
+			Hosts:           hosts,
+			KeeperAddresses: keeperMap,
+			ServerID:        s.serverID,
+			RaftIDs:         raftIDs,
+			SingleFilePath:  s.singleFile,
+			OutputDir:       s.outDir,
+			OwnerUser:       s.owner,
+			DryRun:          s.dryRun,
+			Check:           s.check,
+		})
+		if err != nil {
+			return err
+		}
+		printRenderNodeResult(os.Stdout, result)
+		return renderNodeDrift(result)
+	}
+
+	cr, err := loader.LoadCHI(ctx, port.LoadCHIRequest{Spec: specRef})
+	if err != nil {
+		return err
+	}
+	result, err := operator.NewNodeRenderer(operator.NewConfigRenderer(), operator.NewUsersRenderer(resolver)).RenderNode(ctx, port.RenderNodeRequest{
+		NormalizedCR:   cr,
+		NodeType:       s.nodeType,
+		HostName:       hostName,
+		Hosts:          hosts,
+		Replicas:       replicas,
+		UserPasswords:  userPasswordHashes,
+		RemoteUser:     s.remoteUser,
+		RemotePassword: remotePassword,
+		Networks:       nets,
+		OutputDir:      s.outDir,
+		UsersDir:       s.usersDir,
+		OwnerUser:      s.owner,
+		DryRun:         s.dryRun,
+		Check:          s.check,
+	})
+	if err != nil {
+		return err
+	}
+	printRenderNodeResult(os.Stdout, result)
+	return renderNodeDrift(result)
+}
+
+// renderNodeDrift converts a check-mode drift into the exit-4 error
+// (scripts key on the code, and the delta lines are already on stdout).
+func renderNodeDrift(result port.RenderNodeResult) error {
+	if !result.Check || len(result.Drift) == 0 {
+		return nil
+	}
+	return &driftError{drifted: len(result.Drift), total: len(result.Files)}
+}
+
+// printRenderNodeResult prints the render-node summary — the shape of
+// printRendered, extended with the install mode each file receives and
+// the plan's prune/check annotations. Machine-greppable: one line per
+// file ("group: path mode"), summary lines at the end.
+func printRenderNodeResult(w io.Writer, result port.RenderNodeResult) {
+	for _, file := range result.Files {
+		fmt.Fprintf(w, "%s: %s %04o\n", file.Group, file.Path, file.Mode.Perm())
+	}
+	for _, path := range result.Pruned {
+		fmt.Fprintf(w, "prune: %s\n", path)
+	}
+	for _, line := range result.Drift {
+		fmt.Fprintf(w, "drift: %s\n", line)
+	}
+	switch {
+	case result.Check:
+		fmt.Fprintf(w, "check: %d file(s), %d drift\n", len(result.Files), len(result.Drift))
+	case result.DryRun:
+		fmt.Fprintf(w, "dry-run: %d file(s), nothing written\n", len(result.Files))
+	default:
+		fmt.Fprintf(w, "render-node(%s): %d file(s) installed\n", result.NodeType, len(result.Files))
+	}
 }
 
 // splitSubcommand validates and strips the sub-word (e.g. "sync" from
@@ -1058,6 +1428,184 @@ func runKeeperMntr(args []string) error {
 	}
 	fmt.Println(out)
 	return nil
+}
+
+// runHealth implements `chctl health`: the one verification command the
+// stack gates boots, refreshes and runbooks on — server reachability,
+// replica writability, keeper mntr, spec tables, self registration.
+//
+// Check fan-out: the server check pings EVERY inventory host (a cluster
+// health command must not inherit a load balancer's blind spot) and
+// reports each down host by name. The replicas fan-out runs on the
+// first reachable host via clusterAllReplicas with
+// skip_unavailable_shards=1 — down peers are already named by the
+// server check, so the sweep reports the rest.
+//
+// Exit codes (the safe-to-stop contract): 0 every executed check
+// passed (skips don't count — an optional check that was not requested
+// is not a failure); 3 any check degraded; 1 usage error. Scripts read
+// 3 as "unhealthy", never as empty success.
+//
+// -spec is OPTIONAL here (unlike schema/replica commands): without it
+// the tables check is skipped; with it the tables the spec's .sql files
+// declare are verified present and the -cluster name is whitelisted
+// against the CR (the fan-out SQL interpolates it — same gate as
+// replica gc).
+//
+// -self <name> names this node's replica identity (the {replica} macro
+// value, e.g. reader-0). The check reads it from the replicas fan-out
+// (cluster-wide system.replicas rows), so the full inventory stays
+// valid — no separate host flag needed.
+func runHealth(args []string) error {
+	report, err := runHealthWith(os.Stdout, args)
+	if err != nil {
+		return err
+	}
+	if !report.Healthy() {
+		// Exit code 3: operational degradation — a check failed. The
+		// gate contract: scripts alarm/hold, never treat as success.
+		os.Exit(exitOpError)
+	}
+	return nil
+}
+
+// runHealthWith writes the report to w instead of stdout and returns
+// the report instead of exiting — the shape the CLI tests drive (they
+// assert the human/JSON output and the degraded/healthy verdict
+// without an os.Exit in the test process). The exit-code decision is
+// the caller's: Healthy() false maps to exit 3.
+func runHealthWith(w io.Writer, args []string) (*service.HealthReport, error) {
+	fs := flag.NewFlagSet("health", flag.ContinueOnError)
+	var (
+		cluster    string
+		user       string
+		password   string
+		portNum    int
+		secure     bool
+		specFile   string
+		keeperAddr string
+		selfName   string
+		asJSON     bool
+		timeoutIn  string
+	)
+	hosts := &hostList{}
+	fs.StringVar(&cluster, "cluster", "", "ClickHouse cluster name (remote_servers), required")
+	fs.Var(hosts, "host", "cluster host as name=address (repeatable)")
+	fs.StringVar(&user, "user", "default", "ClickHouse user for health queries")
+	fs.StringVar(&password, "password", "", "ClickHouse password (prefer env/secrets over flags)")
+	fs.IntVar(&portNum, "port", 8123, "ClickHouse HTTP port")
+	fs.BoolVar(&secure, "secure", false, "use HTTPS scheme")
+	fs.StringVar(&specFile, "spec", "", "CHI spec file (YAML); enables the tables-present check and gates -cluster against the CR's clusters")
+	fs.StringVar(&keeperAddr, "keeper", "", "keeper mntr address host:port; enables the keeper check")
+	fs.StringVar(&selfName, "self", "", "this node's replica name ({replica} macro value, e.g. reader-0); enables the self-registration check")
+	fs.BoolVar(&asJSON, "json", false, `emit {"status":...,"checks":[{name,status,detail}...]} instead of the human lines`)
+	fs.StringVar(&timeoutIn, "timeout", "5s", "per-probe timeout")
+	flagArgs, positional := separatePositionals(fs, args)
+	if err := fs.Parse(flagArgs); err != nil {
+		return nil, err
+	}
+	if len(positional) != 0 {
+		return nil, fmt.Errorf("usage: chctl health takes no positional argument (got %v)", positional)
+	}
+	if cluster == "" {
+		return nil, fmt.Errorf("-cluster is required")
+	}
+	if len(hosts.values) == 0 {
+		return nil, fmt.Errorf("-host <name=address> is required (the inventory to check)")
+	}
+	timeout, err := time.ParseDuration(timeoutIn)
+	if err != nil {
+		return nil, fmt.Errorf("parse -timeout: %w", err)
+	}
+	if timeout <= 0 {
+		return nil, fmt.Errorf("-timeout must be positive, got %s", timeout)
+	}
+
+	// Inventory: every -host must be name=address (same shape as the
+	// schema/replica commands).
+	inventory := make([]domain.HostIdentity, 0, len(hosts.values))
+	for _, h := range hosts.values {
+		name, address, ok := strings.Cut(h, "=")
+		if !ok || name == "" || address == "" {
+			return nil, fmt.Errorf("host %q must be name=address", h)
+		}
+		inventory = append(inventory, domain.HostIdentity{Name: name, Address: address})
+	}
+
+	// -spec is optional: given, the tables check runs against the
+	// expected tables parsed from the CR's .sql files, and the cluster
+	// name must be one the CR declares (the replicas fan-out SQL
+	// interpolates it; only CR-declared names may reach the SQL).
+	var normalizedCR any
+	expectedTables := func() []domain.TableRef { return nil }
+	if specFile != "" {
+		specData, err := os.ReadFile(specFile)
+		if err != nil {
+			return nil, fmt.Errorf("read spec: %w", err)
+		}
+		normalizedCR, err = operator.NewSpecLoader().LoadCHI(context.Background(), port.LoadCHIRequest{
+			Spec: domain.SpecReference{Data: specData},
+		})
+		if err != nil {
+			return nil, err
+		}
+		declared, err := clusterDeclaredByCR(normalizedCR, cluster)
+		if err != nil {
+			return nil, err
+		}
+		if !declared {
+			return nil, fmt.Errorf("cluster %q not declared by the CR's spec", cluster)
+		}
+		crTables := operator.ExpectedTablesFromCR(normalizedCR)
+		expectedTables = func() []domain.TableRef { return crTables }
+	}
+
+	// -self needs no host resolution: the check consumes the replicas
+	// fan-out (cluster-wide system.replicas rows), so the full
+	// inventory stays valid.
+
+	svc := service.NewHealthService(operator.NewHealthProbe(), &keeper.Probe{Timeout: timeout}, expectedTables)
+	report, err := svc.Check(context.Background(), service.HealthRequest{
+		ClusterName:   cluster,
+		Hosts:         inventory,
+		Credentials:   domain.Credentials{Username: user, Password: password},
+		HTTPPort:      portNum,
+		Secure:        secure,
+		Timeout:       timeout,
+		KeeperAddress: keeperAddr,
+		CheckTables:   specFile != "",
+		SelfName:      selfName,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if asJSON {
+		out, err := json.Marshal(report.ToJSONShape())
+		if err != nil {
+			return nil, fmt.Errorf("marshal health report: %w", err)
+		}
+		fmt.Fprintln(w, string(out))
+	} else {
+		fmt.Fprint(w, report.FormatHuman())
+	}
+	return report, nil
+}
+
+// clusterDeclaredByCR reports whether the loaded CR declares the named
+// cluster — the whitelist that guards every SQL interpolation of the
+// cluster name (the same gate the schema runner applies).
+func clusterDeclaredByCR(cr any, name string) (bool, error) {
+	chi, ok := cr.(*v1.ClickHouseInstallation)
+	if !ok || chi == nil {
+		return false, fmt.Errorf("normalized CR is not a ClickHouseInstallation")
+	}
+	for _, cluster := range chi.GetSpecT().GetConfiguration().GetClusters() {
+		if cluster != nil && cluster.Name == name {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // schemaFlagSet holds the parsed pointers of the shared schema flags.

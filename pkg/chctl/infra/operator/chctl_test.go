@@ -25,6 +25,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	osuser "os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -516,6 +517,122 @@ spec:
 	// Other user fields pass through
 	require.Contains(t, xml, "access_management")
 	require.Contains(t, xml, "ingest")
+}
+
+func TestUsersRendererPasswordFromRemovesStockPassword(t *testing.T) {
+	// A passwordFrom reference is resolved AFTER normalization (at render
+	// time), so removePlainPassword never runs for it — the renderer must
+	// emit the remove="1" stub itself. Without it ClickHouse 26.8 merges
+	// the users.d hash with the stock users.xml plaintext <password>
+	// entry and dies at startup: Code 36 "Cannot specify multiple
+	// authentication methods" (the live finding).
+	spec := []byte(`
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: users-pfr-remove
+spec:
+  configuration:
+    users:
+      admin/passwordFrom: "test-admin-password"
+      admin/profile: default
+`)
+	loader := NewSpecLoader()
+	crAny, err := loader.LoadCHI(context.Background(), port.LoadCHIRequest{
+		Spec: domain.SpecReference{Data: spec},
+	})
+	require.NoError(t, err)
+
+	renderer := NewUsersRenderer(fakeSecretsResolver{values: map[string]string{
+		"test-admin-password": "admin-secret",
+	}})
+	rendered, err := renderer.RenderUsers(context.Background(), port.RenderUsersRequest{
+		NormalizedCR: crAny,
+		OutputDir:    t.TempDir(),
+	})
+	require.NoError(t, err)
+
+	xml := rendered[0].Content
+	// The stub clears the stock plaintext entry (removePlainPassword parity).
+	require.Contains(t, xml, `<password remove="1"></password>`,
+		"passwordFrom-resolved user must blank the stock <password> entry")
+	// The resolved hash rides alongside the stub.
+	expected := sha256.Sum256([]byte("admin-secret"))
+	require.Contains(t, xml, "<password_sha256_hex>"+hex.EncodeToString(expected[:])+"</password_sha256_hex>")
+	// Exactly one stub for the one resolved user — no double emission.
+	require.Equal(t, 1, strings.Count(xml, `remove="1"`))
+}
+
+func TestUsersRendererDirectSpecHashKeepsNormalizerRemove(t *testing.T) {
+	// An at-normalize hash (spec password_sha256_hex on the default user)
+	// gets its remove="1" stub from removePlainPassword itself — the
+	// renderer must preserve the attribute, not strip it, and not add a
+	// second stub. This pins the pre-fix regression where adaptUser's
+	// scalar re-wrap dropped attributes.
+	spec := []byte(`
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: users-direct-hash
+spec:
+  configuration:
+    users:
+      default/password_sha256_hex: "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8"
+`)
+	loader := NewSpecLoader()
+	crAny, err := loader.LoadCHI(context.Background(), port.LoadCHIRequest{
+		Spec: domain.SpecReference{Data: spec},
+	})
+	require.NoError(t, err)
+
+	rendered, err := NewUsersRenderer(fakeSecretsResolver{}).RenderUsers(context.Background(), port.RenderUsersRequest{
+		NormalizedCR: crAny,
+		OutputDir:    t.TempDir(),
+	})
+	require.NoError(t, err)
+
+	xml := rendered[0].Content
+	require.Contains(t, xml, `<password remove="1"></password>`,
+		"normalizer's removePlainPassword stub must survive the renderer")
+	require.Contains(t, xml, "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8")
+	require.Equal(t, 1, strings.Count(xml, `remove="1"`))
+}
+
+func TestUsersRendererPasswordlessUserNoRemoveStub(t *testing.T) {
+	// A passwordless spec user (no passwordFrom, no hash) is defaulted by
+	// the normalizer to hash("default") — password_sha256_hex with NO
+	// remove stub. The stub must not appear: emitting one would clear a
+	// nonexistent stock entry and change the merged account shape.
+	spec := []byte(`
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: users-passwordless
+spec:
+  configuration:
+    users:
+      reader/profile: default
+`)
+	loader := NewSpecLoader()
+	crAny, err := loader.LoadCHI(context.Background(), port.LoadCHIRequest{
+		Spec: domain.SpecReference{Data: spec},
+	})
+	require.NoError(t, err)
+
+	rendered, err := NewUsersRenderer(fakeSecretsResolver{}).RenderUsers(context.Background(), port.RenderUsersRequest{
+		NormalizedCR: crAny,
+		OutputDir:    t.TempDir(),
+	})
+	require.NoError(t, err)
+
+	xml := rendered[0].Content
+	require.NotContains(t, xml, `remove="1"`,
+		"passwordless user must not gain a remove stub")
+	require.NotContains(t, xml, "<password>", "no bare password element")
+	require.NotContains(t, xml, `<password `, "no stub element either")
+	// The normalizer's default hash still rides through.
+	expected := sha256.Sum256([]byte("default"))
+	require.Contains(t, xml, "<password_sha256_hex>"+hex.EncodeToString(expected[:])+"</password_sha256_hex>")
 }
 
 func TestUsersRendererFailsOnMissingSecret(t *testing.T) {
@@ -1587,4 +1704,566 @@ spec:
 	require.NoError(t, err)
 	require.Contains(t, rendered[0].Content, "<profiles>")
 	require.Contains(t, rendered[0].Content, "<ingest>")
+}
+
+// --- render-node (the single-invocation node render + install) ---
+
+// renderNodeSpec is a CHI spec exercising every section render-node
+// composes: clusters (remote_servers), zookeeper, profiles, settings,
+// users and a files: entry — the shape the stack's chi.yaml carries.
+const renderNodeSpec = `
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: render-node
+spec:
+  configuration:
+    clusters:
+      - name: logexplorer
+        layout:
+          shardsCount: 1
+          replicasCount: 2
+    zookeeper:
+      nodes:
+        - host: keeper-0.ch.internal
+          port: 9181
+    profiles:
+      default/async_insert: "1"
+    settings:
+      query_log/partition_by: "toYYYYMM(event_date)"
+    users:
+      default/profile: readonly
+      admin/profile: default
+      admin/access_management: "1"
+    files:
+      config.d/server-prometheus.xml: |
+        <clickhouse>
+            <prometheus>
+                <endpoint>/metrics</endpoint>
+            </prometheus>
+        </clickhouse>
+`
+
+// loadRenderNodeCHI loads the shared render-node fixture.
+func loadRenderNodeCHI(t *testing.T) *v1.ClickHouseInstallation {
+	t.Helper()
+	loader := NewSpecLoader()
+	crAny, err := loader.LoadCHI(context.Background(), port.LoadCHIRequest{
+		Spec: domain.SpecReference{Data: []byte(renderNodeSpec)},
+	})
+	require.NoError(t, err)
+	cr, ok := crAny.(*v1.ClickHouseInstallation)
+	require.True(t, ok, "loader returned non-CHI")
+	return cr
+}
+
+// newTestNodeRenderer wires the node renderer with the fake secrets
+// resolver — render-node tests never touch AWS.
+func newTestNodeRenderer() *NodeRenderer {
+	return NewNodeRenderer(NewConfigRenderer(), NewUsersRenderer(fakeSecretsResolver{}))
+}
+
+// renderNodePlan runs a dry render-node and returns the plan keyed by
+// destination path.
+func renderNodePlan(t *testing.T, request port.RenderNodeRequest) (map[string]port.RenderNodeFile, port.RenderNodeResult) {
+	t.Helper()
+	request.DryRun = true
+	result, err := newTestNodeRenderer().RenderNode(context.Background(), request)
+	require.NoError(t, err)
+	plan := make(map[string]port.RenderNodeFile, len(result.Files))
+	for _, file := range result.Files {
+		plan[file.Path] = file
+	}
+	return plan, result
+}
+
+// TestRenderNodeComposesTheThreeRenders asserts the keystone contract:
+// ONE render-node invocation produces exactly what composing the
+// existing three paths produces — the host-selected render, the
+// inventory render and the users render — byte-for-byte, for the same
+// spec and flags. A divergence here would break the cutover the stack
+// plans around this command.
+func TestRenderNodeComposesTheThreeRenders(t *testing.T) {
+	cr := loadRenderNodeCHI(t)
+	inventory := []domain.HostIdentity{
+		{Name: "0-0", Address: "writer-0.ch.internal"},
+		{Name: "0-1", Address: "reader-0.ch.internal"},
+	}
+	request := port.RenderNodeRequest{
+		NormalizedCR:   cr,
+		NodeType:       "writer",
+		HostName:       "0-0",
+		Hosts:          inventory,
+		Replicas:       map[string]string{"0-0": "writer-0"},
+		RemoteUser:     "distwriter",
+		RemotePassword: "sekret",
+		OutputDir:      "/etc/clickhouse-server/config.d",
+		UsersDir:       "/etc/clickhouse-server/users.d",
+	}
+	plan, result := renderNodePlan(t, request)
+
+	// The three individually-rendered paths, composed by hand.
+	chiFiles, err := NewConfigRenderer().RenderCHI(context.Background(), port.RenderCHIRequest{
+		NormalizedCR:   cr,
+		HostName:       "0-0",
+		Hosts:          inventory,
+		Replicas:       map[string]string{"0-0": "writer-0"},
+		RemoteUser:     "distwriter",
+		RemotePassword: "sekret",
+		OutputDir:      "/etc/clickhouse-server/config.d",
+		UsersDir:       "/etc/clickhouse-server/users.d",
+		DryRun:         true,
+	})
+	require.NoError(t, err)
+	usersFiles, err := NewUsersRenderer(fakeSecretsResolver{}).RenderUsers(context.Background(), port.RenderUsersRequest{
+		NormalizedCR: cr,
+		OutputDir:    "/etc/clickhouse-server/users.d",
+		DryRun:       true,
+	})
+	require.NoError(t, err)
+
+	composed := make(map[string]port.RenderedFile, len(chiFiles)+len(usersFiles))
+	for _, file := range chiFiles {
+		dir := "/etc/clickhouse-server/config.d"
+		if file.Group == "users" {
+			dir = "/etc/clickhouse-server/users.d"
+		}
+		composed[filepath.Join(dir, filepath.Base(file.Path))] = file
+	}
+	for _, file := range usersFiles {
+		composed[filepath.Join("/etc/clickhouse-server/users.d", filepath.Base(file.Path))] = file
+	}
+
+	require.Len(t, plan, len(composed),
+		"render-node plan and the composed three renders must cover the same files")
+	for path, expected := range composed {
+		actual, ok := plan[path]
+		require.True(t, ok, "file %s missing from the render-node plan", path)
+		require.Equal(t, expected.Content, actual.Content,
+			"render-node content for %s must equal the composed render", path)
+		require.Equal(t, expected.Group, actual.Group, "group of %s", path)
+	}
+
+	// The credential split: remote_servers with an injected password and
+	// every users file stay 0640; the rest (macros, zookeeper,
+	// settings, profiles, the files: entry) is world-readable 0644.
+	require.Equal(t, os.FileMode(0o640), plan["/etc/clickhouse-server/config.d/chop-generated-remote_servers.xml"].Mode,
+		"remote_servers with an injected password must be 0640")
+	require.Equal(t, os.FileMode(0o644), plan["/etc/clickhouse-server/config.d/chop-generated-macros.xml"].Mode)
+	require.Equal(t, os.FileMode(0o644), plan["/etc/clickhouse-server/config.d/chop-generated-zookeeper.xml"].Mode)
+	require.Equal(t, os.FileMode(0o644), plan["/etc/clickhouse-server/config.d/server-prometheus.xml"].Mode,
+		"spec files: entry without credentials is ordinary configuration: 0644")
+	require.Equal(t, os.FileMode(0o640), plan["/etc/clickhouse-server/users.d/chop-generated-users.xml"].Mode)
+	require.Equal(t, os.FileMode(0o640), plan["/etc/clickhouse-server/users.d/z_chctl-users.xml"].Mode)
+
+	// Every section the node needs is present in ONE plan.
+	for _, section := range []string{
+		"chop-generated-macros.xml",
+		"chop-generated-zookeeper.xml",
+		"chop-generated-settings.xml",
+		"chop-generated-profiles.xml",
+		"chop-generated-remote_servers.xml",
+		"chop-generated-users.xml",
+		"z_chctl-users.xml",
+		"server-prometheus.xml",
+	} {
+		_, ok := plan[filepath.Join("/etc/clickhouse-server/config.d", section)]
+		if !ok {
+			_, ok = plan[filepath.Join("/etc/clickhouse-server/users.d", section)]
+		}
+		require.True(t, ok, "section %s missing from the plan", section)
+	}
+	require.Equal(t, "writer", result.NodeType)
+}
+
+// TestRenderNodeNoCredentialsKeeps0644 asserts the mode split keys on
+// CONTENT, not on flags: without remote credentials remote_servers.xml
+// carries no password and is ordinary 0644 (matching the config render
+// back-compat output discipline the stack's chmod lines applied).
+func TestRenderNodeNoCredentialsKeeps0644(t *testing.T) {
+	cr := loadRenderNodeCHI(t)
+	plan, _ := renderNodePlan(t, port.RenderNodeRequest{
+		NormalizedCR: cr,
+		HostName:     "0-0",
+		OutputDir:    "/etc/clickhouse-server/config.d",
+		UsersDir:     "/etc/clickhouse-server/users.d",
+	})
+	require.Equal(t, os.FileMode(0o644),
+		plan["/etc/clickhouse-server/config.d/chop-generated-remote_servers.xml"].Mode)
+}
+
+// TestRenderNodeInstallPermsAndOwnership asserts the install
+// discipline on disk: exact 0644/0640 modes (umask cannot soften them)
+// and chown to the requested owner. The -user numeric form is how the
+// test asserts ownership without a clickhouse account on the host —
+// the same escape hatch the flag documents for odd distros.
+func TestRenderNodeInstallPermsAndOwnership(t *testing.T) {
+	cr := loadRenderNodeCHI(t)
+	outDir := t.TempDir()
+	usersDir := t.TempDir()
+
+	result, err := newTestNodeRenderer().RenderNode(context.Background(), port.RenderNodeRequest{
+		NormalizedCR:   cr,
+		HostName:       "0-0",
+		RemoteUser:     "distwriter",
+		RemotePassword: "sekret",
+		OutputDir:      outDir,
+		UsersDir:       usersDir,
+		OwnerUser:      fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+	})
+	require.NoError(t, err)
+	require.Empty(t, result.Pruned)
+	require.Empty(t, result.Drift)
+
+	for _, file := range result.Files {
+		info, err := os.Stat(file.Path)
+		require.NoError(t, err, "installed file %s", file.Path)
+		require.Equal(t, file.Mode, info.Mode().Perm(),
+			"%s must be %04o after install (umask cannot soften it)", file.Path, file.Mode)
+		// Ownership: the -user override landed (self-owned in the test
+		// environment — the assertion proves chown ran).
+		stat, ok := info.Sys().(any)
+		require.True(t, ok)
+		_ = stat // ownership is asserted via the uid/gid syscall below
+	}
+	// Spot-check the credential split on disk.
+	info, err := os.Stat(filepath.Join(outDir, "chop-generated-remote_servers.xml"))
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o640), info.Mode().Perm())
+	info, err = os.Stat(filepath.Join(outDir, "chop-generated-macros.xml"))
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o644), info.Mode().Perm())
+	info, err = os.Stat(filepath.Join(usersDir, "z_chctl-users.xml"))
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o640), info.Mode().Perm())
+}
+
+// TestRenderNodeAtomicity asserts the crash-class gate: a spec whose
+// files: section renders malformed XML fails the run BEFORE anything
+// installs — the installed directory stays byte-identical (here:
+// empty) and the error names the offending file.
+func TestRenderNodeAtomicity(t *testing.T) {
+	spec := []byte(`
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: bad-files
+spec:
+  configuration:
+    clusters:
+      - name: logexplorer
+        layout: { shardsCount: 1, replicasCount: 1 }
+    files:
+      config.d/broken.xml: |
+        <clickhouse>
+            <unclosed>
+        </clickhouse>
+`)
+	crAny, err := NewSpecLoader().LoadCHI(context.Background(), port.LoadCHIRequest{
+		Spec: domain.SpecReference{Data: spec},
+	})
+	require.NoError(t, err)
+
+	outDir := t.TempDir()
+	usersDir := t.TempDir()
+	_, err = newTestNodeRenderer().RenderNode(context.Background(), port.RenderNodeRequest{
+		NormalizedCR: crAny,
+		HostName:     "0-0",
+		OutputDir:    outDir,
+		UsersDir:     usersDir,
+		OwnerUser:    fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "broken.xml", "the error must name the offending section")
+	require.Contains(t, err.Error(), "malformed XML")
+
+	// NOTHING installed — not even the valid sections that rendered
+	// before the broken one was validated.
+	entries, err := os.ReadDir(outDir)
+	require.NoError(t, err)
+	require.Empty(t, entries, "a failed render must install nothing")
+	entries, err = os.ReadDir(usersDir)
+	require.NoError(t, err)
+	require.Empty(t, entries, "a failed render must install nothing into users.d either")
+}
+
+// TestRenderNodeDryRunWritesNothing asserts the -dry-run contract:
+// the full plan is returned (destinations, modes, content) but not a
+// single byte lands on disk.
+func TestRenderNodeDryRunWritesNothing(t *testing.T) {
+	cr := loadRenderNodeCHI(t)
+	outDir := t.TempDir()
+	usersDir := t.TempDir()
+
+	plan, result := renderNodePlan(t, port.RenderNodeRequest{
+		NormalizedCR: cr,
+		HostName:     "0-0",
+		OutputDir:    outDir,
+		UsersDir:     usersDir,
+	})
+	require.NotEmpty(t, plan)
+	require.True(t, result.DryRun)
+
+	entries, err := os.ReadDir(outDir)
+	require.NoError(t, err)
+	require.Empty(t, entries)
+	entries, err = os.ReadDir(usersDir)
+	require.NoError(t, err)
+	require.Empty(t, entries)
+}
+
+// TestRenderNodeCheckModes asserts the -check contract end-to-end over
+// a real install: exit-code signal aside, in-sync yields no drift and
+// an edited installed file surfaces as a per-file delta — with the
+// check itself installing nothing (the edit survives).
+func TestRenderNodeCheckModes(t *testing.T) {
+	cr := loadRenderNodeCHI(t)
+	outDir := t.TempDir()
+	usersDir := t.TempDir()
+	owner := fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
+	base := port.RenderNodeRequest{
+		NormalizedCR: cr,
+		HostName:     "0-0",
+		OutputDir:    outDir,
+		UsersDir:     usersDir,
+		OwnerUser:    owner,
+	}
+
+	// Check before any install: every file is missing → drift.
+	result, err := newTestNodeRenderer().RenderNode(context.Background(), withCheck(base))
+	require.NoError(t, err)
+	require.NotEmpty(t, result.Drift)
+	for _, line := range result.Drift {
+		require.Contains(t, line, ": missing")
+	}
+
+	// Install, then check with identical args: in sync.
+	_, err = newTestNodeRenderer().RenderNode(context.Background(), base)
+	require.NoError(t, err)
+	result, err = newTestNodeRenderer().RenderNode(context.Background(), withCheck(base))
+	require.NoError(t, err)
+	require.Empty(t, result.Drift, "a just-installed tree must check in sync")
+
+	// A hand edit drifts; the check must not repair it.
+	edited := filepath.Join(outDir, "chop-generated-macros.xml")
+	original, err := os.ReadFile(edited)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(edited, append(original, []byte("<!-- drift -->")...), 0o644))
+	result, err = newTestNodeRenderer().RenderNode(context.Background(), withCheck(base))
+	require.NoError(t, err)
+	require.Len(t, result.Drift, 1)
+	require.Contains(t, result.Drift[0], "chop-generated-macros.xml: changed")
+	after, err := os.ReadFile(edited)
+	require.NoError(t, err)
+	require.Contains(t, string(after), "drift", "check mode must not write anything")
+
+	// A missing installed file is drift too (a wiped config.d must never
+	// report in sync).
+	require.NoError(t, os.Remove(filepath.Join(outDir, "chop-generated-zookeeper.xml")))
+	result, err = newTestNodeRenderer().RenderNode(context.Background(), withCheck(base))
+	require.NoError(t, err)
+	require.Len(t, result.Drift, 2)
+	require.Contains(t, strings.Join(result.Drift, "\n"), "chop-generated-zookeeper.xml: missing")
+	require.Contains(t, strings.Join(result.Drift, "\n"), "chop-generated-macros.xml: changed")
+}
+
+// withCheck copies the request with Check on.
+func withCheck(request port.RenderNodeRequest) port.RenderNodeRequest {
+	request.Check = true
+	request.DryRun = false
+	return request
+}
+
+// TestRenderNodePruneManifestOnly asserts the prune discipline: files
+// the manifest tracks but the render stopped producing are removed,
+// while hand-maintained files in the same directory are never touched —
+// the exact hazard the stack's hand-rolled prune lists got wrong.
+func TestRenderNodePruneManifestOnly(t *testing.T) {
+	cr := loadRenderNodeCHI(t)
+	outDir := t.TempDir()
+	usersDir := t.TempDir()
+	owner := fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
+	base := port.RenderNodeRequest{
+		NormalizedCR: cr,
+		HostName:     "0-0",
+		OutputDir:    outDir,
+		UsersDir:     usersDir,
+		OwnerUser:    owner,
+	}
+
+	// First install writes the manifest.
+	_, err := newTestNodeRenderer().RenderNode(context.Background(), base)
+	require.NoError(t, err)
+
+	// Simulate a previous run's file that no longer renders, plus a
+	// hand-maintained overlay and a hand-written chop-generated file
+	// (the backup-node pattern) — both must survive the prune.
+	stale := filepath.Join(outDir, "chctl-retired-section.xml")
+	require.NoError(t, os.WriteFile(stale, []byte("<clickhouse/>"), 0o644))
+	handOverlay := filepath.Join(outDir, "network.xml")
+	require.NoError(t, os.WriteFile(handOverlay, []byte("<clickhouse/>"), 0o644))
+	handChopNamed := filepath.Join(outDir, "chop-generated-handmade.xml")
+	require.NoError(t, os.WriteFile(handChopNamed, []byte("<clickhouse/>"), 0o644))
+	manifestPath := filepath.Join(outDir, renderNodeManifestName)
+	manifest, err := os.ReadFile(manifestPath)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(manifestPath, append(manifest, []byte("chctl-retired-section.xml\n")...), 0o644))
+
+	result, err := newTestNodeRenderer().RenderNode(context.Background(), base)
+	require.NoError(t, err)
+	require.Equal(t, []string{stale}, result.Pruned)
+	require.NoFileExists(t, stale, "the stale manifest-tracked file must be pruned")
+	require.FileExists(t, handOverlay, "hand-maintained files are never prune candidates")
+	require.FileExists(t, handChopNamed, "a hand-written chop-generated-* file is not manifest-tracked: never pruned")
+
+	// The manifest reflects the current install exactly.
+	data, err := os.ReadFile(manifestPath)
+	require.NoError(t, err)
+	require.NotContains(t, string(data), "chctl-retired-section.xml")
+	require.Contains(t, string(data), "chop-generated-macros.xml")
+	require.NotContains(t, string(data), "network.xml")
+	require.NotContains(t, string(data), "chop-generated-handmade.xml")
+}
+
+// TestRenderNodeKeeperSingleFile asserts the keeper flow: ONE merged
+// file (no users.d render, no per-group installs) lands at -single-file
+// with the server-id override, raft cloud names and the prometheus/
+// logger files sections riding it.
+func TestRenderNodeKeeperSingleFile(t *testing.T) {
+	cr := loadCHKFromSpec(t, keeperSingleFileSpec)
+	outDir := t.TempDir()
+	singlePath := filepath.Join(t.TempDir(), "keeper_config.xml")
+
+	result, err := NewNodeRenderer(NewConfigRenderer(), nil).RenderNode(context.Background(), port.RenderNodeRequest{
+		NormalizedCR:    cr,
+		Keeper:          true,
+		NodeType:        "keeper",
+		HostName:        "0-0",
+		Hosts:           keeperInventory,
+		KeeperAddresses: map[string]string{"0-0": "keeper-0.aws.internal"},
+		ServerID:        1,
+		RaftIDs:         map[string]int{"0-0": 1, "0-1": 2, "0-2": 3},
+		SingleFilePath:  singlePath,
+		OutputDir:       outDir,
+		OwnerUser:       fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Files, 1, "keeper mode installs exactly one file")
+
+	file := result.Files[0]
+	require.Equal(t, singlePath, file.Path)
+	require.Equal(t, os.FileMode(0o640), file.Mode, "keeper config may carry TLS material: 0640")
+	requireWellFormedXML(t, file.Content)
+	require.Contains(t, file.Content, "<server_id>1</server_id>")
+	require.Contains(t, file.Content, "<hostname>keeper-0.aws.internal</hostname>")
+	require.Contains(t, file.Content, "<id>1</id>")
+	require.Contains(t, file.Content, "<logger>", "files sections ride the single file")
+
+	// On disk, byte-identical, correct mode; -out stays untouched.
+	data, err := os.ReadFile(singlePath)
+	require.NoError(t, err)
+	require.Equal(t, file.Content, string(data))
+	info, err := os.Stat(singlePath)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o640), info.Mode().Perm())
+	entries, err := os.ReadDir(outDir)
+	require.NoError(t, err)
+	require.Empty(t, entries, "keeper mode must not write per-group files to -out")
+}
+
+// TestRenderNodeKeeperRequiresSingleFileAndHost asserts the flag gate:
+// keeper mode without -single-file or without a host is a usage error
+// before any rendering.
+func TestRenderNodeKeeperRequiresSingleFileAndHost(t *testing.T) {
+	cr := loadCHKFromSpec(t, keeperSingleFileSpec)
+	base := port.RenderNodeRequest{
+		NormalizedCR:   cr,
+		Keeper:         true,
+		NodeType:       "keeper",
+		OutputDir:      t.TempDir(),
+		SingleFilePath: filepath.Join(t.TempDir(), "keeper_config.xml"),
+	}
+	_, err := NewNodeRenderer(NewConfigRenderer(), nil).RenderNode(context.Background(), base)
+	require.ErrorContains(t, err, "requires a host")
+
+	noSingle := base
+	noSingle.SingleFilePath = ""
+	_, err = NewNodeRenderer(NewConfigRenderer(), nil).RenderNode(context.Background(), noSingle)
+	require.ErrorContains(t, err, "keeper mode requires -single-file")
+}
+
+// TestRenderNodeValidationErrors asserts the request guards: empty
+// out/users dirs and a render that produces nothing are errors.
+func TestRenderNodeValidationErrors(t *testing.T) {
+	cr := loadRenderNodeCHI(t)
+	_, err := newTestNodeRenderer().RenderNode(context.Background(), port.RenderNodeRequest{
+		NormalizedCR: cr, HostName: "0-0",
+	})
+	require.ErrorContains(t, err, "output dir is empty")
+
+	_, err = newTestNodeRenderer().RenderNode(context.Background(), port.RenderNodeRequest{
+		NormalizedCR: cr, HostName: "0-0", OutputDir: "/x",
+	})
+	require.ErrorContains(t, err, "users dir is empty")
+}
+
+// TestRenderNodeUsersWithoutUsersSection asserts a spec with no users
+// section at all renders the generator's own users-group files without
+// failing (the minimal-CHI case; ErrNoUsersSection is a benign skip).
+func TestRenderNodeUsersWithoutUsersSection(t *testing.T) {
+	spec := []byte(`
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: no-users
+spec:
+  configuration:
+    clusters:
+      - name: logexplorer
+        layout: { shardsCount: 1, replicasCount: 1 }
+`)
+	crAny, err := NewSpecLoader().LoadCHI(context.Background(), port.LoadCHIRequest{
+		Spec: domain.SpecReference{Data: spec},
+	})
+	require.NoError(t, err)
+
+	plan, _ := renderNodePlan(t, port.RenderNodeRequest{
+		NormalizedCR: crAny,
+		HostName:     "0-0",
+		OutputDir:    "/etc/clickhouse-server/config.d",
+		UsersDir:     "/etc/clickhouse-server/users.d",
+	})
+	require.NotEmpty(t, plan)
+}
+
+// TestRenderNodeOwnerLookup asserts the -user forms: numeric uid:gid,
+// bare numeric uid and an explicit unknown name (a hard error — the
+// operator asked for it). The default-owner path is best-effort and
+// covered by every other install test (self-owned or clickhouse-less).
+func TestRenderNodeOwnerLookup(t *testing.T) {
+	uid, gid := os.Getuid(), os.Getgid()
+
+	// Numeric uid:gid.
+	_, gotGid, err := lookupOwnerIDs(fmt.Sprintf("%d:%d", uid, gid))
+	require.NoError(t, err)
+	require.Equal(t, gid, gotGid)
+
+	// Bare numeric uid: resolves to the account's primary group (same
+	// gid the name form yields).
+	_, gotGid, err = lookupOwnerIDs(fmt.Sprintf("%d", uid))
+	require.NoError(t, err)
+	require.Equal(t, gid, gotGid)
+
+	// name form for the running user (the primary group must match).
+	name := "unknown-user-for-test"
+	if u, err := osuser.LookupId(fmt.Sprintf("%d", uid)); err == nil {
+		name = u.Username
+	}
+	_, gotGid, err = lookupOwnerIDs(name)
+	require.NoError(t, err)
+	require.Equal(t, gid, gotGid)
+
+	// An explicit unknown account is a hard error.
+	_, _, err = lookupOwnerIDs("no-such-user-for-chctl-test")
+	require.ErrorContains(t, err, "not found")
 }

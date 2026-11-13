@@ -17,6 +17,7 @@ runs on-cluster, using the exact same code paths.
 | Scheduled bash loops that detect + drop stale replicas | `chctl replica gc` — detection and drop in one pass, behind a writer/keeper-safe name gate |
 | Runbook instructions "restart keepers one at a time" | `chctl keeper safe-to-stop` — a hard quorum gate; refuses (exit 2) if the stop would drop Raft majority |
 | `echo mntr \| nc host 9181 \| awk` in health scripts | `chctl keeper mntr` — parsed, sorted key=value (or `-json`) with a real exit code; the metric push stays in the caller |
+| Ad-hoc verification SQL + mntr gates in boot/refresh/runbooks | `chctl health` — one command checks server reachability (every host), replica writability, keeper mntr, spec tables and self registration, with pass/fail/skip per check and exit `0`/`3` |
 | Passwords baked into spec files or argv | `chctl config render -user-password` / `-remote-user` — files and env supply the secrets, the spec only declares the accounts |
 
 Anything you can express in a `ClickHouseInstallation`/`ClickHouseKeeperInstallation`
@@ -472,11 +473,77 @@ if payload=$(chctl keeper mntr -keeper "$KEEPER" -json); then
 fi
 ```
 
+## 5. Verify the whole stack in one pass (`health`)
+
+`chctl health` is the one verification command that gates boots, config
+refreshes and runbooks — it replaces the ad-hoc SQL snippets
+(`clusterAllReplicas ... is_readonly`, `system.replicas` greps) and the
+separate `keeper mntr` invocation each of those carried:
+
+```bash
+chctl health \
+  -cluster ch-int-dev \
+  -host 01-0=writer-0.ch.internal \
+  -host 01-1=reader-0.ch.internal \
+  -spec /var/lib/clickhouse-bootstrap/chi.yaml \
+  -keeper keeper-0.ch.internal:9181 \
+  -user admin -password "$(cat /var/lib/clickhouse-bootstrap/admin-password)"
+```
+
+```
+✓ server: 2/2 hosts up
+✓ keeper: leader (keeper-0.ch.internal:9181)
+✓ replicas: 3 replicated table(s), none readonly
+✓ tables: 3 expected table(s) present on 2 host(s)
+SKIP self: no -self given
+status: healthy (4 pass, 0 fail, 1 skip)
+```
+
+Checks (each reports pass/fail/skip; a skip is an optional check that
+was not requested and never counts against health):
+
+1. **server** — every `-host` inventory entry answers SQL (`SELECT 1`
+   over the same driver path the mutating commands use). A cluster
+   health command fans out over the full inventory, not the first
+   reachable host — a down reader behind a healthy writer must fail,
+   not hide behind the load balancer's blind spot.
+2. **keeper** (with `-keeper <host:port>`) — mntr reachable and
+   `zk_server_state` non-empty; the state (leader/follower/standalone)
+   is reported, not judged — a healthy ensemble HAS followers.
+3. **replicas** — `system.replicas` across the cluster
+   (`clusterAllReplicas` with `skip_unavailable_shards=1`, the same
+   fan-out the schemer's stale-replica detection uses): any
+   `is_readonly` row fails the check naming the table, replica and
+   host. `skip_unavailable_shards` tolerates down peers — the server
+   check already named them.
+4. **tables** (with `-spec`) — the table names the spec's `.sql`
+   `files:` entries declare (the operator's own initdb pattern for
+   schema DDL), compared against existing tables; a table present on
+   ANY host counts as present (schema sync materializes per-host, and
+   a fresh reader may lag — which `-self` covers). `-spec` also gates
+   `-cluster` against the CR's declared clusters, same as `replica gc`.
+5. **self** (with `-self <replica>`) — the named replica (the
+   `{replica}` macro value, e.g. `reader-0`) appears in the replicas
+   fan-out AND is active — the post-boot gate for a fresh reader:
+   tables created but registration absent means the node is not
+   serving replication yet.
+
+Exit `0` all requested checks pass · `3` any check degraded · `1`
+usage error. `-json` emits the stable wire form scripts pin on:
+
+```json
+{"status":"degraded","checks":[{"name":"server","status":"fail","detail":"..."},{"name":"keeper","status":"skip","detail":"no -keeper given"},...]}
+```
+
+Wire it into node bootstrap's final step, the config-refresher's
+post-step, and the cluster-health runbook's verification section
+(`if chctl health ...; then` gates the same way `safe-to-stop` does).
+
 ## Command reference
 
 ```
 chctl config render  -spec chi.yaml [-host 0-0] [-host name=address]... [-replica name=cloudname]...
-                      [-user-password name=path]... [-out config.d] [-users-dir users.d] [-dry-run] [-keeper]
+                      [-user-password name=path]... [-out config.d] [-users-dir users.d] [-dry-run] [-check] [-keeper]
                       [-remote-user <name> -remote-password-env <VAR> | -remote-password-file <path>]
                       keeper mode: [-keeper] -host <host> [-server-id <n>] [-raft-id name=id]... [-single-file <path>]
 chctl schema sync    <host> -cluster <name> -host <name=addr>... [-user u] [-password p] [-port n] [-secure]
@@ -486,6 +553,8 @@ chctl replica sync   <host> -cluster <name> -host <name=addr>...
 chctl replica gc     -on <peer> -cluster <name> -host <name=addr>... [-name-pattern reader-*]
 chctl keeper safe-to-stop -keeper <host:port> [-members n] [-wait-timeout 2m]
 chctl keeper mntr    -keeper <host:port> [-timeout 5s] [-json]
+chctl health    -cluster <name> -host <name=addr>... [-user u] [-password p] [-port n] [-secure]
+                [-spec chi.yaml] [-keeper <host:port>] [-self <replica>] [-json] [-timeout 5s]
 chctl version
 ```
 
@@ -519,6 +588,7 @@ Render flags in detail:
 | `-single-file <path>` | keeper | ONE merged `<clickhouse>`-rooted config (common+host); requires `-host` |
 | `-keeper-address crName=address` | keeper | repeatable keeper-only inventory; same raft `<hostname>` effect as the shared `-host` inventory |
 | `-out`, `-users-dir`, `-dry-run` | all renders | config output dir, users group dir, print without writing |
+| `-check` | all renders | byte-compare the would-be-rendered files against `-out` (users group against `-users-dir`) without writing; prints `IN SYNC` / `DRIFTED <file>` / `MISSING <file>` per file, exits `0` in sync / `4` on drift — the config refresher and health runbook's probe |
 
 Schema/replica flags in detail:
 
@@ -528,11 +598,18 @@ Schema/replica flags in detail:
 | `-prune-stale-self` | `schema sync` | opt-in: on a Code 253 (the target's own registration already exists — a recycled ordinal), drop that registration and retry. Only ever the target's own name |
 | `-on <peer>` | `replica drop`, `replica gc` | host that executes the SQL (either CR or cloud name) |
 | `-name-pattern reader-*` | `replica gc` | the safety gate: only matching stale hosts are dropped |
+| `-spec chi.yaml` | `health` (optional) | enables the tables-present check (expected names from the spec's `.sql` `files:`) and whitelists `-cluster` against the CR's declared clusters |
+| `-keeper <host:port>` | `health` (optional) | enables the keeper mntr check; the state is reported, not judged |
+| `-self <replica>` | `health` (optional) | enables the self-registration check for this node's `{replica}` macro value (works with the full multi-host inventory) |
+| `-json` | `health` | machine-readable `{"status":...,"checks":[{name,status,detail}...]}` instead of the human lines |
+| `-timeout 5s` | `health` | per-probe timeout (ping, each SQL query, mntr) |
 
 Exit codes: `0` ok · `1` usage error · `2` quorum gate held the node
 (`safe-to-stop` only) · `3` operational error — keeper unreachable
 (`keeper` subcommands), an unreachable peer or a failed drop
-(`replica gc`).
+(`replica gc`), any degraded check (`health`) · `4` config drift detected (`config render -check`
+only): some rendered file is missing or different on disk; nothing was
+written.
 
 ## Release / distribution
 

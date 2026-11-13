@@ -42,9 +42,37 @@ var chopOnce sync.Once
 // configuration via chop.Config(); without a non-nil singleton every
 // normalization/render panics. In-repo callers may have bootstrapped it
 // already, so this is idempotent.
+//
+// The operator's extra-config-file scan paths are then pinned to a
+// non-existent directory. The default is "config.d" RELATIVE TO THE
+// PROCESS CWD (normalizeSectionClickHouseConfigurationFile builds
+// RelativeToBasePath(ConfigFolderPath, "config.d") — and with no config
+// file the folder path is empty, so the path stays the bare relative
+// name). On a node the cwd is / and the scan finds nothing — but a
+// render whose -out IS ./config.d (the validate harness, a developer
+// shell) would feed its own previous output back into the next render
+// as operator extra files: nondeterministic output that grows per run
+// and drift-check false positives. Pinning to a path that cannot exist
+// makes the scan a no-op everywhere, preserving on-cluster behavior
+// (there chCommonConfigsPath is set explicitly in the operator's
+// config file).
 func bootstrapChop() {
 	chopOnce.Do(func() {
 		chop.New(nil, nil, "")
+		cfg := chop.Config()
+		// The scan paths are pinned and the ALREADY-scanned Runtime
+		// maps cleared: chop.New → Init → Postprocess reads them above
+		// (see the function comment), so pinning paths alone would
+		// leave this process's maps polluted.
+		const inert = "/nonexistent-chctl-operator-extra-configs"
+		cfg.ClickHouse.Config.File.Path.Common = inert
+		cfg.ClickHouse.Config.File.Path.Host = inert
+		cfg.ClickHouse.Config.File.Path.User = inert
+		cfg.Keeper.Config.File.Path.Common = inert
+		cfg.Keeper.Config.File.Path.Host = inert
+		cfg.Keeper.Config.File.Path.User = inert
+		cfg.ClickHouse.Config.File.Runtime = v1.OperatorConfigFileRuntime{}
+		cfg.Keeper.Config.File.Runtime = v1.OperatorConfigFileRuntime{}
 	})
 }
 

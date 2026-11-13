@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/xml"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -739,4 +740,246 @@ func TestRunReplicaGcRejectsStrayPositional(t *testing.T) {
 	})
 	require.ErrorContains(t, err, "no positional argument")
 	require.ErrorContains(t, err, "writer-0")
+}
+
+// --- config render-node (single-invocation node render + install) ---
+
+// renderNodeCHISpec is a minimal-but-complete CHI for the render-node
+// app tests: a cluster (remote_servers), a zookeeper section (host
+// group), users (both groups), settings and profiles.
+const renderNodeCHISpec = `
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: render-node-app
+spec:
+  configuration:
+    clusters:
+      - name: logexplorer
+        layout: { shardsCount: 1, replicasCount: 1 }
+    zookeeper:
+      nodes:
+        - host: keeper-0.ch.internal
+          port: 9181
+    profiles:
+      default/async_insert: "1"
+    settings:
+      query_log/partition_by: "toYYYYMM(event_date)"
+    users:
+      default/profile: readonly
+      admin/profile: default
+      admin/access_management: "1"
+`
+
+// writeRenderNodeSpec writes the shared fixture to a temp file.
+func writeRenderNodeSpec(t *testing.T) string {
+	t.Helper()
+	return writeSpecFile(t, renderNodeCHISpec)
+}
+
+// renderNodeTestUser pins the numeric self-owner so the install asserts
+// perms deterministically regardless of the host's accounts.
+func renderNodeTestUser() string {
+	return fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
+}
+
+func TestRunRenderNodeRequiresSpecAndOut(t *testing.T) {
+	// -spec and -out are both required: the command's whole value is
+	// the install discipline, and an implicit destination is how the
+	// old multi-call flow lost track of what landed where.
+	err := runConfig([]string{"render-node", "-out", t.TempDir()})
+	require.ErrorContains(t, err, "-spec is required")
+	err = runConfig([]string{"render-node", "-spec", writeRenderNodeSpec(t)})
+	require.ErrorContains(t, err, "-out is required")
+}
+
+func TestRunRenderNodeNodeTypeValidation(t *testing.T) {
+	spec := writeRenderNodeSpec(t)
+	// An unknown role is a typo, not a default.
+	err := runConfig([]string{"render-node", "-spec", spec, "-out", t.TempDir(), "-node-type", "writerz"})
+	require.ErrorContains(t, err, "-node-type must be writer|reader|backup|keeper")
+	// keeper role and -keeper must agree — a CHK spec renders keeper
+	// nodes only, and a keeper spec with a server role would render a
+	// server config from keeper identity data.
+	err = runConfig([]string{"render-node", "-spec", spec, "-out", t.TempDir(), "-keeper", "-node-type", "writer"})
+	require.ErrorContains(t, err, "a CHK spec renders keeper nodes only")
+	err = runConfig([]string{"render-node", "-spec", spec, "-out", t.TempDir(), "-node-type", "keeper"})
+	require.ErrorContains(t, err, "-node-type keeper requires -keeper")
+}
+
+func TestRunRenderNodeRequiresHost(t *testing.T) {
+	// Without a host there is no "this node" to render — the command
+	// is node-scoped by definition.
+	err := runConfig([]string{"render-node", "-spec", writeRenderNodeSpec(t), "-out", t.TempDir()})
+	require.ErrorContains(t, err, "render-node requires a host")
+}
+
+func TestRunRenderNodeDryRunWritesNothing(t *testing.T) {
+	spec := writeRenderNodeSpec(t)
+	outDir := t.TempDir()
+	usersDir := t.TempDir()
+
+	err := runConfig([]string{
+		"render-node", "-spec", spec, "-host", "0-0",
+		"-out", outDir, "-users-dir", usersDir,
+		"-user", renderNodeTestUser(), "-dry-run",
+	})
+	require.NoError(t, err)
+
+	entries, err := os.ReadDir(outDir)
+	require.NoError(t, err)
+	require.Empty(t, entries, "dry-run must not write to config.d")
+	entries, err = os.ReadDir(usersDir)
+	require.NoError(t, err)
+	require.Empty(t, entries, "dry-run must not write to users.d")
+}
+
+func TestRunRenderNodeInstallsWithPerms(t *testing.T) {
+	spec := writeRenderNodeSpec(t)
+	outDir := t.TempDir()
+
+	err := runConfig([]string{
+		"render-node", "-spec", spec, "-host", "0-0",
+		"-out", outDir, "-user", renderNodeTestUser(),
+		"-remote-user", "distwriter", "-remote-password-env", "CHCTL_RN_PW",
+	})
+	// An unset env var must fail before anything renders; then the
+	// real render with the password set.
+	require.ErrorContains(t, err, "environment variable not set")
+
+	require.NoError(t, os.Setenv("CHCTL_RN_PW", "sekret"))
+	defer os.Unsetenv("CHCTL_RN_PW")
+	err = runConfig([]string{
+		"render-node", "-spec", spec, "-host", "0-0",
+		"-out", outDir, "-user", renderNodeTestUser(),
+		"-remote-user", "distwriter", "-remote-password-env", "CHCTL_RN_PW",
+	})
+	require.NoError(t, err)
+
+	// -users-dir defaulted to the users.d sibling of -out; the config.d
+	// and users.d files landed with the mode split.
+	info, err := os.Stat(filepath.Join(outDir, "chop-generated-remote_servers.xml"))
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o640), info.Mode().Perm(), "credentialed remote_servers is 0640")
+	info, err = os.Stat(filepath.Join(outDir, "chop-generated-macros.xml"))
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o644), info.Mode().Perm())
+	usersDir := filepath.Join(filepath.Dir(outDir), "users.d")
+	info, err = os.Stat(filepath.Join(usersDir, "z_chctl-users.xml"))
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o640), info.Mode().Perm(), "users files carry password hashes: 0640")
+
+	// The manifest rides the managed directories (the prune authority).
+	require.FileExists(t, filepath.Join(outDir, ".chctl-render-node.manifest"))
+	require.FileExists(t, filepath.Join(usersDir, ".chctl-render-node.manifest"))
+}
+
+// exitCoder mirrors main.go's coder: an error that dictates its own
+// process exit code (the -check drift contract, 4).
+type exitCoder interface {
+	ExitCode() int
+}
+
+func TestRunRenderNodeCheckExitSyncAndDrift(t *testing.T) {
+	spec := writeRenderNodeSpec(t)
+	outDir := t.TempDir()
+	args := []string{
+		"render-node", "-spec", spec, "-host", "0-0",
+		"-out", outDir, "-user", renderNodeTestUser(),
+	}
+
+	// Check before install: every file missing → driftError with the
+	// exit-4 contract.
+	err := runConfig(append(args, "-check"))
+	require.Error(t, err)
+	var coded exitCoder
+	require.ErrorAs(t, err, &coded)
+	require.Equal(t, exitConfigDrift, coded.ExitCode())
+
+	// Install; then check with identical args: in sync, nil error.
+	require.NoError(t, runConfig(args))
+	require.NoError(t, runConfig(append(args, "-check")))
+
+	// An edited installed file drifts again.
+	edited := filepath.Join(outDir, "chop-generated-macros.xml")
+	data, err := os.ReadFile(edited)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(edited, append(data, []byte("<!-- drift -->")...), 0o644))
+	err = runConfig(append(args, "-check"))
+	require.ErrorAs(t, err, &coded)
+	require.Equal(t, exitConfigDrift, coded.ExitCode())
+}
+
+func TestRunRenderNodeKeeperMode(t *testing.T) {
+	spec := writeSpecFile(t, appKeeperSpec)
+	singlePath := filepath.Join(t.TempDir(), "keeper_config.xml")
+	outDir := t.TempDir()
+
+	err := runConfig([]string{
+		"render-node", "-spec", spec, "-keeper", "-node-type", "keeper",
+		"-host", "0-0", "-server-id", "1", "-single-file", singlePath,
+		"-out", outDir, "-user", renderNodeTestUser(),
+	})
+	require.NoError(t, err)
+
+	data, err := os.ReadFile(singlePath)
+	require.NoError(t, err)
+	require.Contains(t, string(data), "<server_id>1</server_id>")
+	// -out untouched: keeper mode writes only the single file.
+	entries, err := os.ReadDir(outDir)
+	require.NoError(t, err)
+	require.Empty(t, entries)
+
+	// Keeper flags against a CHI spec are refused (the mode gate).
+	err = runConfig([]string{"render-node", "-spec", spec, "-host", "0-0", "-out", t.TempDir(), "-single-file", singlePath})
+	require.ErrorContains(t, err, "-single-file applies to keeper mode only")
+	// And keeper mode demands -single-file.
+	err = runConfig([]string{"render-node", "-spec", spec, "-keeper", "-node-type", "keeper", "-host", "0-0", "-out", t.TempDir()})
+	require.ErrorContains(t, err, "keeper mode requires -single-file")
+}
+
+func TestRunRenderNodeRejectsStrayPositionalAndMutuallyExclusiveModes(t *testing.T) {
+	spec := writeRenderNodeSpec(t)
+	// The pre-scan surfaces a stray positional as a usage error, never
+	// swallows it as a flag value.
+	err := runConfig([]string{"render-node", "reader-0", "-spec", spec, "-out", t.TempDir()})
+	require.ErrorContains(t, err, "no positional argument")
+	require.ErrorContains(t, err, "reader-0")
+
+	// -check already writes nothing; -dry-run on top asks twice.
+	err = runConfig([]string{"render-node", "-spec", spec, "-out", t.TempDir(), "-check", "-dry-run"})
+	require.ErrorContains(t, err, "mutually exclusive")
+}
+
+func TestRunRenderNodeUserPasswordFlagWiresThrough(t *testing.T) {
+	// The -user-password hash injection must flow into render-node's
+	// users files exactly as in `config render`.
+	spec := writeRenderNodeSpec(t)
+	dir := t.TempDir()
+	pwFile := filepath.Join(dir, "admin.pw")
+	require.NoError(t, os.WriteFile(pwFile, []byte("testpass\n"), 0o600))
+	outDir := t.TempDir()
+
+	err := runConfig([]string{
+		"render-node", "-spec", spec, "-host", "0-0",
+		"-out", outDir, "-user", renderNodeTestUser(),
+		"-user-password", "admin=" + pwFile,
+	})
+	require.NoError(t, err)
+
+	data, err := os.ReadFile(filepath.Join(outDir, "..", "users.d", "chop-generated-users.xml"))
+	require.NoError(t, err)
+	require.Contains(t, string(data),
+		"<password_sha256_hex>13d249f2cb4127b40cfa757866850278793f814ded3c587fe5889e889a7a9f6c</password_sha256_hex>")
+}
+
+func TestUsageMentionsRenderNode(t *testing.T) {
+	// The help documents the new subcommand and its one-shot contract
+	// (docs update is a separate todo).
+	var out bytes.Buffer
+	usageWith(&out)
+	require.Contains(t, out.String(), "chctl config render-node")
+	require.Contains(t, out.String(), "[-node-type writer|reader|backup|keeper]")
+	require.Contains(t, out.String(), "render-node renders EVERYTHING for ONE node")
+	require.Contains(t, out.String(), "-check diffs the render against the installed")
 }

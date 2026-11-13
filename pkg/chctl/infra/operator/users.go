@@ -61,6 +61,12 @@ func NewUsersRenderer(secrets port.SecretsResolver) *UsersRenderer {
 	return &UsersRenderer{secrets: secrets}
 }
 
+// ErrNoUsersSection reports that the spec declares no users section at
+// all. Callers composing the users render with other renders (render
+// -node) treat it as a benign skip — the generator's own users-group
+// files already cover a spec without a users section.
+var ErrNoUsersSection = fmt.Errorf("spec has no users section")
+
 // RenderUsers writes the users.d XML for a normalized CHI.
 //
 // Without it: user/password management stays hand-written bash XML
@@ -76,7 +82,7 @@ func (r *UsersRenderer) RenderUsers(ctx context.Context, request port.RenderUser
 
 	userSettings := cr.GetSpecT().GetConfiguration().GetUsers()
 	if userSettings == nil || userSettings.Len() == 0 {
-		return nil, fmt.Errorf("spec has no users section")
+		return nil, ErrNoUsersSection
 	}
 
 	// Walk every SPEC-DECLARED user: resolve passwordFrom into hashed
@@ -215,6 +221,13 @@ func (r *UsersRenderer) adaptUser(ctx context.Context, fields *v1.SettingsUser, 
 			}
 			hash := sha256.Sum256([]byte(plaintext))
 			emitted.Set(user+"/password_sha256_hex", v1.NewSettingScalar(hex.EncodeToString(hash[:])))
+			// Blank the stock plaintext <password> entry, removePlainPassword
+			// semantics (normalizer.go): the reference is resolved here, AFTER
+			// normalization, so the normalizer cannot have set this stub - and
+			// without it ClickHouse (26.8) merges the users.d hash with the
+			// stock users.xml <password></password> and refuses to start:
+			// Code 36 "Cannot specify multiple authentication methods".
+			emitted.Set(user+"/password", v1.NewSettingScalar("").SetAttribute("remove", "1"))
 			resolvedHash = true
 		case name == "password_sha256_hex":
 			// The normalizer defaults this to hash("default") for passwordless
@@ -224,7 +237,13 @@ func (r *UsersRenderer) adaptUser(ctx context.Context, fields *v1.SettingsUser, 
 			}
 			emitted.Set(user+"/"+name, v1.NewSettingScalar(value))
 		default:
-			emitted.Set(user+"/"+name, v1.NewSettingScalar(value))
+			// Re-wrap as a plain scalar: the emitted tree must not alias the
+			// CR's settings. NewSettingScalar(value) drops attributes, so the
+			// normalizer's removePlainPassword stub (password remove="1" for
+			// the default user's at-normalize hash) would be lost - preserve
+			// exactly that one. Other attributes (from_env) are operator-land
+			// pod mechanisms and are deliberately not carried over.
+			emitted.Set(user+"/"+name, scalarPreservingRemove(setting, value))
 		}
 	}
 	// Networks: request entries (cloud CIDRs) + localhost always, emitted
@@ -258,6 +277,24 @@ func lookupClickhouseIDs() (int, int, error) {
 	uid, _ := strconv.Atoi(u.Uid)
 	gid, _ := strconv.Atoi(g.Gid)
 	return uid, gid, nil
+}
+
+// scalarPreservingRemove re-wraps a setting's scalar value for the emitted
+// tree while preserving exactly the remove="1" attribute - the normalizer's
+// removePlainPassword stub for at-normalize hashes. A plain
+// NewSettingScalar drops all attributes, which would strip the stub's
+// semantics: the emitted file would carry a bare <password></password>
+// that ClickHouse merges with the stock users.xml plaintext entry and
+// refuses to start (Code 36). Other attributes (from_env) are pod-land
+// mechanisms with no meaning off-cluster and stay dropped.
+func scalarPreservingRemove(setting *v1.Setting, value string) *v1.Setting {
+	emitted := v1.NewSettingScalar(value)
+	if setting.HasAttribute("remove") {
+		// The stub's only writer is removePlainPassword, which always sets
+		// "1" - mirror it exactly (Setting exposes no attribute getter).
+		emitted.SetAttribute("remove", "1")
+	}
+	return emitted
 }
 
 // splitSecretRef splits "name[/field]".

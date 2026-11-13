@@ -22,16 +22,32 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
 	"github.com/altinity/clickhouse-operator/pkg/chctl/app"
 )
 
+// coder is an error that dictates its own process exit code — the drift
+// verdict of `config render -check` (4) is a script-contract signal, not
+// a failure indistinguishable from a usage error.
+type coder interface {
+	ExitCode() int
+}
+
 func main() {
-	// Application entry point
-	if err := app.Run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+	// Application entry point. An error may carry its own process exit
+	// code (e.g. `config render -check` exits 4 on drift) — scripts
+	// must be able to tell the modes apart without parsing output.
+	err := app.Run(os.Args[1:])
+	if err == nil {
+		return
 	}
+	fmt.Fprintln(os.Stderr, err)
+	var coded coder
+	if errors.As(err, &coded) {
+		os.Exit(coded.ExitCode())
+	}
+	os.Exit(1)
 }
