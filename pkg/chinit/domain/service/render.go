@@ -71,6 +71,16 @@ func (b *Boot) renderNodeConfig(ctx context.Context) error {
 		// readers are both CR members. The DNS-zone addressing is the
 		// same convention the CHI spec's templates carry.
 		request.Hosts = b.clusterHosts()
+		// Distributed-query credentials: without an injected
+		// <user>/<password> in remote_servers, every cross-node query
+		// authenticates as the passwordless default against nodes
+		// whose default REQUIRES a password (Code 516 on every
+		// clusterAllReplicas — the live chinit-cutover finding; the
+		// bash era passed -remote-user/-remote-password-file).
+		if pw, err := os.ReadFile(filepath.Join(BootstrapDir, "default-password")); err == nil {
+			request.RemoteUser = "default"
+			request.RemotePassword = strings.TrimSpace(string(pw))
+		}
 	}
 	result, err := renderer.RenderNode(ctx, request)
 	if err != nil {
