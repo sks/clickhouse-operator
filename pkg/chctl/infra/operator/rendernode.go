@@ -209,6 +209,11 @@ func (r *NodeRenderer) renderCHIPlan(ctx context.Context, request port.RenderNod
 	}
 	plan := make([]port.RenderNodeFile, 0, len(rendered)+2)
 	for _, file := range rendered {
+		// The operator's machinery user (clickhouse_operator) never
+		// reaches these files: RenderCHI drops it from the users tree
+		// before emission (off-cluster its profile is undefined and
+		// ClickHouse refuses the WHOLE users.xml, Code 347 — the live
+		// chinit-cutover finding), so no post-render strip exists here.
 		// Credential-bearing files stay 0640 (group-readable at most,
 		// never world-readable): remote_servers with an injected
 		// password, users files with password hashes. Everything else

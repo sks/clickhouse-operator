@@ -74,6 +74,19 @@ type BootSpec struct {
 	// content: a spec edit rolls the hash and the fleet follows).
 	ConfigBundle ConfigBundle `yaml:"config_bundle" json:"config_bundle"`
 
+	// S3 data bucket (the tiered storage's raw disk endpoint root) and
+	// the node timezone: the boot writes both into the server's
+	// EnvironmentFile (storage.xml reads the endpoint via from_env —
+	// an unset variable is a START error, Code 36 Empty protocol in
+	// the URL, not a warning).
+	S3DataBucket string `yaml:"s3_data_bucket,omitempty" json:"s3_data_bucket,omitempty"`
+	Timezone     string `yaml:"timezone,omitempty"        json:"timezone,omitempty"`
+
+	// ClaimerTableName is the provider's ordinal-lease table (readers'
+	// identity: DynamoDB on AWS, Table storage on Azure). The settle
+	// step claims reader-N from it.
+	ClaimerTableName string `yaml:"claimer_table_name,omitempty" json:"claimer_table_name,omitempty"`
+
 	// Disk labels (mount by LABEL, never device path — NVMe renaming).
 	Disks Disks `yaml:"disks" json:"disks"`
 

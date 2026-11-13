@@ -188,3 +188,23 @@ func (b *Boot) LoadCHI(ctx context.Context) (any, error) {
 	}
 	return cr, nil
 }
+
+// LoadCHK loads keeper.yaml (the CHK spec) from the fetched bundle —
+// configure_keeper renders the node's single-file config from it.
+func (b *Boot) LoadCHK(ctx context.Context) (any, error) {
+	data, err := os.ReadFile(filepath.Join(BootstrapDir, "keeper.yaml"))
+	if err != nil {
+		return nil, fmt.Errorf("read keeper.yaml: %w", err)
+	}
+	loader := chctlops.NewSpecLoader()
+	cr, err := loader.LoadCHK(ctx, chctlport.LoadCHKRequest{
+		Spec: domain.SpecReference{
+			Name: b.Spec.ClusterName,
+			Data: data,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("load keeper.yaml: %w", err)
+	}
+	return cr, nil
+}

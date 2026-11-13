@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,10 +48,15 @@ func (b *Boot) renderNodeConfig(ctx context.Context) error {
 		return Fatal(err)
 	}
 
-	// Hosts inventory: the CR's shape (writers 00-N, readers 01-N);
-	// the backup replica rides as an out-of-CR host the sync paths
-	// tolerate. Address resolution is by DNS name inside the zone.
-	crName, _ := b.CRName()
+	// The settled identity's CRName is authoritative — NOT a fresh
+	// CRName() call: settle_identity already mapped the reader ordinal
+	// (writer_count + claimed), and re-applying the offset here
+	// double-shifts the reader past the end of the replica list
+	// (host "01-2" not found — the live chinit-cutover finding).
+	crName := b.Identity.CRName
+	if crName == "" {
+		crName, _ = b.CRName()
+	}
 
 	renderer := chctlops.NewNodeRenderer(chctlops.NewConfigRenderer(), chctlops.NewUsersRenderer(providerSecrets{p: b.Provider}))
 	request := chctlport.RenderNodeRequest{
@@ -113,15 +120,106 @@ func (b *Boot) configureKeeper(ctx context.Context) error {
 	if b.Spec.Role != model.RoleKeeper {
 		return nil
 	}
+	// RENDER the complete keeper config from the CHK spec (the same
+	// single-file chctl path the bash era ran): keeper launches with
+	// an explicit --config so config.d auto-include is DISABLED —
+	// without this render the node runs whatever stale config the
+	// image or a previous era left behind (the live chinit-cutover
+	// finding: keeper listened on 127.0.0.1 because the root-level
+	// listen_host from the spec's files: section never rendered).
+	cr, err := b.LoadCHK(ctx)
+	if err != nil {
+		return Fatal(err)
+	}
+	// Keeper CR hosts are 0-0..0-(N-1) in keeper_nodes order; THIS
+	// node's ordinal is its position in that list.
+	myOrdinal := -1
+	for i, name := range b.Spec.KeeperNodes {
+		if name == b.Identity.Hostname {
+			myOrdinal = i
+			break
+		}
+	}
+	if myOrdinal < 0 {
+		return Fatal(fmt.Errorf("keeper %s not in spec keeper_nodes %v", b.Identity.Hostname, b.Spec.KeeperNodes))
+	}
+	// server_id: the raft disk's myid file is authoritative across
+	// re-images (ensemble identity lives on persistent state) — but
+	// NEVER 0: keeper ids are 1-based, a stale 0 myid (from a broken
+	// boot) would re-introduce the Code 568 mismatch; fall through to
+	// the seeded 1-based value and rewrite the file. A fresh disk
+	// seeds the ordinal+1.
+	serverID := myOrdinal + 1
+	myidPath := "/var/lib/clickhouse-keeper/log/myid"
+	if data, err := os.ReadFile(myidPath); err == nil {
+		if n, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && n > 0 {
+			serverID = n
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(myidPath), 0755); err == nil {
+		_ = os.WriteFile(myidPath, []byte(fmt.Sprintf("%d", serverID)), 0644)
+	}
+	// Keeper addresses + raft ids: every ensemble member's cloud DNS,
+	// with 1-BASED raft ids matching the server_id/myid convention —
+	// the CR's zero-based replica indices render <id>0</id> and keeper
+	// refuses to start (Code 568: our server id N not found in
+	// raft_configuration — server_id is 1-based by the myid disk
+	// convention; the live chinit-cutover finding).
+	keeperAddrs := map[string]string{}
+	raftIDs := map[string]int{}
+	for i, name := range b.Spec.KeeperNodes {
+		keeperAddrs[fmt.Sprintf("0-%d", i)] = fmt.Sprintf("%s.%s", name, b.Spec.DNSZoneName)
+		raftIDs[fmt.Sprintf("0-%d", i)] = i + 1
+	}
+	renderer := chctlops.NewNodeRenderer(chctlops.NewConfigRenderer(), nil)
+	_, err = renderer.RenderNode(ctx, chctlport.RenderNodeRequest{
+		NormalizedCR:    cr,
+		NodeType:        string(b.Spec.Role),
+		HostName:        fmt.Sprintf("0-%d", myOrdinal),
+		Keeper:          true,
+		SingleFilePath:  "/etc/clickhouse-keeper/keeper_config.xml",
+		KeeperAddresses: keeperAddrs,
+		RaftIDs:         raftIDs,
+		ServerID:        serverID,
+		OutputDir:       "/etc/clickhouse-keeper",
+	})
+	if err != nil {
+		return Fatal(fmt.Errorf("keeper render: %w", err))
+	}
 	// Stale coordination state: a re-image with a live raft log wedges
 	// the ensemble — the bash script wiped coordination/* deliberately.
-	if err := os.RemoveAll("/var/lib/clickhouse-keeper/coordination"); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("clear keeper coordination state: %w", err)
+	// BOTH path families exist: the package default renders
+	// /var/lib/clickhouse/coordination/{logs,snapshots}; the stack's
+	// keeper spec overrides to /var/lib/clickhouse-keeper/{log,snapshots}.
+	// Clear and prepare BOTH so whichever the rendered config uses, the
+	// keeper (running as user clickhouse) can write it — a root-owned
+	// coordination dir is exit code 76 CANNOT_OPEN_FILE Permission
+	// denied (the live chinit-cutover finding: the dir was created
+	// AFTER the mount step's chown ran, as root, and never re-owned).
+	for _, base := range []string{
+		"/var/lib/clickhouse/coordination",
+		"/var/lib/clickhouse-keeper",
+	} {
+		if err := os.RemoveAll(filepath.Join(base, "coordination")); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("clear keeper coordination state: %w", err)
+		}
 	}
-	if err := os.MkdirAll("/var/lib/clickhouse-keeper/coordination", 0755); err != nil {
-		return err
+	for _, dir := range []string{
+		"/var/lib/clickhouse/coordination/logs",
+		"/var/lib/clickhouse/coordination/snapshots",
+		"/var/lib/clickhouse-keeper/log",
+		"/var/lib/clickhouse-keeper/snapshots",
+	} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return err
+		}
 	}
-	out, err := runCommand(ctx, "systemctl", "enable", "--now", "clickhouse-keeper")
+	out, err := runCommand(ctx, "chown", "-R", "clickhouse:clickhouse",
+		"/var/lib/clickhouse/coordination", "/var/lib/clickhouse-keeper")
+	if err != nil {
+		return fmt.Errorf("chown keeper state dirs: %w: %s", err, out)
+	}
+	out, err = runCommand(ctx, "systemctl", "enable", "--now", "clickhouse-keeper")
 	if err != nil {
 		return fmt.Errorf("enable clickhouse-keeper: %w: %s", err, out)
 	}

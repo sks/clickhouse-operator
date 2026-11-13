@@ -81,6 +81,22 @@ func (r *ConfigRenderer) RenderCHI(ctx context.Context, request port.RenderCHIRe
 		namer = newCloudNamer(addresses).withReplicas(request.Replicas)
 	}
 	genOpts := chiGeneratorOptions(cr)
+	// The normalizer injects the operator's machinery user
+	// (chop.Config().ClickHouse.Access.Username) into the users tree.
+	// On-cluster that is a real credential with a profile definition
+	// the operator itself ships (config/chi/users.d/01-clickhouse-
+	// operator-profile.xml, mounted by the users ConfigMap);
+	// bootstrapChop() pins those runtime scan paths to nonexistent, so
+	// off-cluster the profile never materializes and ClickHouse
+	// refuses the whole users.d load (Code 347: Profile was not
+	// found). The spec's users — the deployment's own accounts — are
+	// the contract; the machinery user is operator-only and must not
+	// render. Drop it from the settings tree BEFORE emission — the
+	// same pre-generation discipline as injectUserPasswords — so the
+	// operator's own emitter produces the file and no XML string
+	// surgery (regex/re-parse, with their escaping and tag-mismatch
+	// failure classes) exists anywhere in the chain.
+	genOpts.Users = withoutMachineryUser(genOpts.Users)
 	if len(request.UserPasswords) > 0 {
 		users, err := injectUserPasswords(genOpts.Users, request.UserPasswords)
 		if err != nil {
@@ -861,6 +877,43 @@ func chkGeneratorOptions(cr *chk.ClickHouseKeeperInstallation) *chkConfig.Genera
 		Settings: cr.GetSpecT().GetConfiguration().GetSettings(),
 		Files:    cr.GetSpecT().GetConfiguration().GetFiles(),
 	}
+}
+
+// withoutMachineryUser deep-copies the users settings and drops the
+// operator's machinery user (chop.Config().ClickHouse.Access.Username)
+// injected by the normalizer.
+//
+// Why drop pre-emission (not post-process the rendered XML): the
+// generator owns the users XML — ordering, nesting, and value escaping.
+// Editing the settings before generation means the file is emitted by
+// the operator's own emitter, byte-identical to an on-cluster render of
+// a spec without the machinery user; a post-process pass (regex or
+// re-parse) re-implements XML editing with new escaping and tag-mismatch
+// failure classes. The deep copy keeps the shared CR untouched — the
+// normalizer-added machinery user stays in the tree for any later
+// render that wants the operator-native output.
+//
+// Without it: the machinery user renders into users.d off-cluster, where
+// its predefined profile (operator-shipped on-cluster only) does not
+// exist, and ClickHouse refuses the whole users.d load — Code 347
+// "Profile clickhouse_operator was not found", the live boot crash.
+func withoutMachineryUser(users *v1.Settings) *v1.Settings {
+	machinery := chop.Config().ClickHouse.Access.Username
+	if users == nil {
+		return nil
+	}
+	if !userSettingsPrefixExists(users, machinery) {
+		return users
+	}
+	emitted := users.DeepCopy()
+	// SettingsUser.Delete routes through the "username/" storage-key
+	// prefix converter, so each Delete removes exactly that user's
+	// field — the same discipline injectUserPasswords applies.
+	fields := v1.NewSettingsUser(emitted, machinery)
+	for _, name := range fields.Names() {
+		fields.Delete(name)
+	}
+	return emitted
 }
 
 // injectUserPasswords deep-copies the users settings and injects one

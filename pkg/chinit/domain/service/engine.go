@@ -251,6 +251,15 @@ type Engine struct {
 	// bundle hash re-runs every step (re-render), a re-run against the
 	// SAME hash resumes (skips done steps).
 	specHash string
+	// shared is the ONE in-memory state object the run and the
+	// identity persister both mutate. Without it the persister's
+	// Load+Save races the run's Load-at-start+Save-per-step: the
+	// run's stale copy (loaded BEFORE settle_identity) overwrites
+	// the persisted identity on the very next step record — the
+	// live chinit-cutover finding (schema-sync found "no settled
+	// identity" in a state.json whose node-env proved the settle
+	// had run).
+	shared *modelState
 }
 
 // StateStore persists the boot state file.
@@ -289,8 +298,16 @@ func (e *Engine) IdentityPersister(cloud string) func(model.NodeIdentity) {
 		return nil
 	}
 	return func(identity model.NodeIdentity) {
-		state, err := e.stateStore.Load()
-		if err != nil || state == nil {
+		// Mutate the SHARED state (the run's copy), then save: the
+		// run's next per-step Save must carry the identity, not
+		// clobber it. A nil shared state (persister called outside
+		// a run) falls back to a fresh load.
+		var state *modelState
+		if e.shared != nil {
+			state = e.shared
+		} else if loaded, err := e.stateStore.Load(); err == nil && loaded != nil {
+			state = loaded
+		} else {
 			state = &modelState{}
 		}
 		state.Identity = toBootIdentity(&identity, cloud)
@@ -355,6 +372,9 @@ func (e *Engine) Run(ctx context.Context, steps []Step) RunResult {
 	if state == nil {
 		state = &modelState{}
 	}
+	// The identity persister and this run share ONE state object so
+	// their Save calls cannot clobber each other (see Engine.shared).
+	e.shared = state
 
 	// Spec-hash invalidation: a step recorded done under a DIFFERENT
 	// bundle hash is stale (the configs it installed are not what the

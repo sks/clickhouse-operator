@@ -24,6 +24,8 @@ import (
 	"strings"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/fail"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
@@ -39,6 +41,35 @@ type nodeState struct {
 
 // clusterName returns the cluster the node serves (identity snapshot).
 func (s *nodeState) clusterName() string { return s.Identity.ClusterName }
+
+// specInventory loads the node's chinit.yaml and renders the CR-name →
+// address pairs the chctl cluster operations need as -host flags. The
+// spec file is the bundle-seeded role spec (never the state: the state
+// carries identity, not topology).
+func (s *nodeState) specInventory() []string {
+	data, err := os.ReadFile(service.BootstrapDir + "/chinit.yaml")
+	if err != nil {
+		return nil
+	}
+	var spec struct {
+		WriterNodes       []string `yaml:"writer_nodes"`
+		ReaderCount       int      `yaml:"reader_count"`
+		ReaderHostPrefix  string   `yaml:"reader_hostname_prefix"`
+		DNSZoneName       string   `yaml:"dns_zone_name"`
+	}
+	if err := yaml.Unmarshal(data, &spec); err != nil {
+		return nil
+	}
+	var out []string
+	for i, name := range spec.WriterNodes {
+		out = append(out, fmt.Sprintf("01-%d=%s.%s", i, name, spec.DNSZoneName))
+	}
+	for i := 0; i < spec.ReaderCount; i++ {
+		name := fmt.Sprintf("%s%d", spec.ReaderHostPrefix, i)
+		out = append(out, fmt.Sprintf("01-%d=%s.%s", len(spec.WriterNodes)+i, name, spec.DNSZoneName))
+	}
+	return out
+}
 
 // dnsZone returns the cluster's private DNS zone.
 func (s *nodeState) dnsZone() string { return s.Identity.DNSZone }
@@ -63,6 +94,18 @@ func loadNodeState(path string) (*nodeState, error) {
 // These wrap chctl's CLI (the library seam covers render/health inside
 // the boot; the job commands keep the CLI boundary the units' ExecStart
 // contract already uses — one process per job, typed exit codes).
+// adminPassword reads the boot's admin password file. chctl's CLI has
+// no -password-file flag (plain -password only); the value is read
+// here so the file stays 0600 and the chctl argv carries it like every
+// other credential-bearing CLI call.
+func adminPassword() string {
+	data, err := os.ReadFile(service.BootstrapDir + "/admin-password")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
 func chctl(ctx context.Context, args ...string) (string, error) {
 	out, err := exec.CommandContext(ctx, "chctl", args...).CombinedOutput()
 	if err != nil {
@@ -104,12 +147,20 @@ func runSchemaSync(args []string) error {
 		"-cluster", st.clusterName(),
 		"-retries", fmt.Sprint(*retries),
 	}
+	// Host inventory: chctl's schemer names replicas from the spec but
+	// resolves addresses from the -host flags ("host inventory is
+	// empty" without them). CR names: writers 01-0.. then readers
+	// 01-(writer_count+i).. — CRName()'s order; the addresses are the
+	// stack's private-zone DNS.
+	for _, h := range st.specInventory() {
+		argv = append(argv, "-host", h)
+	}
 	if *pruneStaleSelf {
 		argv = append(argv, "-prune-stale-self")
 	}
 	argv = append(argv,
 		"-user", "admin",
-		"-password-file", service.BootstrapDir+"/admin-password",
+		"-password", adminPassword(),
 		st.Identity.Hostname,
 	)
 	if out, err := chctl(ctx, argv...); err != nil {
@@ -135,7 +186,7 @@ func runReplicaSync(args []string) error {
 		"-spec", service.BootstrapDir+"/chi.yaml",
 		"-cluster", st.clusterName(),
 		"-user", "admin",
-		"-password-file", service.BootstrapDir+"/admin-password",
+		"-password", adminPassword(),
 		st.Identity.Hostname,
 	)
 	fmt.Fprintln(os.Stderr, out)
@@ -220,7 +271,7 @@ func runDeadReplicaGc(args []string) error {
 		"-spec", service.BootstrapDir+"/chi.yaml",
 		"-cluster", st.clusterName(),
 		"-user", "admin",
-		"-password-file", service.BootstrapDir+"/admin-password",
+		"-password", adminPassword(),
 	)
 	fmt.Fprintln(os.Stderr, out)
 	return err
@@ -344,7 +395,7 @@ func drain(ctx context.Context, st *nodeState, provider port.Provider, notice po
 		"-host", "01-0="+writer0,
 		"-host", st.Identity.CRName+"="+st.Identity.Hostname+"."+st.dnsZone(),
 		"-user", "admin",
-		"-password-file", service.BootstrapDir+"/admin-password",
+		"-password", adminPassword(),
 		st.Identity.Hostname,
 	)
 	if err != nil {

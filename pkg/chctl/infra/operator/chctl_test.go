@@ -35,6 +35,7 @@ import (
 	v1 "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse.altinity.com/v1"
 	"github.com/altinity/clickhouse-operator/pkg/chctl/domain"
 	"github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chop"
 
 	"github.com/stretchr/testify/require"
 )
@@ -1356,6 +1357,75 @@ func usersXML(t *testing.T, request port.RenderCHIRequest) map[string]string {
 	return users
 }
 
+// TestConfigRendererMachineryUserNeverRenders asserts the core
+// off-cluster contract: the normalizer injects the operator's machinery
+// user (clickhouse_operator) into every users tree, but RenderCHI drops
+// it before emission — off-cluster its profile definition (operator
+// machinery, mounted from the users ConfigMap on-cluster only) does not
+// exist and ClickHouse refuses the whole users.d load (Code 347, the
+// live boot crash). The spec's own users must render untouched.
+func TestConfigRendererMachineryUserNeverRenders(t *testing.T) {
+	cr := loadUserPasswordCHI(t)
+
+	files := usersXML(t, port.RenderCHIRequest{NormalizedCR: cr})
+	xmlBody := files["chop-generated-users.xml"]
+
+	require.NotContains(t, xmlBody, "<clickhouse_operator>",
+		"the machinery user must never render off-cluster: its profile is operator-shipped on-cluster only (Code 347)")
+	require.NotContains(t, xmlBody, "clickhouse_operator",
+		"no machinery trace may ride the users file — including profile/quota references")
+
+	// The spec-declared users are the deployment's contract and must
+	// survive the machinery drop byte-for-byte.
+	require.Contains(t, xmlBody, "<profile>default</profile>")
+	require.Contains(t, xmlBody, "<profile>ingest</profile>")
+	require.Contains(t, xmlBody, "<access_management>1</access_management>")
+}
+
+// TestConfigRendererMachineryDropDoesNotMutateCR asserts the deep-copy
+// invariant: the shared CR's users tree still carries the machinery
+// user after a machinery-free render — a later render in the same
+// process (host group, render-node plan) sees the operator-native tree,
+// never a silently-stripped one.
+func TestConfigRendererMachineryDropDoesNotMutateCR(t *testing.T) {
+	cr := loadUserPasswordCHI(t)
+	machinery := chop.Config().ClickHouse.Access.Username
+
+	_, err := NewConfigRenderer().RenderCHI(context.Background(), port.RenderCHIRequest{
+		NormalizedCR: cr,
+		OutputDir:    t.TempDir(),
+		DryRun:       true,
+	})
+	require.NoError(t, err)
+
+	users := cr.GetSpecT().GetConfiguration().GetUsers()
+	require.True(t, userSettingsPrefixExists(users, machinery),
+		"in-place mutation of the shared CR would strip the machinery user from every later render")
+}
+
+// TestRenderNodePlanMachineryUserAbsent asserts the render-node plan
+// (what actually installs on a node) carries no machinery user in any
+// users.d file — the Code 347 class is impossible by construction, with
+// no post-render strip in the plan or the cloud-init caller.
+func TestRenderNodePlanMachineryUserAbsent(t *testing.T) {
+	cr := loadRenderNodeCHI(t)
+	plan, _ := renderNodePlan(t, port.RenderNodeRequest{
+		NormalizedCR: cr,
+		HostName:     "0-0",
+		OutputDir:    "/etc/clickhouse-server/config.d",
+		UsersDir:     "/etc/clickhouse-server/users.d",
+	})
+	for path, file := range plan {
+		if filepath.Base(filepath.Dir(path)) != "users.d" {
+			continue
+		}
+		require.NotContains(t, file.Content, "clickhouse_operator",
+			"machinery user in %s would crash the node's users.d load (Code 347)", path)
+	}
+	// The deployment's own users file still renders.
+	require.Contains(t, plan["/etc/clickhouse-server/users.d/chop-generated-users.xml"].Content, "<default>")
+}
+
 // TestConfigRendererUserPasswordInjectionOverridesSpec asserts the core
 // fix: the injected runtime hash replaces every spec-carried password
 // for that user, the spec's own fields pass through, and non-injected
@@ -1824,6 +1894,11 @@ func TestRenderNodeComposesTheThreeRenders(t *testing.T) {
 
 	composed := make(map[string]port.RenderedFile, len(chiFiles)+len(usersFiles))
 	for _, file := range chiFiles {
+		// The machinery clickhouse_operator user never reaches
+		// users-group files: RenderCHI drops it from the users tree
+		// before emission (its profile is operator-shipped on-cluster
+		// only — Code 347 off-cluster), so the composed expectation is
+		// exactly what the renderer emits, no post-guard.
 		dir := "/etc/clickhouse-server/config.d"
 		if file.Group == "users" {
 			dir = "/etc/clickhouse-server/users.d"

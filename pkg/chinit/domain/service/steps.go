@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	chctlport "github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
@@ -98,6 +99,18 @@ func (b *Boot) Steps(ctx context.Context) ([]Step, error) {
 		// 7. Passwords land BEFORE the render (passwordFrom refs and
 		// the distributed-query password files the render consumes).
 		StepFunc("retrieve_passwords", Critical, apiRetry, b.retrievePasswords),
+
+		// 7b. TLS material: server cert/key/CA from the cloud secret
+		// store, or self-signed interserver-only when no TLS secrets
+		// are configured (acm mode: the NLB terminates client TLS, the
+		// interserver port still requires the files to EXIST).
+		StepFunc("configure_tls", Critical, apiRetry, b.configureTLS),
+
+		// 7c. Server environment: /etc/default/clickhouse-server + the
+		// systemd EnvironmentFile drop-in. storage.xml resolves the S3
+		// endpoint via from_env — the variable must be set before the
+		// server starts.
+		StepFunc("configure_server_env", Critical, onceFatal, b.configureServerEnv),
 
 		// 8. Render the node config — chctl's library, not its CLI.
 		StepFunc("render_node_config", Critical, onceFatal, b.renderNodeConfig),
@@ -180,8 +193,12 @@ func (b *Boot) settleIdentity(ctx context.Context) error {
 		if claimer == nil {
 			return Fatal(fmt.Errorf("cloud %s has no ordinal-lease capability but spec demands identity_mode: lease", b.Provider.Name()))
 		}
+		leaseTable := b.Spec.ClaimerTableName
+		if leaseTable == "" {
+			leaseTable = os.Getenv("CHINIT_LEASE_TABLE")
+		}
 		ordinal, err := claimer.ClaimOrdinal(ctx, chinitport.ClaimRequest{
-			Table:           os.Getenv("CHINIT_LEASE_TABLE"),
+			Table:           leaseTable,
 			Prefix:          b.Spec.ReaderHostPrefix,
 			Count:           b.Spec.ReaderCount,
 			InstanceID:      b.Meta.InstanceID,
@@ -194,7 +211,7 @@ func (b *Boot) settleIdentity(ctx context.Context) error {
 		}
 		id.Hostname = fmt.Sprintf("%s%d", b.Spec.ReaderHostPrefix, ordinal)
 		id.CROrdinal = ordinal
-		id.LeaseTable = os.Getenv("CHINIT_LEASE_TABLE")
+		id.LeaseTable = leaseTable
 	}
 
 	// The CR host name derives from the settled role + ordinal (writers
@@ -271,6 +288,126 @@ func (b *Boot) retrievePasswords(ctx context.Context) error {
 		if err := os.WriteFile(dest, []byte(value), 0600); err != nil {
 			return Fatal(fmt.Errorf("write %s: %w", dest, err))
 		}
+	}
+	return nil
+}
+
+// configureTLS writes the interserver TLS material the server's
+// interserver port (9010) requires: server cert/key + CA. With TLS
+// secrets configured, the values come from the cloud secret store;
+// without them (acm mode — the NLB terminates client TLS, the
+// interserver port is internal) a self-signed pair is generated — the
+// bash-era generate_interserver_selfsigned_cert shape. The server
+// FAILS TO START when the ssl.xml paths point at files that do not
+// exist (Code 210 File not found — the live chinit-cutover finding:
+// the bash script's configure_tls step had no chinit equivalent).
+func (b *Boot) configureTLS(ctx context.Context) error {
+	sslDir := "/etc/clickhouse-server/ssl"
+	if err := os.MkdirAll(sslDir, 0755); err != nil {
+		return Fatal(fmt.Errorf("create %s: %w", sslDir, err))
+	}
+
+	if b.Spec.Secrets.TLSCertificate == "" {
+		// No TLS secrets configured (acm mode): interserver-only
+		// self-signed, preserved across reboots (idempotent).
+		crt := filepath.Join(sslDir, "server.crt")
+		if _, err := os.Stat(crt); err == nil {
+			return nil
+		}
+		out, err := runCommand(ctx, "openssl", "req", "-x509", "-newkey", "rsa:2048",
+			"-nodes", "-days", "3650",
+			"-subj", "/CN="+b.Identity.Hostname,
+			"-keyout", filepath.Join(sslDir, "server.key"),
+			"-out", crt)
+		if err != nil {
+			return Fatal(fmt.Errorf("generate self-signed interserver cert: %w: %s", err, out))
+		}
+		if err := os.WriteFile(filepath.Join(sslDir, "ca.crt"), mustRead(crt), 0644); err != nil {
+			return Fatal(fmt.Errorf("write ca.crt: %w", err))
+		}
+		if _, err := runCommand(ctx, "chown", "-R", "clickhouse:clickhouse", sslDir); err != nil {
+			return Fatal(err)
+		}
+		fmt.Println("TLS: generated self-signed cert for interserver TLS (no TLS secrets configured)")
+		return nil
+	}
+
+	material := []struct {
+		secret string
+		dest   string
+		mode   os.FileMode
+	}{
+		{b.Spec.Secrets.TLSCertificate, filepath.Join(sslDir, "server.crt"), 0644},
+		{b.Spec.Secrets.TLSPrivateKey, filepath.Join(sslDir, "server.key"), 0600},
+		{b.Spec.Secrets.TLSCACertificate, filepath.Join(sslDir, "ca.crt"), 0644},
+	}
+	for _, m := range material {
+		if m.secret == "" {
+			continue
+		}
+		value, err := b.Provider.GetSecretValue(ctx, chctlport.SecretRequest{Name: m.secret})
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(m.dest, []byte(value), m.mode); err != nil {
+			return Fatal(fmt.Errorf("write %s: %w", m.dest, err))
+		}
+	}
+	if _, err := runCommand(ctx, "chown", "-R", "clickhouse:clickhouse", sslDir); err != nil {
+		return Fatal(err)
+	}
+	fmt.Println("TLS: material installed from the cloud secret store")
+	return nil
+}
+
+// mustRead reads a file, panicking on failure (used only on files this
+// boot just wrote).
+func mustRead(path string) []byte {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		panic("mustRead " + path + ": " + err.Error())
+	}
+	return data
+}
+
+// configureServerEnv writes the server's EnvironmentFile (the
+// /etc/default/clickhouse-server shape the bash era wrote) and the
+// systemd drop-in that loads it. storage.xml's <endpoint
+// from_env="CH_S3_ENDPOINT"> is a START requirement: unset, the server
+// dies with Code 36 Empty protocol in the URL (the live chinit-cutover
+// finding — the bash configure_environment_variables step had no
+// chinit equivalent). Credentials NEVER go here: the SDK chain reads
+// the instance role.
+func (b *Boot) configureServerEnv(ctx context.Context) error {
+	if b.Spec.S3DataBucket == "" {
+		return Fatal(fmt.Errorf("spec s3_data_bucket is empty — storage.xml's endpoint env cannot be set (Code 36 at server start)"))
+	}
+	region := b.Spec.Region
+	if region == "" {
+		region = b.Meta.Region
+	}
+	envFile := "/etc/default/clickhouse-server"
+	var sb strings.Builder
+	if b.Spec.Timezone != "" {
+		sb.WriteString("CLICKHOUSE_TZ=" + b.Spec.Timezone + "\n")
+	}
+	sb.WriteString("CH_S3_ENDPOINT=\"https://" + b.Spec.S3DataBucket + ".s3." + region + ".amazonaws.com\"\n")
+	if err := os.WriteFile(envFile, []byte(sb.String()), 0644); err != nil {
+		return Fatal(fmt.Errorf("write %s: %w", envFile, err))
+	}
+	if _, err := runCommand(ctx, "chown", "clickhouse:clickhouse", envFile); err != nil {
+		return Fatal(err)
+	}
+
+	dropIn := "/etc/systemd/system/clickhouse-server.service.d/env.conf"
+	if err := os.MkdirAll(filepath.Dir(dropIn), 0755); err != nil {
+		return Fatal(err)
+	}
+	if err := os.WriteFile(dropIn, []byte("[Service]\nEnvironmentFile=-/etc/default/clickhouse-server\n"), 0644); err != nil {
+		return Fatal(fmt.Errorf("write %s: %w", dropIn, err))
+	}
+	if _, err := runCommand(ctx, "systemctl", "daemon-reload"); err != nil {
+		return Fatal(err)
 	}
 	return nil
 }
