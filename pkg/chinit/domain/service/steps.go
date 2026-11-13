@@ -48,7 +48,7 @@ func (b *Boot) Steps(ctx context.Context) ([]Step, error) {
 	runner := system.ExecRunner{}
 	disks := system.NewDiskManager(runner).WithPlatform(b.Provider.Name())
 	tuner := system.NewOSTuner(runner)
-	configs := system.NewStaticConfigInstaller(runner)
+	configs := system.NewStaticConfigInstaller(runner).WithRole(b.Spec.Role)
 
 	steps := []Step{
 		// 1. Fetch the config bundle (replaces bootstrap.sh stage-1).

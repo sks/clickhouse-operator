@@ -341,7 +341,7 @@ func drain(ctx context.Context, st *nodeState, provider port.Provider, notice po
 		"-spec", service.BootstrapDir+"/chi.yaml",
 		"-cluster", st.clusterName(),
 		"-on", writer0,
-		"-host", "00-0="+writer0,
+		"-host", "01-0="+writer0,
 		"-host", st.Identity.CRName+"="+st.Identity.Hostname+"."+st.dnsZone(),
 		"-user", "admin",
 		"-password-file", service.BootstrapDir+"/admin-password",

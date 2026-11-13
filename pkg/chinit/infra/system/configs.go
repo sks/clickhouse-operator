@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 
 	chinitsvc "github.com/altinity/clickhouse-operator/pkg/chinit/domain/fail"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
 )
 
 // ValidateXML checks a ClickHouse config fragment: non-empty, a root
@@ -63,11 +64,21 @@ func ValidateXML(path string) error {
 // would conflict at config-merge time with the chctl-rendered files.
 type StaticConfigInstaller struct {
 	runner Runner
+	// Role gates the backup-replica-specific overlay installed from the
+	// bundle (the settings file is fetched and hash-covered for every
+	// role; only the backup node installs it).
+	Role model.Role
 }
 
 // NewStaticConfigInstaller builds the installer.
 func NewStaticConfigInstaller(runner Runner) *StaticConfigInstaller {
 	return &StaticConfigInstaller{runner: runner}
+}
+
+// WithRole pins the node's role for the role-conditional overlays.
+func (i *StaticConfigInstaller) WithRole(role model.Role) *StaticConfigInstaller {
+	i.Role = role
+	return i
 }
 
 // retiredOverlays are files earlier stacks shipped by hand. A lingering
@@ -124,6 +135,37 @@ func (i *StaticConfigInstaller) Install(ctx context.Context, bundleDir string) e
 		if _, err := i.runner.Run(ctx, "chown", "clickhouse:clickhouse", dest); err != nil {
 			return fmt.Errorf("chown %s: %w", dest, err)
 		}
+	}
+
+	// backup-replica-settings.xml: fetched by every role (the digest
+	// covers it — Terraform hashes it as part of config_files_all), but
+	// installed ONLY on the backup replica (its MergeTree settings would
+	// disable merges on serving nodes). The installer owns the role gate
+	// because it is the only place the node's role and the config
+	// installation meet.
+	if i.Role == model.RoleBackup {
+		const brsName = "backup-replica-settings.xml"
+		src := filepath.Join(bundleDir, brsName)
+		if err := ValidateXML(src); err != nil {
+			return err
+		}
+		data, err := os.ReadFile(src)
+		if err != nil {
+			return chinitsvc.Fatal(fmt.Errorf("read bundle config %s: %w", brsName, err))
+		}
+		const dest = "/etc/clickhouse-server/config.d/backup-replica-settings.xml"
+		if err := os.WriteFile(dest, data, 0644); err != nil {
+			return chinitsvc.Fatal(fmt.Errorf("install %s: %w", brsName, err))
+		}
+		if _, err := i.runner.Run(ctx, "chown", "clickhouse:clickhouse", dest); err != nil {
+			return fmt.Errorf("chown %s: %w", dest, err)
+		}
+	} else {
+		// Non-backup roles MUST NOT carry the overlay — a lingering copy
+		// on a writer would disable merges on a serving node. Removing
+		// it here is the same converge-the-drift discipline as the
+		// retiredOverlays block above.
+		_ = os.Remove("/etc/clickhouse-server/config.d/backup-replica-settings.xml")
 	}
 	return nil
 }

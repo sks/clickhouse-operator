@@ -106,25 +106,28 @@ func TestStaticHostname_OctetMap(t *testing.T) {
 	}
 }
 
-// TestCRName_RoleShapes: writers render 00-N, readers 01-N, backup is
-// out of the CR (empty name — the signal every consumer keys on).
+// TestCRName_RoleShapes: the CHI names its single shard "01", so
+// writers render 01-N and readers 01-(writer_count+N) (readers sit
+// after writers in the shard's replica list); backup is out of the CR
+// (empty name — the signal every consumer keys on).
 func TestCRName_RoleShapes(t *testing.T) {
-	mk := func(role model.Role, ordinal int) *Boot {
-		b := &Boot{Spec: &model.BootSpec{Role: role}}
+	mk := func(role model.Role, ordinal, writers int) *Boot {
+		b := &Boot{Spec: &model.BootSpec{Role: role, WriterCount: writers}}
 		b.Identity.CROrdinal = ordinal
 		return b
 	}
-	name, ordinal := mk(model.RoleWriter, 3).CRName()
-	require.Equal(t, "00-3", name)
+	name, ordinal := mk(model.RoleWriter, 3, 1).CRName()
+	require.Equal(t, "01-3", name)
 	require.Equal(t, 3, ordinal)
 
-	name, ordinal = mk(model.RoleReader, 1).CRName()
-	require.Equal(t, "01-1", name)
-	require.Equal(t, 1, ordinal)
+	// reader ordinal 1 with 2 writers -> host 01-3 in the replica list
+	name, ordinal = mk(model.RoleReader, 1, 2).CRName()
+	require.Equal(t, "01-3", name)
+	require.Equal(t, 3, ordinal)
 
-	name, _ = mk(model.RoleBackup, 0).CRName()
+	name, _ = mk(model.RoleBackup, 0, 1).CRName()
 	require.Empty(t, name, "the backup replica is not a CR member")
 
-	name, _ = mk(model.RoleWriter, -1).CRName()
+	name, _ = mk(model.RoleWriter, -1, 1).CRName()
 	require.Empty(t, name, "an unset ordinal must not render a bogus CR name")
 }

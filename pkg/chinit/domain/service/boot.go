@@ -104,10 +104,15 @@ func StaticHostname(privateIP string) (string, int) {
 	}
 }
 
-// CRName computes the operator CR host name for server nodes:
-// writers are "00-N" shard-ordinal form (00-0..), readers "01-N" —
-// matching the CHI layout the Terraform renders. The backup replica is
-// NOT in the CR (empty name says so to every consumer).
+// CRName computes the operator CR host name for server nodes. The CHI
+// spec names its single shard "01" (the Keeper-path/S3-prefix identity
+// invariant — an anonymous shardsCount layout would re-key every
+// table's keeper path), so CR hosts are "01-0".."01-(N-1)" over the
+// FULL server fleet in a fixed order: writers first (01-0.. by writer
+// ordinal), then readers (01-(writer_count + reader ordinal)..). The
+// same order the bash-era node contract and the chctl inventory flags
+// use. Keepers and the backup replica are NOT in the CR (empty name
+// says so to every consumer).
 func (b *Boot) CRName() (string, int) {
 	switch b.Spec.Role {
 	case model.RoleWriter:
@@ -115,13 +120,14 @@ func (b *Boot) CRName() (string, int) {
 		if ordinal < 0 {
 			return "", -1
 		}
-		return fmt.Sprintf("00-%d", ordinal), ordinal
+		return fmt.Sprintf("01-%d", ordinal), ordinal
 	case model.RoleReader:
 		ordinal := b.Identity.CROrdinal
 		if ordinal < 0 {
 			return "", -1
 		}
-		return fmt.Sprintf("01-%d", ordinal), ordinal
+		// Readers sit AFTER the writers in the shard's replica list.
+		return fmt.Sprintf("01-%d", b.Spec.WriterCount+ordinal), b.Spec.WriterCount + ordinal
 	case model.RoleBackup:
 		return "", -1
 	default:

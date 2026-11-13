@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -26,8 +27,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
-	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
 	chinitsvc "github.com/altinity/clickhouse-operator/pkg/chinit/domain/fail"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
 )
 
 // bundleFiles are the known members of the config bundle. The list is
@@ -35,19 +36,37 @@ import (
 // the bundle — it arrives via user-data and names the bundle. The
 // static XMLs live under configs/ in the bundle prefix (the same keys
 // the refresh path and the pre-chinit cloud-init consumed); the specs
-// sit at the prefix root. NoSuchKey names use the SHORT name for
-// chi/keeper (the missing-spec case) so the log stays stable.
+// sit at the prefix root.
+//
+// The SHA256 gate contract — the digest MUST equal Terraform's
+// config_files_hash, i.e. sha256(jsonencode(merge(config_files_all,
+// {"chi.yaml": spec}))): jsonencode of a map renders SORTED key→content
+// pairs wrapped in braces, so chinit recomputes exactly that over the
+// five role-independent members it fetches (json.Marshal of the same
+// Go map is byte-identical to Terraform's jsonencode). Two shape
+// constraints fall out:
+//   - keeper.yaml is fetched when present (keepers need it; writers
+//     skip it via NoSuchKey) but EXCLUDED from the digest: Terraform's
+//     hash does not include it (it is a separate spec upload), and
+//     including it would make the digest role-dependent.
+//   - backup-replica-settings.xml participates in the digest AND is
+//     fetched by every role (one ~1KB file): Terraform's hash covers
+//     it inside config_files_all, so a role-skipped fetch would make
+//     the digests diverge. The static INSTALLER gates the overlay to
+//     the backup role only — fetching everywhere, installing on one.
 var bundleFiles = []bundleFile{
-	{key: "configs/network.xml", name: "network.xml"},
-	{key: "configs/ssl.xml", name: "ssl.xml"},
-	{key: "configs/storage.xml", name: "storage.xml"},
-	{key: "chi.yaml", name: "chi.yaml"},
-	{key: "keeper.yaml", name: "keeper.yaml"},
+	{key: "configs/network.xml", name: "network.xml", hashed: true},
+	{key: "configs/ssl.xml", name: "ssl.xml", hashed: true},
+	{key: "configs/storage.xml", name: "storage.xml", hashed: true},
+	{key: "configs/backup-replica-settings.xml", name: "backup-replica-settings.xml", hashed: true},
+	{key: "chi.yaml", name: "chi.yaml", hashed: true},
+	{key: "keeper.yaml", name: "keeper.yaml", hashed: false},
 }
 
 type bundleFile struct {
-	key  string // S3 key suffix under the bundle prefix
-	name string // on-disk name in the staging dir
+	key    string // S3 key suffix under the bundle prefix
+	name   string // on-disk name in the staging dir
+	hashed bool   // participates in the SHA256 gate digest
 }
 
 // S3API is the S3 surface the bundle fetcher needs (s3.Client satisfies
@@ -103,7 +122,10 @@ func (s *S3BundleSource) FetchBundle(ctx context.Context, bundle model.ConfigBun
 	}
 
 	var written []string
-	hasher := sha256.New()
+	// hashedContents maps bundle key → content for the digest (only
+	// hashed members). Filled here, digested below in Terraform's
+	// jsonencode shape.
+	hashedContents := map[string]string{}
 	for _, bf := range bundleFiles {
 		key := strings.TrimPrefix(bundle.Prefix+"/", "/") + bf.key
 		out, err := client.GetObject(ctx, &s3.GetObjectInput{
@@ -132,11 +154,17 @@ func (s *S3BundleSource) FetchBundle(ctx context.Context, bundle model.ConfigBun
 			return nil, chinitsvc.Fatal(fmt.Errorf("write %s: %w", dest, err))
 		}
 		written = append(written, dest)
-		_, _ = hasher.Write(body)
+		if bf.hashed {
+			// The digest key is the SHORT member name — Terraform's hash
+			// merges {"chi.yaml": spec} at the TOP level (no prefix),
+			// and the XMLs' keys there keep the configs/ prefix they
+			// carry in config_files_all.
+			hashedContents[bf.key] = string(body)
+		}
 	}
 
 	if bundle.SHA256 != "" {
-		got := hex.EncodeToString(hasher.Sum(nil))
+		got := hex.EncodeToString(terraformPairsDigest(hashedContents))
 		if got != bundle.SHA256 {
 			return written, chinitsvc.Fatal(fmt.Errorf(
 				"config bundle SHA256 mismatch: want %s got %s — the tfvars hash is stale or the bucket was overwritten; refusing to install",
@@ -144,6 +172,25 @@ func (s *S3BundleSource) FetchBundle(ctx context.Context, bundle model.ConfigBun
 		}
 	}
 	return written, nil
+}
+
+// terraformPairsDigest computes sha256 over the fetch's hashed members
+// in EXACTLY Terraform's config_files_hash shape:
+// sha256(jsonencode(merge(config_files_all, {"chi.yaml": spec}))).
+// jsonencode of a map emits the SORTED key→content pairs, comma-joined,
+// wrapped in braces, with the values HTML-escaped (<,>,& → \u003c,\u003e,
+// \u0026) — verified byte-identical against Go's json.Marshal by a real
+// `tofu apply` probing digest, and pinned by the parity test.
+func terraformPairsDigest(contents map[string]string) []byte {
+	enc, err := json.Marshal(contents)
+	if err != nil {
+		// Unreachable for string maps (encoding is total); a failure
+		// must fail the gate rather than silently pass.
+		panic("terraformPairsDigest: " + err.Error())
+	}
+	h := sha256.New()
+	h.Write(enc)
+	return h.Sum(nil)
 }
 
 // awsString is a local *string helper (keeps the aws import surface

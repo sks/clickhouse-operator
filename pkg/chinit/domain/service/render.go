@@ -26,6 +26,7 @@ import (
 	chctlport "github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
 	chctlops "github.com/altinity/clickhouse-operator/pkg/chctl/infra/operator"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
+	chinitport "github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 )
 
 // renderNodeConfig renders the whole node through chctl's library —
@@ -50,7 +51,7 @@ func (b *Boot) renderNodeConfig(ctx context.Context) error {
 	// tolerate. Address resolution is by DNS name inside the zone.
 	crName, _ := b.CRName()
 
-	renderer := chctlops.NewNodeRenderer(chctlops.NewConfigRenderer(), chctlops.NewUsersRenderer(nil))
+	renderer := chctlops.NewNodeRenderer(chctlops.NewConfigRenderer(), chctlops.NewUsersRenderer(providerSecrets{p: b.Provider}))
 	request := chctlport.RenderNodeRequest{
 		NormalizedCR: cr,
 		NodeType:     string(b.Spec.Role),
@@ -240,3 +241,22 @@ func waitForHTTP(ctx context.Context, url string, attempts int, delaySec int) er
 	}
 	return fmt.Errorf("%s did not become ready after %d attempts", url, attempts)
 }
+
+// providerSecrets adapts the chinit provider (a port.SecretSource,
+// GetSecretValue) to chctl's users-renderer SecretsResolver
+// (ResolveSecret). Without this adapter the renderer receives a nil
+// resolver and PANICS the first time the spec declares a passwordFrom
+// user (nil dereference in adaptUser) — the renderer resolves
+// password references at render time and cannot skip them.
+type providerSecrets struct {
+	p chinitport.Provider
+}
+
+// ResolveSecret fetches one secret value by name via the cloud
+// provider's secret source (instance role on AWS, Key Vault on Azure).
+// chinit's Provider interface embeds chctl's port.SecretSource, so the
+// request shape is shared.
+func (a providerSecrets) ResolveSecret(ctx context.Context, request chctlport.SecretRequest) (string, error) {
+	return a.p.GetSecretValue(ctx, request)
+}
+
