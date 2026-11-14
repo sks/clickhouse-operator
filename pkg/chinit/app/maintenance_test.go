@@ -97,7 +97,17 @@ func maintState(role model.Role, hostname string) *nodeState {
 // run and returns what was written — the WARNING lines the specs
 // assert are the operator's journal contract (fmt.Fprintf resolves
 // os.Stderr at call time, so the swap is honored).
+//
+// Self-sufficient on the scratch dir: Ginkgo shuffles top-level
+// container order per run, so a Describe outside the maintenance
+// suite (the logging specs) may run BEFORE the maintenance
+// BeforeEach has created maintDir — OpenFile would fail on a fresh
+// runner (the chinit-v0.1.8 release-gate flake). MkdirAll is
+// idempotent and keeps the helper order-independent.
 func captureStderr(run func()) string {
+	if err := os.MkdirAll(maintDir, 0755); err != nil {
+		Fail(err.Error())
+	}
 	logPath := filepath.Join(maintDir, "stderr.log")
 	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
