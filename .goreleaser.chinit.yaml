@@ -1,0 +1,58 @@
+# GoReleaser config for the chinit binary — the node bootstrapper in
+# cmd/chinit. Triggered by chinit-v* tags via .github/workflows/release-chinit.yaml.
+#
+# Artifact names MUST stay stable: the golden AMI packer build and the
+# cloud-init wrapper pin chinit-<os>-<arch> and chinit-SHA256SUMS, so the
+# asset names and the checksums file name are a contract, not cosmetics.
+version: 2
+
+project_name: chinit
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: chinit
+    binary: chinit
+    main: ./cmd/chinit
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - arm64
+      - amd64
+    # The node images are stripped, static, reproducible builds.
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X github.com/altinity/clickhouse-operator/pkg/chinit/app.Version={{ .Version }}
+
+archives:
+  - id: binaries
+    formats: ["binary"]
+    name_template: "chinit-{{ .Os }}-{{ .Arch }}"
+    # Bare binaries (no tarball) — the packer downloads chinit-linux-arm64
+    # directly and checksums it against chinit-SHA256SUMS.
+
+checksum:
+  name_template: "chinit-SHA256SUMS"
+  algorithm: sha256
+
+release:
+  # chinit releases live on GitHub releases, tag namespace chinit-v*
+  # (carved out from the operator's release-v* family).
+  github:
+    owner: sks
+    name: clickhouse-operator
+  name_template: "chinit {{ .Version }}"
+
+changelog:
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"

@@ -100,8 +100,10 @@ chmod +x chinit
 curl -fsSL "https://github.com/sks/clickhouse-operator/releases/download/chinit-${CHINIT_VERSION}/chinit-SHA256SUMS" | grep arm64 | sha256sum -c
 ```
 
-Releases build from the `chinit-v*` tag workflow (vet+test gate, stripped
-static binaries for linux/darwin arm64+amd64). The golden AMI bakes a
+Releases build from the `chinit-v*` tag workflow (vet+test gate, then
+GoReleaser — `.goreleaser.chinit.yaml` — producing stripped static binaries for
+linux/darwin arm64+amd64 plus `chinit-SHA256SUMS`; the setup-go module cache is
+enabled so repeat tags skip cold module downloads). The golden AMI bakes a
 pinned version; the user-data wrapper upgrades from the staged
 `bootstrap/artifacts/chinit/<version>/` prefix with the same sha256 gate
 the cluster-ops port uses.

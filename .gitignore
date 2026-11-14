@@ -61,3 +61,6 @@ AGENTS.md
 
 # local build output (cmd/chinit)
 /chinit
+
+# goreleaser local snapshot output
+/dist/
