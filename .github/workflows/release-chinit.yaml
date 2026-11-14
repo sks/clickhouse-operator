@@ -67,6 +67,10 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
 
+      - name: Derive goreleaser version
+        id: ver
+        run: echo "tag=${GITHUB_REF_NAME#chinit-}" >> "$GITHUB_OUTPUT"
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
@@ -75,3 +79,7 @@ jobs:
           args: release --clean --config .goreleaser.chinit.yaml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # chinit-v* tags are not valid semver; hand GoReleaser the
+          # stripped version (v0.2.0). The release is still published
+          # under the chinit-v* tag via the workflow's tag trigger.
+          GORELEASER_CURRENT_TAG: ${{ steps.ver.outputs.tag }}
