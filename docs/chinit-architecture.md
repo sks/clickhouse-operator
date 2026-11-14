@@ -272,9 +272,9 @@ line — logic lives in testable Go:
 | `schema-sync` | `chinit schema-sync -retries 3 -prune-stale-self` | writer, reader | hourly |
 | `replica-sync` | `chinit replica-sync` | writer, reader | post-boot |
 | `keeper-health` | `chinit keeper-health` | keeper | timer |
-| `lease-renew` | `chinit lease-renew` | leased readers | every 5 min |
-| `dead-replica-gc` | `chinit dead-replica-gc` | writer | weekly |
-| `orphaned-data-gc` | `chinit orphaned-gc` | writer | weekly |
+| `lease-renew` | `chinit lease-renew` | leased nodes (writers + readers) | every 5 min |
+| `dead-replica-gc` | `chinit dead-replica-gc` | writers (runs on the ordinal-0 holder) | weekly |
+| `orphaned-data-gc` | `chinit orphaned-gc` | writers (runs on the ordinal-0 holder) | weekly |
 | `clickhouse-backup-daily` | `chinit backup-daily` | backup replica | daily 02:00 |
 | `chinit-spot-watch` | `chinit spot-watch` | spot readers | daemon |
 
@@ -284,6 +284,23 @@ keeper mntr` — one process per job, typed exit codes, the units'
 contract) and over the provider for cloud operations (lease renewal,
 DNS cleanup). They reload identity from `state.json`; none re-derive
 it.
+
+**Maintenance gating and the GC safety contract.** With ASG writers,
+`writer-0` is a lease ordinal, not a machine — the maintenance timers
+(`dead-replica-gc`, `orphaned-data-gc`) install on every writer and the
+subcommands no-op exit 0 on any node that does not hold the settled
+identity `writer-{prefix}0` (readers and non-0 writers take the same
+skip path, so an SSM manual run cannot fire the sweep from the wrong
+node). The dead-replica GC itself is two passes with an asymmetric
+safety posture: the **reader pass always runs** (`reader-*` — readers
+are disposable, their drain already dropped them authoritatively); the
+**writer pass runs only with liveness data** — it lists the lease
+table's active claims first and passes every live writer as `-exclude`
+to chctl, so a stale-looking registration whose lease is minutes
+fresh (a mid-boot re-join) is reported but never dropped. No
+lease-listing capability or a scan failure skips the writer pass with
+a warning; the reader pass still ran. chctl gained the `-exclude`
+flag for exactly this guard.
 
 ## The conformance suite: one contract, every cloud
 

@@ -37,10 +37,10 @@ type DynamoDBAPI interface {
 // claimItem is the lease row: hostname is the key; instance_id guards
 // renewal (only the holder extends); lease_until is the TTL epoch.
 type claimItem struct {
-	Hostname    string `dynamodbav:"hostname"`
-	InstanceID  string `dynamodbav:"instance_id"`
-	IP          string `dynamodbav:"ip"`
-	LeaseUntil  int64  `dynamodbav:"lease_until"`
+	Hostname   string `dynamodbav:"hostname"`
+	InstanceID string `dynamodbav:"instance_id"`
+	IP         string `dynamodbav:"ip"`
+	LeaseUntil int64  `dynamodbav:"lease_until"`
 }
 
 // DynamoDBClaimer implements the ordinal lease over DynamoDB conditional
@@ -83,6 +83,13 @@ func (c *DynamoDBClaimer) clientOrInit(ctx context.Context) (DynamoDBAPI, error)
 // now) is the atomicity primitive: two readers racing for reader-0
 // cannot both win, and an expired lease is claimable by anyone.
 func (c *DynamoDBClaimer) Claim(ctx context.Context, req chinitport.ClaimRequest) (int, error) {
+	// An empty table name would put every conditional item into a
+	// bogus PutItem call (the rendered-spec blind spot: the claim
+	// targets "" and DynamoDB's validation error is undebuggable from
+	// a boot loop). Guard here too, not only at the spec layer.
+	if req.Table == "" {
+		return -1, fmt.Errorf("ordinal claim requires a lease table (ClaimRequest.Table is empty — check claimer_table_name in the chinit spec)")
+	}
 	client, err := c.clientOrInit(ctx)
 	if err != nil {
 		return -1, err
@@ -103,8 +110,8 @@ func (c *DynamoDBClaimer) Claim(ctx context.Context, req chinitport.ClaimRequest
 				return -1, fmt.Errorf("marshal claim item: %w", err)
 			}
 			_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
-				TableName:        awsString(req.Table),
-				Item:             item,
+				TableName:           awsString(req.Table),
+				Item:                item,
 				ConditionExpression: awsString("attribute_not_exists(hostname) OR lease_until < :now"),
 				ExpressionAttributeValues: map[string]dynamodbtypes.AttributeValue{
 					":now": &dynamodbtypes.AttributeValueMemberN{Value: strconv.FormatInt(now, 10)},
@@ -140,15 +147,20 @@ func isConditionalCheckFailed(err error) bool {
 // Renew extends the holder's lease; the instance_id condition makes a
 // stolen-ordinal renewal by a different node a no-op failure.
 func (c *DynamoDBClaimer) Renew(ctx context.Context, req chinitport.RenewRequest) error {
+	// Same empty-table guard as Claim: a renewal against "" fails in
+	// DynamoDB validation, not with a reason an operator can act on.
+	if req.Table == "" {
+		return fmt.Errorf("lease renewal requires a lease table (RenewRequest.Table is empty)")
+	}
 	client, err := c.clientOrInit(ctx)
 	if err != nil {
 		return err
 	}
 	lease := time.Now().Unix() + int64(req.LeaseSeconds)
 	_, err = client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName:        awsString(req.Table),
-		Key:              claimKey(req.Hostname),
-		UpdateExpression: awsString("SET lease_until = :lease"),
+		TableName:           awsString(req.Table),
+		Key:                 claimKey(req.Hostname),
+		UpdateExpression:    awsString("SET lease_until = :lease"),
 		ConditionExpression: awsString("instance_id = :me"),
 		ExpressionAttributeValues: map[string]dynamodbtypes.AttributeValue{
 			":lease": &dynamodbtypes.AttributeValueMemberN{Value: strconv.FormatInt(lease, 10)},
@@ -160,13 +172,18 @@ func (c *DynamoDBClaimer) Renew(ctx context.Context, req chinitport.RenewRequest
 
 // Release deletes the node's claim (spot drain / termination).
 func (c *DynamoDBClaimer) Release(ctx context.Context, req chinitport.ReleaseRequest) error {
+	// Same empty-table guard as Claim: the drain must say what it
+	// could not do, not surface DynamoDB's own validation error.
+	if req.Table == "" {
+		return fmt.Errorf("lease release requires a lease table (ReleaseRequest.Table is empty)")
+	}
 	client, err := c.clientOrInit(ctx)
 	if err != nil {
 		return err
 	}
 	_, err = client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 		TableName: awsString(req.Table),
-		Key:        claimKey(req.Hostname),
+		Key:       claimKey(req.Hostname),
 	})
 	return err
 }

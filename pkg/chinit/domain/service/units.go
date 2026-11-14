@@ -72,13 +72,17 @@ WantedBy=timers.target
 //     replicated table — operator HostSyncTables parity)
 //   - schema-sync: oneshot per boot + hourly safety net (operator
 //     ClusterSchemer parity, -prune-stale-self for ASG replacements)
-//   - lease-renew: hourly (readers; 15-min TTL, 5-min cadence inside)
+//   - lease-renew: hourly (lease-mode nodes — readers AND writers; the
+//     15-min TTL gets a 5-min cadence inside)
 //   - keeper-health: keepers
-//   - dead-replica-gc / orphaned-data-gc: writer-0 maintenance
-func (b *Boot) installUnits(ctx context.Context) error {
-	installer := system.NewUnitInstaller("/etc/systemd/system")
+//   - dead-replica-gc / orphaned-data-gc: writers (the service gates
+//     itself on the ordinal-0 holder — every writer installs the
+//     units, whichever machine holds writer-{prefix}0 does the work)
+//
+// chinitUnits is the pure assembler (the matrix's test seam); this
+// method only installs what it returns.
+func (b *Boot) chinitUnits() []system.UnitFile {
 	var units []system.UnitFile
-
 	switch b.Spec.Role {
 	case model.RoleKeeper:
 		units = append(units,
@@ -90,24 +94,40 @@ func (b *Boot) installUnits(ctx context.Context) error {
 			b.chinitUnit("schema-sync.service", "ClickHouse schema auto-propagation from cluster peers", "schema-sync -retries 3 -prune-stale-self"),
 			chinitTimer("schema-sync.timer", "Run schema sync periodically", "hourly"),
 		)
+		// Identity-mode gate, never a role gate: the ordinal lease is
+		// claimed by BOTH ASG roles (writers since the writer-ASG
+		// rollout), so lease renewal installs on any lease-mode node.
+		// The subcommand renews through the state's LeaseTable/hostname
+		// — role data it already carries.
 		if b.Spec.IdentityMode == model.IdentityLease {
 			units = append(units,
-				b.chinitUnit("lease-renew.service", "Reader ordinal lease renewal", "lease-renew"),
-				chinitTimer("lease-renew.timer", "Renew the reader ordinal lease every 5 minutes", "*-*-* *:00/5:00"),
+				b.chinitUnit("lease-renew.service", "Node ordinal lease renewal", "lease-renew"),
+				chinitTimer("lease-renew.timer", "Renew the ordinal lease every 5 minutes", "*-*-* *:00/5:00"),
 			)
 		}
 		if b.Spec.Role == model.RoleWriter {
+			// The maintenance units install on EVERY writer: with ASG
+			// writers "writer-0" is a lease ordinal (whoever holds it),
+			// not a machine, so the unit set must survive ordinal
+			// handoffs. runDeadReplicaGc/runOrphanedGc no-op exit 0 on
+			// non-ordinal-0 holders — the timers fire everywhere, the
+			// work happens on the holder.
 			units = append(units,
-				b.chinitUnit("dead-replica-gc.service", "Dead replica GC (DROP REPLICA for gone hosts)", "dead-replica-gc"),
+				b.chinitUnit("dead-replica-gc.service", "Dead replica GC (ordinal-0 writer only)", "dead-replica-gc"),
 				chinitTimer("dead-replica-gc.timer", "Run dead-replica GC weekly", "Mon *-*-* 03:00:00"),
-				b.chinitUnit("orphaned-data-gc.service", "Orphaned S3 parts GC", "orphaned-gc"),
+				b.chinitUnit("orphaned-data-gc.service", "Orphaned S3 parts GC (ordinal-0 writer only)", "orphaned-gc"),
 				chinitTimer("orphaned-data-gc.timer", "Run orphaned S3 parts GC weekly", "Sun *-*-* 04:00:00"),
 			)
 		}
 	case model.RoleBackup:
 		// The backup replica needs no cluster-maintenance units.
 	}
+	return units
+}
 
+func (b *Boot) installUnits(ctx context.Context) error {
+	units := b.chinitUnits()
+	installer := system.NewUnitInstaller("/etc/systemd/system")
 	if _, err := installer.InstallUnits(units); err != nil {
 		return err
 	}
@@ -288,6 +308,11 @@ service:
 
 // installSpotWatch writes the spot-watch service (readers): a
 // long-running chinit daemon that drains on the interruption notice.
+//
+// Reader-only BY DESIGN: writers are on-demand ASG members with no
+// spot interruption endpoint to watch — their scale-in drain arrives
+// through the ASG termination lifecycle hook (EventBridge → drain
+// Lambda → SSM `chinit drain`), not a 2-minute notice.
 func (b *Boot) installSpotWatch(ctx context.Context) error {
 	if b.Spec.Role != model.RoleReader {
 		return nil

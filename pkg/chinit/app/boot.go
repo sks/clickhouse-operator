@@ -17,6 +17,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/fail"
@@ -56,12 +57,16 @@ func runBoot(args []string) error {
 	// Detect the cloud (flag > env > DMI > IMDS) — the spec's cloud
 	// field is an override at the same precedence as the flag.
 	detected, err := detect.Detect(ctx, detect.Options{
-		Flag:     firstNonEmpty(flags.cloud, spec.Cloud),
-		EnvName:  detect.EnvDetection(),
+		Flag:    firstNonEmpty(flags.cloud, spec.Cloud),
+		EnvName: detect.EnvDetection(),
 	})
 	if err != nil {
 		return fail.Fatal(fmt.Errorf("cloud detection: %w", err))
 	}
+	slog.Info("Detected cloud",
+		"cloud", detected.Provider,
+		"via", detected.Via,
+		"detail", detected.Detail)
 	fmt.Printf("Detected cloud: %s (via %s: %s)\n", detected.Provider, detected.Via, detected.Detail)
 
 	// Build the provider. In dry-run the metadata probe is optional: the
@@ -78,6 +83,7 @@ func runBoot(args []string) error {
 		if !flags.dryRun {
 			return fail.Fatal(fmt.Errorf("instance metadata: %w", err))
 		}
+		slog.Warn("NOTE: metadata unavailable — printing the plan with an empty identity", "err", err)
 		fmt.Printf("NOTE: metadata unavailable (%s) — printing the plan with an empty identity\n", err)
 		meta = port.InstanceMetadata{Provider: detected.Provider}
 	}

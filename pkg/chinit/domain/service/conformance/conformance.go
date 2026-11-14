@@ -25,8 +25,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	chctlport "github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
-	chinitport "github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
+	chinitport "github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 )
 
 // Suite drives one provider through the capability scenarios. Fakes for
@@ -80,6 +80,9 @@ func (s Suite) Run(t *testing.T) {
 	t.Run("optional_capabilities", func(t *testing.T) {
 		if chinitport.AsOrdinalClaimer(s.Provider) == nil {
 			t.Logf("provider %s has no OrdinalClaimer (acceptable: static-identity clouds)", s.Provider.Name())
+		}
+		if chinitport.AsLeaseLister(s.Provider) == nil {
+			t.Logf("provider %s has no LeaseLister (acceptable: inventory falls back to static spec lists)", s.Provider.Name())
 		}
 		if chinitport.AsDNSRegistrar(s.Provider) == nil {
 			t.Logf("provider %s has no DNSRegistrar (acceptable: degraded DNS)", s.Provider.Name())

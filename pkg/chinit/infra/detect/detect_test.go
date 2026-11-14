@@ -17,82 +17,57 @@ package detect
 import (
 	"context"
 	"errors"
-	"testing"
 
-	"github.com/stretchr/testify/require"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 )
 
-// TestDetect_PrecedenceChain: flag > env > DMI > IMDS — each layer wins
-// over the ones below it.
-func TestDetect_PrecedenceChain(t *testing.T) {
-	ctx := context.Background()
-	noProbes := Options{
-		DMIVendorFunc: func() (string, error) { return "", errors.New("no dmi") },
-		ProbeAWS:      func(context.Context) (bool, error) { return false, nil },
-		ProbeAzure:    func(context.Context) (bool, error) { return false, nil },
-	}
-
-	t.Run("flag wins over everything", func(t *testing.T) {
-		res, err := Detect(ctx, Options{
-			Flag:         "AWS", // case-normalized
-			EnvName:      "azure",
+var _ = Describe("Detect", func() {
+	// Each layer wins over the ones below it — the boot log's "via"
+	// names the layer that answered, which is the operator's first
+	// triage hint when a node picks the wrong cloud.
+	DescribeTable("the precedence chain flag > env > dmi > imds",
+		func(opts Options, wantProvider, wantVia string) {
+			res, err := Detect(context.Background(), opts)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(res.Provider).To(Equal(wantProvider))
+			if wantVia != "" {
+				Expect(res.Via).To(Equal(wantVia))
+			}
+		},
+		Entry("the flag wins over everything", Options{
+			Flag:          "AWS", // case-normalized
+			EnvName:       "azure",
 			DMIVendorFunc: func() (string, error) { return "Microsoft Corporation", nil },
-		})
-		require.NoError(t, err)
-		require.Equal(t, AWSName, res.Provider)
-		require.Equal(t, "flag", res.Via)
-	})
-
-	t.Run("env wins over dmi", func(t *testing.T) {
-		res, err := Detect(ctx, Options{
-			EnvName:      "azure",
+		}, AWSName, "flag"),
+		Entry("the env wins over dmi", Options{
+			EnvName:       "azure",
 			DMIVendorFunc: func() (string, error) { return "Amazon EC2", nil },
-		})
-		require.NoError(t, err)
-		require.Equal(t, AzureName, res.Provider)
-		require.Equal(t, "env", res.Via)
-	})
-
-	t.Run("dmi amazon signature", func(t *testing.T) {
-		res, err := Detect(ctx, Options{
+		}, AzureName, "env"),
+		Entry("the dmi amazon signature", Options{
 			DMIVendorFunc: func() (string, error) { return "Amazon EC2", nil },
-		})
-		require.NoError(t, err)
-		require.Equal(t, AWSName, res.Provider)
-		require.Equal(t, "dmi", res.Via)
-	})
-
-	t.Run("dmi microsoft signature", func(t *testing.T) {
-		res, err := Detect(ctx, Options{
+		}, AWSName, "dmi"),
+		Entry("the dmi microsoft signature", Options{
 			DMIVendorFunc: func() (string, error) { return "Microsoft Corporation", nil },
-		})
-		require.NoError(t, err)
-		require.Equal(t, AzureName, res.Provider)
-	})
-
-	t.Run("imds fallback when dmi is generic", func(t *testing.T) {
-		res, err := Detect(ctx, Options{
+		}, AzureName, ""),
+		Entry("imds answers when dmi is generic", Options{
 			DMIVendorFunc: func() (string, error) { return "QEMU", nil },
 			ProbeAWS:      func(context.Context) (bool, error) { return true, nil },
-		})
-		require.NoError(t, err)
-		require.Equal(t, AWSName, res.Provider)
-		require.Equal(t, "imds", res.Via)
-	})
-
-	t.Run("azure imds fallback", func(t *testing.T) {
-		res, err := Detect(ctx, Options{
+		}, AWSName, "imds"),
+		Entry("the azure imds fallback", Options{
 			DMIVendorFunc: func() (string, error) { return "QEMU", nil },
 			ProbeAWS:      func(context.Context) (bool, error) { return false, nil },
 			ProbeAzure:    func(context.Context) (bool, error) { return true, nil },
-		})
-		require.NoError(t, err)
-		require.Equal(t, AzureName, res.Provider)
-	})
+		}, AzureName, ""),
+	)
 
-	t.Run("no signal is an error", func(t *testing.T) {
-		_, err := Detect(ctx, noProbes)
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "could not detect cloud provider")
+	It("errors when no signal answers", func() {
+		_, err := Detect(context.Background(), Options{
+			DMIVendorFunc: func() (string, error) { return "", errors.New("no dmi") },
+			ProbeAWS:      func(context.Context) (bool, error) { return false, nil },
+			ProbeAzure:    func(context.Context) (bool, error) { return false, nil },
+		})
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("could not detect cloud provider"))
 	})
-}
+})

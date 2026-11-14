@@ -29,10 +29,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 
-	chctlaws "github.com/altinity/clickhouse-operator/pkg/chctl/infra/aws"
 	chctlport "github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
-	chinitport "github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
+	chctlaws "github.com/altinity/clickhouse-operator/pkg/chctl/infra/aws"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
+	chinitport "github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 )
 
 // Provider is the AWS entry in chinit's provider registry. It composes
@@ -42,22 +42,24 @@ type Provider struct {
 	region string
 	spec   *model.BootSpec
 
-	meta           *IMDSMetadata
-	secrets        *chctlaws.SecretsManagerSource
+	meta            *IMDSMetadata
+	secrets         *chctlaws.SecretsManagerSource
 	secretsOverride chctlport.SecretSource
-	bundle         *S3BundleSource
-	bundleOverride chinitport.ConfigSource
-	claims         *DynamoDBClaimer
-	dns            *Route53Registrar
-	spot           *SpotWatcher
+	bundle          *S3BundleSource
+	bundleOverride  chinitport.ConfigSource
+	claims          *DynamoDBClaimer
+	lister          *DynamoDBClaimLister
+	dns             *Route53Registrar
+	spot            *SpotWatcher
 }
 
 // Compile-time capability checks: the factory relies on these.
 var (
-	_ chinitport.Provider          = (*Provider)(nil)
-	_ chinitport.OrdinalClaimer    = (*Provider)(nil)
-	_ chinitport.DNSRegistrar      = (*Provider)(nil)
-	_ chinitport.SpotSignals       = (*Provider)(nil)
+	_ chinitport.Provider       = (*Provider)(nil)
+	_ chinitport.OrdinalClaimer = (*Provider)(nil)
+	_ chinitport.LeaseLister    = (*Provider)(nil)
+	_ chinitport.DNSRegistrar   = (*Provider)(nil)
+	_ chinitport.SpotSignals    = (*Provider)(nil)
 )
 
 // New builds the AWS provider with real SDK clients. The metadata
@@ -75,6 +77,7 @@ func New(cfg chinitport.Config) chinitport.Provider {
 	p.secrets = chctlaws.NewSecretsManagerSource(region)
 	p.bundle = NewS3BundleSource(region)
 	p.claims = NewDynamoDBClaimer(region)
+	p.lister = NewDynamoDBClaimLister(region)
 	p.dns = NewRoute53Registrar(region)
 	p.spot = NewSpotWatcher()
 	return p
@@ -144,6 +147,12 @@ func (p *Provider) RenewLease(ctx context.Context, req chinitport.RenewRequest) 
 // ReleaseLease drops the node's claim.
 func (p *Provider) ReleaseLease(ctx context.Context, req chinitport.ReleaseRequest) error {
 	return p.claims.Release(ctx, req)
+}
+
+// ListActiveClaims enumerates the cluster's live ordinal leases (the
+// inventory source for remote_servers and the -host flags).
+func (p *Provider) ListActiveClaims(ctx context.Context, req chinitport.ListClaimsRequest) ([]chinitport.Claim, error) {
+	return p.lister.ListActiveClaims(ctx, req)
 }
 
 // ResolveZoneID finds the Route53 private zone by exact DNS name.

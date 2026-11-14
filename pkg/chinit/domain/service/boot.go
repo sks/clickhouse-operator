@@ -75,11 +75,24 @@ type Boot struct {
 	// re-run always see the SETTLED identity, even if a later critical
 	// step fails the boot. Nil (tests) = no persistence.
 	PersistIdentity func(model.NodeIdentity)
+
+	// SetHostname is how the settle_identity step sets the system
+	// hostname. Production leaves it nil (settleIdentity falls back to
+	// the hostnamectl/hostname sequence — best-effort by design); tests
+	// inject a recorder so specs never rename the machine they run on.
+	SetHostname func(ctx context.Context, hostname string) error
 }
 
 // StaticHostname derives writer-N/keeper-N/backup-0 from the private
 // IP's last octet (Terraform allocates at fixed offsets: writers at
 // +10..+19, keepers at +20..+29, backup at +30).
+//
+// DEPRECATION NOTE: the writer range (10..19) is deprecated pending the
+// writer-ASG rollout — leased writers claim writer-N from the ordinal
+// lease table instead of mapping a static IP offset. The writer range
+// will be REMOVED when the static writer path is retired in the
+// Terraform stream; keepers/backup stay static (raft safety — they are
+// not ASG members). Do not extend writer coverage here.
 //
 // Why not the platform hostname: EC2 boots with ip-10-0-1-N; the keeper
 // server_id parses garbage from the ip-* name and keeper exits 56.
@@ -109,8 +122,8 @@ func StaticHostname(privateIP string) (string, int) {
 // invariant — an anonymous shardsCount layout would re-key every
 // table's keeper path), so CR hosts are "01-0".."01-(N-1)" over the
 // FULL server fleet in a fixed order: writers first (01-0.. by writer
-// ordinal), then readers (01-(writer_count + reader ordinal)..). The
-// same order the bash-era node contract and the chctl inventory flags
+// ordinal), then readers (01-(writer ceiling + reader ordinal)..).
+// The same order the bash-era node contract and the chctl inventory flags
 // use. Keepers and the backup replica are NOT in the CR (empty name
 // says so to every consumer).
 func (b *Boot) CRName() (string, int) {
@@ -126,8 +139,15 @@ func (b *Boot) CRName() (string, int) {
 		if ordinal < 0 {
 			return "", -1
 		}
-		// Readers sit AFTER the writers in the shard's replica list.
-		return fmt.Sprintf("01-%d", b.Spec.WriterCount+ordinal), b.Spec.WriterCount + ordinal
+		// Reader CR names offset by the writer slot ceiling (WriterMax =
+		// the writers ASG max), NOT the live writer count — scaling
+		// writers must never re-key reader CR slots. Interim: WriterCount
+		// when WriterMax is unset (static writer specs).
+		offset := b.Spec.WriterMax
+		if offset == 0 {
+			offset = b.Spec.WriterCount
+		}
+		return fmt.Sprintf("01-%d", offset+ordinal), offset + ordinal
 	case model.RoleBackup:
 		return "", -1
 	default:

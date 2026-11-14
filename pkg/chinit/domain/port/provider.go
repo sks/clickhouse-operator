@@ -35,9 +35,9 @@ import (
 // InstanceMetadata is what the boot pipeline needs from the platform the
 // node is running on. Everything identity-related derives from it.
 type InstanceMetadata struct {
-	Provider  string // "aws", "azure", …
-	Region    string
-	Zone      string // availability zone, when the platform has one
+	Provider   string // "aws", "azure", …
+	Region     string
+	Zone       string // availability zone, when the platform has one
 	InstanceID string
 	PrivateIP  string
 	// HostnameHint is the platform-assigned hostname (EC2's ip-* or the
@@ -91,7 +91,7 @@ type OrdinalClaimer interface {
 // ClaimRequest is the input to ClaimOrdinal.
 type ClaimRequest struct {
 	Table        string // provider lease table (DynamoDB table / Storage table)
-	Prefix      string // hostname prefix ("reader-")
+	Prefix       string // hostname prefix ("reader-")
 	Count        int    // ordinals 0..Count-1
 	InstanceID   string
 	PrivateIP    string
@@ -103,14 +103,14 @@ type ClaimRequest struct {
 // RenewRequest is the input to RenewLease.
 type RenewRequest struct {
 	Table        string
-	Hostname    string
-	InstanceID  string
+	Hostname     string
+	InstanceID   string
 	LeaseSeconds int
 }
 
 // ReleaseRequest is the input to ReleaseLease.
 type ReleaseRequest struct {
-	Table     string
+	Table    string
 	Hostname string
 }
 
@@ -130,11 +130,11 @@ type DNSRegistrar interface {
 
 // ARecordRequest names one record operation.
 type ARecordRequest struct {
-	ZoneID   string
-	ZoneName string
+	ZoneID     string
+	ZoneName   string
 	RecordName string // short hostname; FQDN = RecordName + "." + ZoneName
-	IP       string
-	TTL      int
+	IP         string
+	TTL        int
 }
 
 // InterruptionNotice is the platform's "you are being reclaimed" signal.
@@ -192,6 +192,48 @@ func AsDNSRegistrar(p Provider) DNSRegistrar {
 // AsSpotSignals returns the interruption-watch capability, or nil.
 func AsSpotSignals(p Provider) SpotSignals {
 	if c, ok := p.(SpotSignals); ok {
+		return c
+	}
+	return nil
+}
+
+// Claim is one live ordinal-lease row (see LeaseLister): the identity a
+// cluster member currently holds — hostname reader-N/writer-N with the
+// instance that owns it.
+type Claim struct {
+	Hostname   string
+	InstanceID string
+	IP         string
+}
+
+// LeaseLister enumerates the cluster's ACTIVE ordinal leases.
+//
+// Why an optional capability: cluster inventory (remote_servers, the
+// schema-sync -host flags, chctl health fan-out) must enumerate only
+// ACTIVE lease holders — a reserved-but-vacant slot's CR host would put
+// an unreachable peer in remote_servers/clusterAllReplicas and fail
+// every DDL read that fans out (the vacant-slot finding). The ASG owns
+// slot RESERVATIONS (max_size); the lease table owns LIVENESS, so the
+// lease table is the only source that knows which reserved slots have a
+// machine behind them. Providers without a listable lease store keep
+// the static spec inventory (loud warning at the call site).
+type LeaseLister interface {
+	// ListActiveClaims returns every lease row with lease_until > now
+	// from the table (one DynamoDB Scan / Azure Table query — the
+	// caller treats the result as the cluster's live member set).
+	ListActiveClaims(ctx context.Context, req ListClaimsRequest) ([]Claim, error)
+}
+
+// ListClaimsRequest is the input to ListActiveClaims.
+type ListClaimsRequest struct {
+	// Table is the provider lease table to scan (DynamoDB table /
+	// Storage table) — the same table ClaimOrdinal writes.
+	Table string
+}
+
+// AsLeaseLister returns the lease-listing capability, or nil.
+func AsLeaseLister(p Provider) LeaseLister {
+	if c, ok := p.(LeaseLister); ok {
 		return c
 	}
 	return nil

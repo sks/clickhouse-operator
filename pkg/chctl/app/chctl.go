@@ -127,7 +127,7 @@ Usage:
                         [-retries 2] [-prune-stale-self]
   chctl replica drop <host> -on <peer> -cluster <name> -host <name=addr>...
   chctl replica sync <host> -cluster <name> -host <name=addr>...
-  chctl replica gc -on <peer> -cluster <name> -host <name=addr>... [-name-pattern reader-*]
+  chctl replica gc -on <peer> -cluster <name> -host <name=addr>... [-name-pattern reader-*] [-exclude <host>]...
   chctl keeper safe-to-stop -keeper <host:port> [-members n] [-wait-timeout 2m]
   chctl keeper mntr -keeper <host:port> [-timeout 5s] [-json]
   chctl health -cluster <name> -host <name=addr>... [-user u] [-password p] [-port n] [-secure]
@@ -1256,11 +1256,16 @@ func runReplicaGc(args []string) error {
 	var (
 		runOn       string
 		namePattern string
+		excludes    excludeList
 	)
 	fs.StringVar(&runOn, "on", "", "peer host that executes the operation, required")
 	fs.StringVar(&namePattern, "name-pattern", "reader-*",
 		"glob (path.Match: * and ? wildcards, case-sensitive) a stale host must match to be dropped; "+
 			"non-matching hosts are reported but never dropped (keeps writers/keepers safe)")
+	fs.Var(&excludes, "exclude",
+		"host name never to drop, even when the pattern matches and it is stale (repeatable). "+
+			"The liveness guard for the writer pass: chinit lists the cluster's active ordinal leases "+
+			"and excludes every live writer so a mid-boot re-join never loses its registration")
 	flagArgs, positional := separatePositionals(fs, args)
 	if err := fs.Parse(flagArgs); err != nil {
 		return err
@@ -1278,7 +1283,7 @@ func runReplicaGc(args []string) error {
 
 	result, err := newSchemaService().GcReplica(
 		context.Background(), parsed,
-		domain.ReplicaGcRequest{RunOn: runOn, NamePattern: namePattern},
+		domain.ReplicaGcRequest{RunOn: runOn, NamePattern: namePattern, ExcludeHosts: excludes.values},
 	)
 	if err != nil {
 		// Exit code 3: operational failure — detection error, bad
@@ -1686,6 +1691,24 @@ func (h hostList) String() string {
 // vanish (the "host inventory is empty" live-harness finding).
 func (h *hostList) Set(value string) error {
 	h.values = append(h.values, value)
+	return nil
+}
+
+// excludeList collects repeated -exclude flag values (exact host names
+// the GC must never drop). Pointer receiver, same as hostList: a value
+// receiver would drop every entry after the first flag.
+type excludeList struct {
+	values []string
+}
+
+// String implements flag.Value.
+func (e excludeList) String() string {
+	return strings.Join(e.values, ", ")
+}
+
+// Set implements flag.Value.
+func (e *excludeList) Set(value string) error {
+	e.values = append(e.values, value)
 	return nil
 }
 

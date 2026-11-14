@@ -138,6 +138,27 @@ type ReplicaGcRequest struct {
 	// path.Match: * and ? wildcards, no separator matching, case
 	// sensitive.
 	NamePattern string
+	// ExcludeHosts are exact host names a matching stale host must
+	// never be dropped for, even though it still appears in Stale (the
+	// caller's liveness guard: chinit's writer GC pass lists the
+	// cluster's active ordinal leases and excludes every live writer,
+	// so a mid-boot re-join whose lease is renewed never loses its
+	// registration to the weekly sweep). Empty means no exclusion.
+	ExcludeHosts []string
+}
+
+// NewExcludeSet builds the drop-loop's membership check. A nil request
+// (or empty list) yields a nil map, and the loop skips the lookup
+// entirely — the default shape (no excludes) keeps its zero cost.
+func (r ReplicaGcRequest) NewExcludeSet() map[string]bool {
+	if len(r.ExcludeHosts) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(r.ExcludeHosts))
+	for _, host := range r.ExcludeHosts {
+		set[host] = true
+	}
+	return set
 }
 
 // TableRef names one table (database + name) — the unit of the

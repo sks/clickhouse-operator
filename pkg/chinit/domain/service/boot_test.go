@@ -15,119 +15,33 @@
 package service
 
 import (
-	"testing"
-
-	"github.com/stretchr/testify/require"
-
-	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 )
 
-// validSpec is the baseline every mutation breaks one field at a time.
-func validSpec() model.BootSpec {
-	return model.BootSpec{
-		Role:         model.RoleWriter,
-		IdentityMode: model.IdentityStatic,
-		ClusterName:  "logexplorer",
-		ConfigBundle: model.ConfigBundle{Bucket: "data-bucket", Prefix: "bootstrap"},
-		Disks:        model.Disks{MetadataLabel: "ch-metadata"},
-		Secrets:      model.Secrets{DefaultPassword: "default-pw", AdminPassword: "admin-pw"},
-	}
-}
+// This file pins StaticHostname — the fixed-offset octet map the
+// STATIC identity path (keepers, backup, and the interim static-writer
+// path) derives its hostname from. Spec validation lives in the model
+// suite (pkg/chinit/domain/model/spec_test.go, the single home of the
+// Validate() table) and the CR-name arithmetic in ceiling_test.go;
+// neither is re-asserted here.
 
-// TestSpecValidate_AcceptsBaseline: the valid spec passes.
-func TestSpecValidate_AcceptsBaseline(t *testing.T) {
-	spec := validSpec()
-	require.NoError(t, spec.Validate())
-}
-
-// TestSpecValidate_RejectsBadShapes: table-driven invalid specs, each
-// naming its field in the SpecError.
-func TestSpecValidate_RejectsBadShapes(t *testing.T) {
-	cases := []struct {
-		name   string
-		mutate func(*model.BootSpec)
-		field  string
-	}{
-		{"unknown role", func(s *model.BootSpec) { s.Role = "coordinator" }, "role"},
-		{"missing role", func(s *model.BootSpec) { s.Role = "" }, "role"},
-		{"missing identity mode", func(s *model.BootSpec) { s.IdentityMode = "" }, "identity_mode"},
-		{"unknown identity mode", func(s *model.BootSpec) { s.IdentityMode = "dns" }, "identity_mode"},
-		{
-			"lease reader without count",
-			func(s *model.BootSpec) {
-				s.Role = model.RoleReader
-				s.IdentityMode = model.IdentityLease
-				s.ReaderCount = 0
-			},
-			"reader_count",
+var _ = Describe("StaticHostname", func() {
+	// The keeper server_id garbage bug lives here if the map drifts:
+	// an ip-* name parses garbage into the raft identity.
+	DescribeTable("maps the private IP's last octet to the role bands",
+		func(ip, hostname string, ordinal int) {
+			name, ord := StaticHostname(ip)
+			Expect(name).To(Equal(hostname))
+			Expect(ord).To(Equal(ordinal))
 		},
-		{"no bucket", func(s *model.BootSpec) { s.ConfigBundle.Bucket = "" }, "config_bundle.bucket"},
-		{"no metadata label", func(s *model.BootSpec) { s.Disks.MetadataLabel = "" }, "disks.metadata_label"},
-		{"no cluster name", func(s *model.BootSpec) { s.ClusterName = "" }, "cluster_name"},
-		{"no default secret", func(s *model.BootSpec) { s.Secrets.DefaultPassword = "" }, "secrets.default_password"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			spec := validSpec()
-			tc.mutate(&spec)
-			err := spec.Validate()
-			require.Error(t, err)
-			var specErr *model.SpecError
-			require.ErrorAs(t, err, &specErr)
-			require.Equal(t, tc.field, specErr.Field)
-		})
-	}
-}
-
-// TestStaticHostname_OctetMap: the fixed-offset contract (writers
-// +10..19, keepers +20..29, backup +30) — the keeper server_id garbage
-// bug lives here if the map drifts.
-func TestStaticHostname_OctetMap(t *testing.T) {
-	cases := []struct {
-		ip       string
-		hostname string
-		ordinal  int
-	}{
-		{"10.0.1.10", "writer-0", 0},
-		{"10.0.1.19", "writer-9", 9},
-		{"10.0.1.20", "keeper-0", 0},
-		{"10.0.1.29", "keeper-9", 9},
-		{"10.0.1.30", "backup-0", 0},
-		{"10.0.1.5", "", -1},   // outside every role band
-		{"10.0.1.31", "", -1},  // beyond backup
-		{"not-an-ip", "", -1},  // unparseable
-	}
-	for _, tc := range cases {
-		t.Run(tc.ip, func(t *testing.T) {
-			hostname, ordinal := StaticHostname(tc.ip)
-			require.Equal(t, tc.hostname, hostname)
-			require.Equal(t, tc.ordinal, ordinal)
-		})
-	}
-}
-
-// TestCRName_RoleShapes: the CHI names its single shard "01", so
-// writers render 01-N and readers 01-(writer_count+N) (readers sit
-// after writers in the shard's replica list); backup is out of the CR
-// (empty name — the signal every consumer keys on).
-func TestCRName_RoleShapes(t *testing.T) {
-	mk := func(role model.Role, ordinal, writers int) *Boot {
-		b := &Boot{Spec: &model.BootSpec{Role: role, WriterCount: writers}}
-		b.Identity.CROrdinal = ordinal
-		return b
-	}
-	name, ordinal := mk(model.RoleWriter, 3, 1).CRName()
-	require.Equal(t, "01-3", name)
-	require.Equal(t, 3, ordinal)
-
-	// reader ordinal 1 with 2 writers -> host 01-3 in the replica list
-	name, ordinal = mk(model.RoleReader, 1, 2).CRName()
-	require.Equal(t, "01-3", name)
-	require.Equal(t, 3, ordinal)
-
-	name, _ = mk(model.RoleBackup, 0, 1).CRName()
-	require.Empty(t, name, "the backup replica is not a CR member")
-
-	name, _ = mk(model.RoleWriter, -1, 1).CRName()
-	require.Empty(t, name, "an unset ordinal must not render a bogus CR name")
-}
+		Entry("writer band starts at +10", "10.0.1.10", "writer-0", 0),
+		Entry("writer band ends at +19", "10.0.1.19", "writer-9", 9),
+		Entry("keeper band starts at +20", "10.0.1.20", "keeper-0", 0),
+		Entry("keeper band ends at +29", "10.0.1.29", "keeper-9", 9),
+		Entry("backup sits at +30", "10.0.1.30", "backup-0", 0),
+		Entry("below every band is unmapped", "10.0.1.5", "", -1),
+		Entry("beyond backup is unmapped", "10.0.1.31", "", -1),
+		Entry("an unparseable IP is unmapped", "not-an-ip", "", -1),
+	)
+})

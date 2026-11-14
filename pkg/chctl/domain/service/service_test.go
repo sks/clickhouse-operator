@@ -244,6 +244,52 @@ func TestGcReplicaCustomPatternGatesEligibility(t *testing.T) {
 	require.Empty(t, result.Failed)
 }
 
+func TestGcReplicaExcludeSparesLiveHostsButReportsThem(t *testing.T) {
+	// The liveness guard for chinit's writer pass: a host holding a
+	// live ordinal lease is excluded, so even when the pattern names it
+	// and detection calls it stale it must NOT be dropped — but it
+	// stays in Stale so the sweep remains visible in the log.
+	runner := &fakeSchemaRunner{stale: []string{"writer-0", "writer-1", "writer-2"}}
+	svc, request := gcTestService(runner)
+
+	result, err := svc.GcReplica(context.Background(), request, domain.ReplicaGcRequest{
+		RunOn:       "writer-0",
+		NamePattern: "writer-*",
+		ExcludeHosts: []string{
+			"writer-0", // this node (the run-on peer is always live)
+			"writer-1", // mid-boot re-join, lease renewed 5 minutes ago
+		},
+	})
+	require.NoError(t, err)
+
+	// Detection still reports all three — exclusions never hide
+	// staleness from the operator reading the timer log.
+	require.Equal(t, []string{"writer-0", "writer-1", "writer-2"}, result.Stale)
+	// Only the non-excluded writer drops; the excluded ones never reach
+	// DropReplica.
+	require.Equal(t, []string{"writer-2"}, result.Dropped)
+	require.Empty(t, result.Failed)
+	require.Len(t, runner.drops, 1)
+	require.Equal(t, "writer-2", runner.drops[0].HostName)
+}
+
+func TestGcReplicaExcludeOnlyGatesMatchingHosts(t *testing.T) {
+	// An exclude entry for a host the pattern does not name changes
+	// nothing: the two gates compose as pattern-then-exclude, and the
+	// reader pass with writer excludes keeps its reader-only behavior.
+	runner := &fakeSchemaRunner{stale: []string{"reader-3", "reader-4"}}
+	svc, request := gcTestService(runner)
+
+	result, err := svc.GcReplica(context.Background(), request, domain.ReplicaGcRequest{
+		RunOn:        "writer-0",
+		NamePattern:  "reader-*",
+		ExcludeHosts: []string{"reader-4"},
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"reader-3"}, result.Dropped)
+	require.Len(t, runner.drops, 1)
+}
+
 func TestGcReplicaContinuesOnDropFailure(t *testing.T) {
 	// One failing host must not shield the rest from cleanup: the sweep
 	// continues and reports both outcomes.

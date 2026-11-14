@@ -742,6 +742,26 @@ func TestRunReplicaGcRejectsStrayPositional(t *testing.T) {
 	require.ErrorContains(t, err, "writer-0")
 }
 
+func TestRunReplicaGcExcludeFlagAcceptsRepeatedHosts(t *testing.T) {
+	// The -exclude flag is repeatable (chinit's writer pass lists every
+	// active lease claim): the pre-scan must carry BOTH the flag token
+	// and its value as flag tokens — a value consumed as a positional
+	// leaves -exclude without an argument and fs.Parse rejects it.
+	//
+	// The spec is deliberately nonexistent: runReplicaGc exits the
+	// process (exit 3) once detection runs, so the spec read is the last
+	// observable boundary — reaching it proves the flags parsed clean.
+	err := runReplicaGc([]string{
+		"-spec", "/nonexistent/chi.yaml", "-cluster", "logexplorer", "-on", "writer-0",
+		"-name-pattern", "writer-*",
+		"-exclude", "writer-0",
+		"-exclude", "writer-1",
+	})
+	require.ErrorContains(t, err, "read spec")
+	require.NotContains(t, err.Error(), "flag needs an argument")
+	require.NotContains(t, err.Error(), "no positional argument")
+}
+
 // --- config render-node (single-invocation node render + install) ---
 
 // renderNodeCHISpec is a minimal-but-complete CHI for the render-node

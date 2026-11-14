@@ -18,14 +18,20 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
-	"testing"
 
-	"github.com/stretchr/testify/require"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/fail"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
 )
+
+// This file pins the disk mount contracts: mount by LABEL (NVMe device
+// renaming), first-boot format with the label, the metadata-Critical/
+// cache-degrade split, fstab idempotence, XML validation and the
+// golden-AMI binary gate.
 
 // fakeRunner records invocations and scripts outcomes. results keys on
 // the joined command line; every unmatched call succeeds (mkdir, chown,
@@ -90,57 +96,78 @@ func specFor(role model.Role) model.BootSpec {
 	}
 }
 
-// TestMountDisk_FirstBootFormatsWithLabel: a blank device (blkid
-// unrecognized) gets mkfs.ext4 -L, then mounts by the resolved label.
-func TestMountDisk_FirstBootFormatsWithLabel(t *testing.T) {
-	// no label yet; blank disk: no signature; not mounted yet
-	r := newFakeRunner().
-		script("blkid -l -o device -t LABEL=ch-metadata", "").
-		fail("blkid /dev/sdb").
-		fail("mountpoint -q /var/lib/clickhouse")
-	d := NewDiskManager(r)
+var _ = Describe("DiskManager.MountDisk", func() {
+	It("formats a blank device with the label on first boot, then mounts it", func() {
+		// no label yet; blank disk: no signature; not mounted yet
+		r := newFakeRunner().
+			script("blkid -l -o device -t LABEL=ch-metadata", "").
+			fail("blkid /dev/sdb").
+			fail("mountpoint -q /var/lib/clickhouse")
+		d := NewDiskManager(r)
 
-	res, err := d.MountDisk(context.Background(), "ch-metadata", "/var/lib/clickhouse", "/dev/sdb")
-	require.NoError(t, err)
-	require.Equal(t, "/dev/sdb", res.Device)
-	require.True(t, r.invoked("mkfs.ext4 -F -L ch-metadata /dev/sdb"), "first boot must format with the label")
-	require.True(t, r.invoked("mount /dev/sdb /var/lib/clickhouse"))
-}
+		res, err := d.MountDisk(context.Background(), "ch-metadata", "/var/lib/clickhouse", "/dev/sdb")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.Device).To(Equal("/dev/sdb"))
+		Expect(r.invoked("mkfs.ext4 -F -L ch-metadata /dev/sdb")).To(BeTrue(), "first boot must format with the label")
+		Expect(r.invoked("mount /dev/sdb /var/lib/clickhouse")).To(BeTrue())
+	})
 
-// TestMountDisk_RepeatBootMountsByLabel: an existing labeled filesystem
-// skips mkfs and mounts the label-resolved device (survives NVMe
-// renaming).
-func TestMountDisk_RepeatBootMountsByLabel(t *testing.T) {
-	// label resolved post-rename; has fs with right label; not mounted yet
-	r := newFakeRunner().
-		script("blkid -l -o device -t LABEL=ch-metadata", "/dev/nvme3n1").
-		script("blkid /dev/nvme3n1", `LABEL="ch-metadata" TYPE="ext4"`).
-		fail("mountpoint -q /var/lib/clickhouse")
-	d := NewDiskManager(r)
+	It("mounts an existing labeled filesystem by label on repeat boot (no reformat)", func() {
+		// label resolved post-rename; has fs with right label; not
+		// mounted yet — the NVMe-renaming survival contract.
+		r := newFakeRunner().
+			script("blkid -l -o device -t LABEL=ch-metadata", "/dev/nvme3n1").
+			script("blkid /dev/nvme3n1", `LABEL="ch-metadata" TYPE="ext4"`).
+			fail("mountpoint -q /var/lib/clickhouse")
+		d := NewDiskManager(r)
 
-	_, err := d.MountDisk(context.Background(), "ch-metadata", "/var/lib/clickhouse", "/dev/nvme3n1")
-	require.NoError(t, err)
-	require.False(t, r.invoked("mkfs.ext4 -F -L ch-metadata /dev/nvme3n1"), "repeat boot must NOT reformat")
-	require.True(t, r.invoked("mount /dev/nvme3n1 /var/lib/clickhouse"))
-}
+		_, err := d.MountDisk(context.Background(), "ch-metadata", "/var/lib/clickhouse", "/dev/nvme3n1")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(r.invoked("mkfs.ext4 -F -L ch-metadata /dev/nvme3n1")).To(BeFalse(), "repeat boot must NOT reformat")
+		Expect(r.invoked("mount /dev/nvme3n1 /var/lib/clickhouse")).To(BeTrue())
+	})
 
-// TestMountDisk_MissingDeviceIsFatal: no device, no mount — Fatal (the
-// ASG must replace the node, and the message says which label).
-func TestMountDisk_MissingDeviceIsFatal(t *testing.T) {
-	d := NewDiskManager(newFakeRunner())
-	_, err := d.MountDisk(context.Background(), "ch-metadata", "/var/lib/clickhouse", "")
-	require.Error(t, err)
-	require.True(t, fail.IsFatal(err), "a missing metadata disk is a config-level failure, not a transient one")
-	require.Contains(t, err.Error(), "ch-metadata")
-}
+	It("is Fatal on a missing device, naming the label", func() {
+		// No device, no mount — the ASG must replace the node.
+		d := NewDiskManager(newFakeRunner())
+		_, err := d.MountDisk(context.Background(), "ch-metadata", "/var/lib/clickhouse", "")
+		Expect(err).To(HaveOccurred())
+		Expect(fail.IsFatal(err)).To(BeTrue(), "a missing metadata disk is a config-level failure, not a transient one")
+		Expect(err.Error()).To(ContainSubstring("ch-metadata"))
+	})
 
-// TestMountAll_MetadataCritical_CacheDegrades: cache mount failure
-// falls back to the directory on the metadata disk; metadata failure
-// is fatal.
-func TestMountAll_MetadataCritical_CacheDegrades(t *testing.T) {
-	t.Run("cache mount failure degrades", func(t *testing.T) {
+	It("appends the LABEL= fstab entry exactly once across convergent runs", func() {
+		fstabAppend := "sh -c echo 'LABEL=ch-metadata /var/lib/clickhouse ext4 defaults,nofail 0 2' >> /etc/fstab"
+
+		// Absent entry: grep fails → the append runs.
+		r := newFakeRunner().
+			script("blkid -l -o device -t LABEL=ch-metadata", "/dev/sdb").
+			script("blkid /dev/sdb", `LABEL="ch-metadata" TYPE="ext4"`).
+			fail("mountpoint -q /var/lib/clickhouse").
+			fail("grep -q LABEL=ch-metadata /etc/fstab")
+		d := NewDiskManager(r)
+		_, err := d.MountDisk(context.Background(), "ch-metadata", "/var/lib/clickhouse", "/dev/sdb")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(r.invoked(fstabAppend)).To(BeTrue())
+
+		// Present entry + active mount: neither the append nor the
+		// mount runs again.
+		r2 := newFakeRunner().
+			script("blkid -l -o device -t LABEL=ch-metadata", "/dev/sdb").
+			script("blkid /dev/sdb", `LABEL="ch-metadata" TYPE="ext4"`)
+		d2 := NewDiskManager(r2)
+		_, err = d2.MountDisk(context.Background(), "ch-metadata", "/var/lib/clickhouse", "/dev/sdb")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(r2.invoked(fstabAppend)).To(BeFalse(), "an existing fstab entry must not be duplicated")
+		Expect(r2.invoked("mount /dev/sdb /var/lib/clickhouse")).To(BeFalse(), "an active mount must not be re-mounted")
+	})
+})
+
+var _ = Describe("DiskManager.MountAll", func() {
+	It("degrades a cache mount failure to a metadata-disk subdir; metadata failure is Fatal", func() {
 		// Only the CACHE mount fails (its mountpoint probe reports
 		// unmounted and the mount errors); the metadata path succeeds.
+		By("cache mount failure degrades")
 		r := newFakeRunner().
 			script("blkid -l -o device -t LABEL=ch-metadata", "/dev/sdb").
 			script("blkid /dev/sdb", `LABEL="ch-metadata" TYPE="ext4"`).
@@ -151,91 +178,63 @@ func TestMountAll_MetadataCritical_CacheDegrades(t *testing.T) {
 		d := NewDiskManager(r)
 
 		mounted, err := d.MountAll(context.Background(), specFor(model.RoleWriter), nil)
-		require.NoError(t, err, "a cache failure must not fail the boot")
-		require.Len(t, mounted, 1, "only the metadata disk is mounted: %v", mounted)
-		require.True(t, r.invoked("mkdir -p /var/lib/clickhouse/disks"), "cache falls back to a metadata-disk subdir")
-	})
-	t.Run("metadata mount failure is fatal", func(t *testing.T) {
-		r := newFakeRunner().
+		Expect(err).NotTo(HaveOccurred(), "a cache failure must not fail the boot")
+		Expect(mounted).To(HaveLen(1), "only the metadata disk is mounted: %v", mounted)
+		Expect(r.invoked("mkdir -p /var/lib/clickhouse/disks")).To(BeTrue(), "cache falls back to a metadata-disk subdir")
+
+		By("metadata mount failure is fatal")
+		r2 := newFakeRunner().
 			script("blkid -l -o device -t LABEL=ch-metadata", "/dev/sdb").
 			script("blkid /dev/sdb", `LABEL="ch-metadata" TYPE="ext4"`).
 			fail("mountpoint -q /var/lib/clickhouse").
 			fail("mount /dev/sdb /var/lib/clickhouse")
-		d := NewDiskManager(r)
+		d2 := NewDiskManager(r2)
 
-		_, err := d.MountAll(context.Background(), specFor(model.RoleWriter), nil)
-		require.Error(t, err)
-		require.True(t, fail.IsFatal(err))
+		_, err = d2.MountAll(context.Background(), specFor(model.RoleWriter), nil)
+		Expect(err).To(HaveOccurred())
+		Expect(fail.IsFatal(err)).To(BeTrue())
 	})
-}
+})
 
-// TestMountDisk_FstabIdempotent: the LABEL= fstab entry is appended
-// exactly once across convergent runs (absent → append; present → skip).
-func TestMountDisk_FstabIdempotent(t *testing.T) {
-	// Absent entry: grep fails → the append runs.
-	r := newFakeRunner().
-		script("blkid -l -o device -t LABEL=ch-metadata", "/dev/sdb").
-		script("blkid /dev/sdb", `LABEL="ch-metadata" TYPE="ext4"`).
-		fail("mountpoint -q /var/lib/clickhouse").
-		fail("grep -q LABEL=ch-metadata /etc/fstab")
-	d := NewDiskManager(r)
-	_, err := d.MountDisk(context.Background(), "ch-metadata", "/var/lib/clickhouse", "/dev/sdb")
-	require.NoError(t, err)
-	require.True(t, r.invoked("sh -c echo 'LABEL=ch-metadata /var/lib/clickhouse ext4 defaults,nofail 0 2' >> /etc/fstab"))
+var _ = Describe("ValidateXML", func() {
+	It("accepts well-formed fragments and fails empty, missing and malformed ones", func() {
+		dir := GinkgoT().TempDir()
 
-	// Present entry + active mount: neither the append nor the mount
-	// runs again.
-	r2 := newFakeRunner().
-		script("blkid -l -o device -t LABEL=ch-metadata", "/dev/sdb").
-		script("blkid /dev/sdb", `LABEL="ch-metadata" TYPE="ext4"`)
-	d2 := NewDiskManager(r2)
-	_, err = d2.MountDisk(context.Background(), "ch-metadata", "/var/lib/clickhouse", "/dev/sdb")
-	require.NoError(t, err)
-	require.False(t, r2.invoked("sh -c echo 'LABEL=ch-metadata /var/lib/clickhouse ext4 defaults,nofail 0 2' >> /etc/fstab"),
-		"an existing fstab entry must not be duplicated")
-	require.False(t, r2.invoked("mount /dev/sdb /var/lib/clickhouse"), "an active mount must not be re-mounted")
-}
+		good := filepath.Join(dir, "good.xml")
+		Expect(writeTestFile(good, `<clickhouse><listen_host>0.0.0.0</listen_host></clickhouse>`)).To(Succeed())
+		Expect(ValidateXML(good)).To(Succeed())
 
-// TestValidateXML: well-formed fragments pass; empty, missing and
-// malformed files fail (the malformed case must be Fatal — a broken
-// fragment makes clickhouse-server refuse to start).
-func TestValidateXML(t *testing.T) {
-	dir := t.TempDir()
+		empty := filepath.Join(dir, "empty.xml")
+		Expect(writeTestFile(empty, "   ")).To(Succeed())
+		err := ValidateXML(empty)
+		Expect(err).To(HaveOccurred())
+		Expect(fail.IsFatal(err)).To(BeTrue())
 
-	good := dir + "/good.xml"
-	require.NoError(t, writeFile(good, `<clickhouse><listen_host>0.0.0.0</listen_host></clickhouse>`))
-	require.NoError(t, ValidateXML(good))
+		broken := filepath.Join(dir, "broken.xml")
+		Expect(writeTestFile(broken, `<clickhouse><unclosed></clickhouse>`)).To(Succeed())
+		err = ValidateXML(broken)
+		Expect(err).To(HaveOccurred())
+		Expect(fail.IsFatal(err)).To(BeTrue(), "a broken fragment makes clickhouse-server refuse to start")
 
-	empty := dir + "/empty.xml"
-	require.NoError(t, writeFile(empty, "   "))
-	err := ValidateXML(empty)
-	require.Error(t, err)
-	require.True(t, fail.IsFatal(err))
+		Expect(ValidateXML(filepath.Join(dir, "missing.xml"))).To(HaveOccurred())
+	})
+})
 
-	broken := dir + "/broken.xml"
-	require.NoError(t, writeFile(broken, `<clickhouse><unclosed></clickhouse>`))
-	err = ValidateXML(broken)
-	require.Error(t, err)
-	require.True(t, fail.IsFatal(err))
+var _ = Describe("OSTuner.RequireBinaries", func() {
+	It("is Fatal on a missing golden-AMI binary and names every missing component", func() {
+		// LookPath finds nothing on a stripped PATH.
+		GinkgoT().Setenv("PATH", "/nonexistent")
+		tuner := NewOSTuner(newFakeRunner())
+		err := tuner.RequireBinaries(context.Background(), []string{"clickhouse-server", "chctl"})
+		Expect(err).To(HaveOccurred())
+		Expect(fail.IsFatal(err)).To(BeTrue())
+		Expect(err.Error()).To(ContainSubstring("clickhouse-server"))
+		Expect(err.Error()).To(ContainSubstring("chctl"))
+		Expect(err.Error()).To(ContainSubstring("golden AMI"))
+	})
+})
 
-	require.Error(t, ValidateXML(dir+"/missing.xml"))
-}
-
-// TestRequireBinaries_FatalOnMissing: a missing golden-AMI binary is
-// Fatal and names every missing component.
-func TestRequireBinaries_FatalOnMissing(t *testing.T) {
-	// LookPath finds nothing on a stripped PATH.
-	t.Setenv("PATH", "/nonexistent")
-	tuner := NewOSTuner(newFakeRunner())
-	err := tuner.RequireBinaries(context.Background(), []string{"clickhouse-server", "chctl"})
-	require.Error(t, err)
-	require.True(t, fail.IsFatal(err))
-	require.Contains(t, err.Error(), "clickhouse-server")
-	require.Contains(t, err.Error(), "chctl")
-	require.Contains(t, err.Error(), "golden AMI")
-}
-
-// writeFile is the test-local file writer.
-func writeFile(path, content string) error {
+// writeTestFile is the test-local file writer.
+func writeTestFile(path, content string) error {
 	return os.WriteFile(path, []byte(content), 0644)
 }

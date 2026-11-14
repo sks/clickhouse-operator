@@ -37,16 +37,29 @@ const (
 
 // IdentityMode selects how the node derives its hostname:
 //   - static: Terraform allocates the private IP at a fixed offset and the
-//     node maps the last octet to writer-N/keeper-N/backup-0. AWS
-//     writers/keepers/backup use this.
-//   - lease: an ASG member claims reader-N via the provider's ordinal
-//     lease table before any render (the "ip-10-0-1-101 never joined the
-//     cluster" production finding: identity MUST settle before macros).
+//     node maps the last octet to keeper-N/backup-0 (writers, too, while
+//     the static writer path still exists — being retired in favor of the
+//     writer ASG). Keepers/backup and the interim static writer path use
+//     this.
+//   - lease: an ASG member claims its ordinal from the provider's lease
+//     table before any render — readers claim reader-N and (since the
+//     writer ASG rollout) writers claim writer-N (the "ip-10-0-1-101
+//     never joined the cluster" production finding: identity MUST settle
+//     before macros; a scaled-in/scaled-out writer is a new machine, so
+//     it needs the same rented identity the readers already have).
 type IdentityMode string
 
 const (
 	IdentityStatic IdentityMode = "static"
 	IdentityLease  IdentityMode = "lease"
+)
+
+// Default host prefixes: the claim-table key and DNS record are
+// prefix+ordinal, and inventory (live-claims and static fallback both)
+// matches claims by these prefixes when the spec leaves them unset.
+const (
+	DefaultWriterHostPrefix = "writer-"
+	DefaultReaderHostPrefix = "reader-"
 )
 
 // BootSpec is the complete, validated input to a node boot. It is the Go
@@ -60,11 +73,46 @@ type BootSpec struct {
 	Role             Role         `yaml:"role"                        json:"role"`
 	IdentityMode     IdentityMode `yaml:"identity_mode"               json:"identity_mode"`
 	ReaderHostPrefix string       `yaml:"reader_hostname_prefix,omitempty" json:"reader_hostname_prefix,omitempty"`
-	ReaderCount      int          `yaml:"reader_count,omitempty"      json:"reader_count,omitempty"`
+
+	// ReaderCount is the readers' baseline count (render-time
+	// inventory: the reserved host-name list). In lease mode the
+	// ordinal claim ceiling is ReaderMax (the ASG max — scale-out
+	// beyond this baseline must be able to claim); ReaderCount stays
+	// the compat baseline the pre-max Terraform render relies on.
+	ReaderCount int `yaml:"reader_count,omitempty" json:"reader_count,omitempty"`
+
+	// ReaderMax is the ordinal claim ceiling for leased readers = the
+	// readers ASG max_size. Readers claim ordinals in [0, ReaderMax).
+	// Why: the ASG can scale past ReaderCount, so the ceiling must be
+	// the maximum the fleet can ever reach, not today's baseline —
+	// otherwise a scale-out boots a node that can never claim an
+	// identity. Empty/0 for non-leased readers (static inventory uses
+	// ReaderCount).
+	ReaderMax int `yaml:"reader_max,omitempty" json:"reader_max,omitempty"`
+
+	// WriterHostPrefix is the hostname prefix leased writers claim
+	// (writer-0, writer-1, ...). Consumers default it to "writer-" so
+	// the Terraform template can omit it. Why a prefix field at all:
+	// the claim-table key and DNS record are prefix+ordinal, and tests
+	// render both from one place.
+	WriterHostPrefix string `yaml:"writer_hostname_prefix,omitempty" json:"writer_hostname_prefix,omitempty"`
+
+	// WriterMax is the ordinal claim ceiling for leased writers = the
+	// writers ASG max_size. Writers claim ordinals in [0, WriterMax).
+	// Why: CR slots are rendered from fixed ceilings (stable CR names
+	// across scaling events), and the claimer needs the bound it may
+	// hand out. 0 for static writers (the octet map fixes the ordinal).
+	WriterMax int `yaml:"writer_max,omitempty" json:"writer_max,omitempty"`
 
 	// Cluster topology (rendered into the CHI/keeper spec macros).
-	ClusterName string   `yaml:"cluster_name"             json:"cluster_name"`
-	DNSZoneName string   `yaml:"dns_zone_name"            json:"dns_zone_name"`
+	ClusterName string `yaml:"cluster_name"             json:"cluster_name"`
+	DNSZoneName string `yaml:"dns_zone_name"            json:"dns_zone_name"`
+
+	// WriterCount and WriterNodes are DEPRECATED for lease identity:
+	// they remain the source for the static-identity writer path only
+	// (static EC2s with fixed IPs, being replaced by the writer ASG).
+	// Lease-mode writers derive identity from WriterHostPrefix/WriterMax
+	// instead. Retire both fields when the static writer path is gone.
 	WriterCount int      `yaml:"writer_count"             json:"writer_count"`
 	WriterNodes []string `yaml:"writer_nodes,omitempty"  json:"writer_nodes,omitempty"`
 	KeeperNodes []string `yaml:"keeper_nodes,omitempty"   json:"keeper_nodes,omitempty"`
@@ -82,9 +130,9 @@ type BootSpec struct {
 	S3DataBucket string `yaml:"s3_data_bucket,omitempty" json:"s3_data_bucket,omitempty"`
 	Timezone     string `yaml:"timezone,omitempty"        json:"timezone,omitempty"`
 
-	// ClaimerTableName is the provider's ordinal-lease table (readers'
+	// ClaimerTableName is the provider's ordinal-lease table (lease
 	// identity: DynamoDB on AWS, Table storage on Azure). The settle
-	// step claims reader-N from it.
+	// step claims reader-N/writer-N from it.
 	ClaimerTableName string `yaml:"claimer_table_name,omitempty" json:"claimer_table_name,omitempty"`
 
 	// Disk labels (mount by LABEL, never device path — NVMe renaming).
@@ -158,9 +206,9 @@ type Backup struct {
 
 // LogShipping is the optional remote log pipeline (OTEL or Fluent Bit).
 type LogShipping struct {
-	Agent         string `yaml:"agent,omitempty"       json:"agent,omitempty"`
-	Endpoint      string `yaml:"endpoint,omitempty"     json:"endpoint,omitempty"`
-	Headers       string `yaml:"headers,omitempty"      json:"headers,omitempty"`
+	Agent           string `yaml:"agent,omitempty"       json:"agent,omitempty"`
+	Endpoint        string `yaml:"endpoint,omitempty"     json:"endpoint,omitempty"`
+	Headers         string `yaml:"headers,omitempty"      json:"headers,omitempty"`
 	FluentbitOutput string `yaml:"fluentbit_output,omitempty" json:"fluentbit_output,omitempty"`
 }
 
@@ -181,8 +229,11 @@ func (s *BootSpec) Validate() error {
 	default:
 		return &SpecError{Field: "identity_mode", Reason: "unknown mode " + string(s.IdentityMode)}
 	}
-	if s.Role == RoleReader && s.IdentityMode == IdentityLease && s.ReaderCount <= 0 {
-		return &SpecError{Field: "reader_count", Reason: "lease identity requires reader_count > 0"}
+	if s.Role == RoleReader && s.IdentityMode == IdentityLease && s.ReaderMax <= 0 {
+		return &SpecError{Field: "reader_max", Reason: "lease identity requires reader_max > 0"}
+	}
+	if s.Role == RoleWriter && s.IdentityMode == IdentityLease && s.WriterMax <= 0 {
+		return &SpecError{Field: "writer_max", Reason: "lease identity for writers requires writer_max > 0"}
 	}
 	if s.ConfigBundle.Bucket == "" {
 		return &SpecError{Field: "config_bundle.bucket", Reason: "required"}
@@ -197,6 +248,46 @@ func (s *BootSpec) Validate() error {
 		return &SpecError{Field: "secrets.default_password", Reason: "required"}
 	}
 	return nil
+}
+
+// WriterCeiling is the fixed writer section size of the CR's replica
+// list: WriterMax (the ASG max — every ordinal a writer can ever claim)
+// when set, else WriterCount (the static baseline). Why a ceiling and
+// not the live count: reader CR slots are rendered at
+// writerCeiling+ordinal, so the slot an ordinal maps to must never
+// shift when a writer scales in/out — that would re-key every reader's
+// CR name mid-flight (the CR-slot stability contract).
+func (s *BootSpec) WriterCeiling() int {
+	if s.WriterMax > 0 {
+		return s.WriterMax
+	}
+	return s.WriterCount
+}
+
+// ReaderCeiling is the readers' enumeration bound for inventory: the
+// ASG max when set (a scale-out past ReaderCount must still be listed
+// once it claims), else the static baseline ReaderCount.
+func (s *BootSpec) ReaderCeiling() int {
+	if s.ReaderMax > 0 {
+		return s.ReaderMax
+	}
+	return s.ReaderCount
+}
+
+// WriterPrefix is the leased-writer hostname prefix ("writer-").
+func (s *BootSpec) WriterPrefix() string {
+	if s.WriterHostPrefix != "" {
+		return s.WriterHostPrefix
+	}
+	return DefaultWriterHostPrefix
+}
+
+// ReaderPrefix is the leased-reader hostname prefix ("reader-").
+func (s *BootSpec) ReaderPrefix() string {
+	if s.ReaderHostPrefix != "" {
+		return s.ReaderHostPrefix
+	}
+	return DefaultReaderHostPrefix
 }
 
 // SpecError names the spec field that failed validation so the operator
@@ -259,10 +350,10 @@ type StepResult struct {
 // short-circuit on re-run (convergence); identity is the settled snapshot
 // subcommands (schema-sync, spot-watch, …) reload instead of re-deriving.
 type StateFile struct {
-	Version  int           `json:"version"`
+	Version  int          `json:"version"`
 	Identity NodeIdentity `json:"identity"`
 	Steps    []StepResult `json:"steps"`
-	BootTime string        `json:"boot_time,omitempty"`
+	BootTime string       `json:"boot_time,omitempty"`
 }
 
 // FindStep returns the recorded result for a step, or nil when it has

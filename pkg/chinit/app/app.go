@@ -87,6 +87,8 @@ func Run(args []string) error {
 		return runBackupDaily(rest)
 	case "spot-watch":
 		return runSpotWatch(rest)
+	case "drain":
+		return runDrain(rest)
 	case "version":
 		fmt.Printf("chinit %s\n", Version)
 		return nil
@@ -101,6 +103,10 @@ func Run(args []string) error {
 
 // Main is the process entry: prints the error, honors exit codes.
 func Main(args []string) {
+	// Structured logging on every entry path (boot + all subcommands):
+	// INFO records land on stdout, WARN/ERROR on stderr — the levels
+	// the journal contract already splits on.
+	InitLogging()
 	if err := Run(args); err == nil {
 		return
 	} else {
@@ -136,6 +142,7 @@ Usage:
   chinit orphaned-gc
   chinit backup-daily
   chinit spot-watch
+  chinit drain [-reason spot|termination-hook] [-timeout seconds]
   chinit version
 
 The spec is chinit.yaml (fetched with the config bundle when booted via

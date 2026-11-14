@@ -393,7 +393,10 @@ const DefaultReplicaGcPattern = "reader-*"
 // The pattern gate is applied here, not in SQL: detection stays a simple
 // query (stays easy to reason about), and the eligibility rule lives in
 // one place the CLI documents. A host that does not match is reported as
-// stale but never dropped.
+// stale but never dropped. The exclude list is the caller's second gate
+// (chinit's writer pass excludes hosts with live ordinal leases): an
+// excluded host is reported as stale but skipped at drop time — the
+// sweep stays visible while the liveness override wins.
 //
 // Drop failures are logged per-host and do not abort the sweep — one
 // flaky replica must not shield the rest from cleanup. The caller is
@@ -412,6 +415,7 @@ func (s *SchemaService) GcReplica(ctx context.Context, request SchemaRequest, gc
 		return nil, fmt.Errorf("gc: invalid name pattern %q: %w", pattern, err)
 	}
 	gc.NamePattern = pattern
+	excluded := gc.NewExcludeSet()
 
 	runner, err := s.runner(ctx, request)
 	if err != nil {
@@ -429,6 +433,12 @@ func (s *SchemaService) GcReplica(ctx context.Context, request SchemaRequest, gc
 		// happen. Being defensive costs one line and never reaps on
 		// ambiguity.
 		if err != nil || !matched {
+			continue
+		}
+		if excluded[host] {
+			// The caller's liveness guard outranks staleness: the host
+			// stays in Stale (the sweep's visibility contract) but its
+			// registration must survive the pass.
 			continue
 		}
 		if err := runner.DropReplica(ctx, domain.ReplicaDropRequest{HostName: host, RunOn: gc.RunOn}); err != nil {

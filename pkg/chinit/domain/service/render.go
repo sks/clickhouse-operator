@@ -17,9 +17,11 @@ package service
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -80,8 +82,16 @@ func (b *Boot) renderNodeConfig(ctx context.Context) error {
 	if b.Spec.Role != model.RoleBackup {
 		// The inventory host list renders remote_servers; writers and
 		// readers are both CR members. The DNS-zone addressing is the
-		// same convention the CHI spec's templates carry.
-		request.Hosts = b.clusterHosts()
+		// same convention the CHI spec's templates carry. The list is
+		// built ONCE here (live-claims discovery is a lease-table scan;
+		// the replica map and remote_servers must never disagree by
+		// racing two scans).
+		hosts, note := b.clusterHostsWithSource()
+		if note != "" {
+			slog.Warn(note)
+			fmt.Fprintln(os.Stderr, note)
+		}
+		request.Hosts = hosts
 		// Replica names (the {replica} macro value): without this map
 		// the macros render the operator's POD pattern
 		// (chi-<chi>-<cluster>-<shard>-<replica>) as the replica
@@ -91,7 +101,7 @@ func (b *Boot) renderNodeConfig(ctx context.Context) error {
 		// chinit-cutover finding). The bash era passed -replica
 		// 01-$idx=$hostname.
 		request.Replicas = map[string]string{}
-		for _, h := range b.clusterHosts() {
+		for _, h := range hosts {
 			request.Replicas[h.Name] = strings.SplitN(h.Address, ".", 2)[0]
 		}
 		// Distributed-query credentials: without an injected
@@ -113,32 +123,157 @@ func (b *Boot) renderNodeConfig(ctx context.Context) error {
 	return nil
 }
 
-// clusterHosts builds the CR inventory: the namer keys entries by the
-// operator CR host name ({shard}-{index}, writers 01-0.. then readers
-// 01-(writer_count+i).. in shard-replica order — the same order CRName()
-// derives), with the stack's private-zone DNS as the address. Keying by
-// hostname instead of CR name renders remote_servers <host> entries as
-// unresolvable chi-<chi>-<cluster>-<shard>-<replica> pod names (the
+// clusterHostsWithSource builds the CR inventory plus the provenance
+// note for the boot log (live-claims vs static fallback + its
+// warning) — split so the inventory tests assert the source without
+// scraping stderr. The namer keys entries by the operator CR host name
+// ({shard}-{index}, writers 01-0.. then readers
+// 01-(writerCeiling+readerOrdinal).. — the same order CRName()
+// derives), with the stack's private-zone DNS as the address. Keying
+// by hostname instead of CR name renders remote_servers <host> entries
+// as unresolvable chi-<chi>-<cluster>-<shard>-<replica> pod names (the
 // live boot finding: server crash-loops on DNS_ERROR Code 198).
-func (b *Boot) clusterHosts() []domain.HostIdentity {
+//
+// The inventory's SOURCE OF TRUTH is the live lease table when the
+// node holds a lease (identity_mode: lease): a clusterAllReplicas DDL
+// read fans out to every host in this list, so a reserved-but-vacant
+// slot (the ASG's max is a RESERVATION, not a member) would fail every
+// fan-out with an unreachable host. The lease table owns liveness —
+// only ACTIVE claim rows become hosts. The static spec lists stay as
+// the fallback for clouds without the listing capability (Azure
+// interim), reported loudly so a vacant-slot regression is visible in
+// the boot log.
+//
+// Source selection:
+//   - lease identity + listable lease table → ACTIVE claims (the
+//     contract above). The table name is the SETTLED identity's
+//     LeaseTable (the boot claimed from it; the spec field is the
+//     pre-settle fallback for direct unit wiring).
+//   - lease identity without the capability (Azure interim) or a
+//     listing failure → static lists + a loud WARNING: a lease-mode
+//     fleet's reserved lists contain vacant slots, and a silent
+//     fallback would put unreachable hosts in clusterAllReplicas
+//     reads with nothing in the log pointing at the cause.
+//   - static identity → static lists, no warning: every static node
+//     is a real machine, so the reserved list IS the member list.
+func (b *Boot) clusterHostsWithSource() (hosts []domain.HostIdentity, note string) {
+	if b.Spec.IdentityMode != model.IdentityLease {
+		return staticSpecInventory(b), ""
+	}
+	table := b.Identity.LeaseTable
+	if table == "" {
+		table = b.Spec.ClaimerTableName
+	}
+	lister := chinitport.AsLeaseLister(b.Provider)
+	if lister == nil {
+		return staticSpecInventory(b),
+			fmt.Sprintf("WARNING: cloud %s has no lease-listing capability; inventory enumerated from static spec (may include vacant slots)", b.Provider.Name())
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	claims, err := lister.ListActiveClaims(ctx, chinitport.ListClaimsRequest{Table: table})
+	if err != nil {
+		// A lease-table outage must not wedge the boot in a half
+		// inventory: fall back to the static lists and say so.
+		return staticSpecInventory(b),
+			fmt.Sprintf("WARNING: live-claims discovery on cloud %s failed (%s); inventory enumerated from static spec (may include vacant slots)", b.Provider.Name(), err)
+	}
+	return claimsInventory(b, claims), ""
+}
+
+// claimsInventory maps ACTIVE lease rows to CR slots: writers take
+// 01-{writerOrdinal}; readers take 01-{writerCeiling+readerOrdinal}
+// (writerCeiling = WriterMax, fallback WriterCount — the fixed-ceiling
+// arithmetic CRName() lands, so reader slots never shift when the
+// writer fleet scales). Ordinals at or beyond a role's ceiling are
+// stale rows (a shrunk writer_max) — the CR no longer reserves their
+// slot, so they are dropped. Order is CR slot (stable across runs: the
+// lease-table Scan order is unordered). THIS node's claim is included
+// deliberately: remote_servers and the -host inventories include self.
+//
+// Invariant: a lease-mode spec must carry writer_max (the Terraform
+// render writes it into every role's spec — reader CR slots derive
+// from it); with it unset the reader offset degenerates to WriterCount.
+func claimsInventory(b *Boot, claims []chinitport.Claim) []domain.HostIdentity {
+	writerPrefix, readerPrefix := b.Spec.WriterPrefix(), b.Spec.ReaderPrefix()
+	ceiling := b.Spec.WriterCeiling()
+	readerBound := b.Spec.ReaderCeiling()
 	var hosts []domain.HostIdentity
-	for i, name := range b.Spec.WriterNodes {
+	for _, claim := range claims {
+		ordinal := -1
+		role := domain.Role("")
+		switch {
+		case strings.HasPrefix(claim.Hostname, writerPrefix):
+			if n, err := strconv.Atoi(strings.TrimPrefix(claim.Hostname, writerPrefix)); err == nil && n >= 0 && (ceiling <= 0 || n < ceiling) {
+				ordinal, role = n, domain.RoleWriter
+			}
+		case strings.HasPrefix(claim.Hostname, readerPrefix):
+			if n, err := strconv.Atoi(strings.TrimPrefix(claim.Hostname, readerPrefix)); err == nil && n >= 0 && (readerBound <= 0 || n < readerBound) {
+				ordinal, role = ceiling+n, domain.RoleReader
+			}
+		}
+		if ordinal < 0 {
+			continue // foreign row (backup-0, out-of-ceiling stale claim)
+		}
 		hosts = append(hosts, domain.HostIdentity{
 			Cloud:   b.Provider.Name(),
 			Region:  b.Meta.Region,
-			Name:    fmt.Sprintf("01-%d", i),
-			Address: fmt.Sprintf("%s.%s", name, b.Spec.DNSZoneName),
-			Role:    domain.RoleWriter,
+			Name:    fmt.Sprintf("01-%d", ordinal),
+			Address: fmt.Sprintf("%s.%s", claim.Hostname, b.Spec.DNSZoneName),
+			Role:    role,
 		})
 	}
-	// Readers: the ordinals the CR covers, continuing the replica list
-	// AFTER the writers (CRName()'s ordering contract).
-	for i := 0; i < b.Spec.ReaderCount; i++ {
-		name := fmt.Sprintf("%s%d", b.Spec.ReaderHostPrefix, i)
+	sort.SliceStable(hosts, func(i, j int) bool {
+		// Claim keys are unique (hostname is the table key), so Name —
+		// which encodes the slot — is a total order.
+		return hosts[i].Name < hosts[j].Name
+	})
+	return hosts
+}
+
+// staticSpecInventory enumerates from the spec's reserved lists — the
+// pre-lease inventory shape, kept as the fallback for clouds without
+// the listing capability (Azure interim) and static-identity paths.
+// Leased specs (writer_max set) enumerate the reserved writer ordinals
+// by prefix — the same shape hostInventory (the app package's -host
+// renderer) uses, so the boot's remote_servers and the schema-sync
+// flags agree — and readers enumerate to ReaderMax when set (a
+// scale-out past the baseline is a member the moment it claims)
+// falling back to ReaderCount; the reader slot offset is
+// WriterCeiling(), the same arithmetic the live path uses, so static
+// and live inventories agree on CR slots.
+func staticSpecInventory(b *Boot) []domain.HostIdentity {
+	var hosts []domain.HostIdentity
+	if b.Spec.WriterMax > 0 {
+		prefix := b.Spec.WriterPrefix()
+		for i := 0; i < b.Spec.WriterMax; i++ {
+			name := fmt.Sprintf("%s%d", prefix, i)
+			hosts = append(hosts, domain.HostIdentity{
+				Cloud:   b.Provider.Name(),
+				Region:  b.Meta.Region,
+				Name:    fmt.Sprintf("01-%d", i),
+				Address: fmt.Sprintf("%s.%s", name, b.Spec.DNSZoneName),
+				Role:    domain.RoleWriter,
+			})
+		}
+	} else {
+		for i, name := range b.Spec.WriterNodes {
+			hosts = append(hosts, domain.HostIdentity{
+				Cloud:   b.Provider.Name(),
+				Region:  b.Meta.Region,
+				Name:    fmt.Sprintf("01-%d", i),
+				Address: fmt.Sprintf("%s.%s", name, b.Spec.DNSZoneName),
+				Role:    domain.RoleWriter,
+			})
+		}
+	}
+	ceiling := b.Spec.WriterCeiling()
+	for i := 0; i < b.Spec.ReaderCeiling(); i++ {
+		name := fmt.Sprintf("%s%d", b.Spec.ReaderPrefix(), i)
 		hosts = append(hosts, domain.HostIdentity{
 			Cloud:   b.Provider.Name(),
 			Region:  b.Meta.Region,
-			Name:    fmt.Sprintf("01-%d", len(b.Spec.WriterNodes)+i),
+			Name:    fmt.Sprintf("01-%d", ceiling+i),
 			Address: fmt.Sprintf("%s.%s", name, b.Spec.DNSZoneName),
 			Role:    domain.RoleReader,
 		})
@@ -365,7 +500,12 @@ func (b *Boot) healthGate(ctx context.Context) error {
 		args = append(args, "-keeper",
 			fmt.Sprintf("%s.%s:9181", b.Spec.KeeperNodes[0], b.Spec.DNSZoneName))
 	}
-	for _, h := range b.clusterHosts() {
+	hosts, note := b.clusterHostsWithSource()
+	if note != "" {
+		slog.Warn(note)
+		fmt.Fprintln(os.Stderr, note)
+	}
+	for _, h := range hosts {
 		args = append(args, "-host", h.Name+"="+h.Address)
 	}
 	out, err := runCommand(ctx, "chctl", args...)
@@ -442,4 +582,3 @@ type providerSecrets struct {
 func (a providerSecrets) ResolveSecret(ctx context.Context, request chctlport.SecretRequest) (string, error) {
 	return a.p.GetSecretValue(ctx, request)
 }
-

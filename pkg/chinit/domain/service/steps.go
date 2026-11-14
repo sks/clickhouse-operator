@@ -17,6 +17,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -91,9 +92,9 @@ func (b *Boot) Steps(ctx context.Context) ([]Step, error) {
 		}),
 
 		// 6. Identity settles BEFORE any render (the ip-* macro bug:
-		// readers must claim their ordinal before macros render). The
-		// claimer is an optional capability — static identity (writers,
-		// keepers, backup) needs no claim.
+		// ASG members must claim their ordinal before macros render). The
+		// claimer is an optional capability — static identity (keepers,
+		// backup — and the interim static-writer path) needs no claim.
 		StepFunc("settle_identity", Critical, claimSweep, b.settleIdentity),
 
 		// 5b. Peer /etc/hosts entries: short names must resolve
@@ -169,11 +170,19 @@ func (b *Boot) Steps(ctx context.Context) ([]Step, error) {
 }
 
 // settleIdentity derives or claims the node identity and registers DNS.
-// Static nodes (writers/keepers/backup) map the IP octet; lease nodes
-// (readers) claim via the provider's OrdinalClaimer — the capability is
-// probed once, and its absence under lease identity is Fatal (a reader
-// without a claimer would boot with the ephemeral ip-* name and break
-// replication identity — the exact production finding).
+// Static nodes (keepers/backup — and writers while the static path still
+// exists) map the IP octet; lease nodes (BOTH ASG roles — readers and,
+// since the writer-ASG rollout, writers) claim via the provider's
+// OrdinalClaimer. The capability is probed once, and its absence under
+// lease identity is Fatal (an ASG member without a claimer would boot
+// with the ephemeral ip-* name and break replication identity — the
+// exact production finding).
+//
+// The claim is role-aware: the claim sweeps ordinals within the ROLE'S
+// ASG max (Prefix/Count come from the spec's role fields — writer-
+// /WriterMax for writers, reader-/ReaderMax for readers), so a
+// scaled-out node claims the first free slot in [0, max) and never
+// exceeds the CR slot ceiling the CHI spec reserved.
 func (b *Boot) settleIdentity(ctx context.Context) error {
 	id := model.NodeIdentity{
 		Role:        b.Spec.Role,
@@ -200,14 +209,51 @@ func (b *Boot) settleIdentity(ctx context.Context) error {
 		if claimer == nil {
 			return Fatal(fmt.Errorf("cloud %s has no ordinal-lease capability but spec demands identity_mode: lease", b.Provider.Name()))
 		}
+		// Role-aware claim parameters: prefix defaults keep pre-writer-ASG
+		// spec templates working (the model documents the defaults), and
+		// the ceiling is the role's ASG max — the validation contract
+		// already requires it for lease identity.
+		var prefix string
+		var ceiling int
+		switch b.Spec.Role {
+		case model.RoleWriter:
+			prefix = b.Spec.WriterHostPrefix
+			if prefix == "" {
+				prefix = "writer-"
+			}
+			ceiling = b.Spec.WriterMax
+		case model.RoleReader:
+			prefix = b.Spec.ReaderHostPrefix
+			if prefix == "" {
+				prefix = "reader-"
+			}
+			ceiling = b.Spec.ReaderMax
+		default:
+			// Lease identity is an ASG-member property: keepers and the
+			// backup replica are static EC2s (raft safety — they are not
+			// CR members and must never claim a CR slot).
+			return Fatal(fmt.Errorf("identity_mode: lease is only valid for writer/reader roles (got %s)", b.Spec.Role))
+		}
 		leaseTable := b.Spec.ClaimerTableName
 		if leaseTable == "" {
 			leaseTable = os.Getenv("CHINIT_LEASE_TABLE")
 		}
+		// The empty-table blind spot: a lease identity with no table
+		// name claims against "" — DynamoDB answers a confusing
+		// validation error from inside the ASG's boot loop and the
+		// operator has nothing pointing at the rendered spec being
+		// incomplete. Fatal, named, immediately.
+		if leaseTable == "" {
+			return Fatal(fmt.Errorf("lease identity requires claimer_table_name in the spec (or CHINIT_LEASE_TABLE env) — the rendered chinit spec is missing the field"))
+		}
+		slog.Info("identity: claiming ordinal lease",
+			"hostname_prefix", prefix,
+			"claim_ceiling", ceiling,
+			"lease_table", leaseTable)
 		ordinal, err := claimer.ClaimOrdinal(ctx, chinitport.ClaimRequest{
 			Table:           leaseTable,
-			Prefix:          b.Spec.ReaderHostPrefix,
-			Count:           b.Spec.ReaderCount,
+			Prefix:          prefix,
+			Count:           ceiling,
 			InstanceID:      b.Meta.InstanceID,
 			PrivateIP:       b.Meta.PrivateIP,
 			LeaseSeconds:    900,
@@ -216,13 +262,18 @@ func (b *Boot) settleIdentity(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		id.Hostname = fmt.Sprintf("%s%d", b.Spec.ReaderHostPrefix, ordinal)
+		id.Hostname = fmt.Sprintf("%s%d", prefix, ordinal)
 		id.CROrdinal = ordinal
 		id.LeaseTable = leaseTable
+		slog.Info("identity: lease claimed",
+			"hostname", id.Hostname,
+			"ordinal", ordinal,
+			"lease_table", leaseTable)
 	}
 
 	// The CR host name derives from the settled role + ordinal (writers
-	// 00-N, readers 01-N; backup and keepers carry none).
+	// 01-<ordinal>, readers 01-<writer ceiling + ordinal>; backup and
+	// keepers carry none).
 	b.Identity = id
 	if crName, ord := b.CRName(); crName != "" {
 		id.CRName = crName
@@ -240,10 +291,12 @@ func (b *Boot) settleIdentity(ctx context.Context) error {
 		// job subcommands read it from the state file.
 		b.PersistIdentity(id)
 	}
-	if err := setSystemHostname(ctx, id.Hostname); err != nil {
+	if err := b.setHostname(ctx, id.Hostname); err != nil {
 		// Best-effort (hostnamectl can fail inside cloud-init); the
 		// identity itself is settled and persisted.
-		fmt.Fprintf(os.Stderr, "WARNING: could not set system hostname to %s (%s)\n", id.Hostname, err)
+		slog.Warn("WARNING: could not set system hostname",
+			"hostname", id.Hostname,
+			"err", err)
 	}
 
 	// DNS registration: optional capability, best-effort with a loud
@@ -262,11 +315,28 @@ func (b *Boot) settleIdentity(ctx context.Context) error {
 			}); err != nil {
 				// Best-effort: registration failure must not fail the
 				// boot; the peer-hosts entries carry discovery.
-				fmt.Fprintf(os.Stderr, "WARNING: DNS registration failed for %s (%s); boot continues\n", id.Hostname, err)
+				slog.Warn("WARNING: DNS registration failed; boot continues",
+					"hostname", id.Hostname,
+					"err", err)
+			} else {
+				slog.Info("identity: DNS A record registered",
+					"hostname", id.Hostname,
+					"zone_id", zoneID)
 			}
 		} else if err != nil {
-			fmt.Fprintf(os.Stderr, "WARNING: zone resolution failed for %s (%s); DNS registration skipped\n", b.Spec.DNSZoneName, err)
+			slog.Warn("WARNING: zone resolution failed; DNS registration skipped",
+				"dns_zone", b.Spec.DNSZoneName,
+				"err", err)
+		} else {
+			slog.Warn("WARNING: zone resolution returned an empty zone id; DNS registration skipped",
+				"dns_zone", b.Spec.DNSZoneName)
 		}
+	}
+	// Persist identity a second time when the DNS block enriched it: the
+	// drain path releases the A record through the state's ZoneID, and
+	// the first persist (pre-DNS) carried an empty zone id.
+	if id.ZoneID != "" && b.PersistIdentity != nil {
+		b.PersistIdentity(id)
 	}
 	return nil
 }
@@ -417,6 +487,17 @@ func (b *Boot) configureServerEnv(ctx context.Context) error {
 		return Fatal(err)
 	}
 	return nil
+}
+
+// setHostname sets the node's hostname through the Boot's injectable
+// seam: the injected recorder (tests) or the hostnamectl/hostname
+// sequence. Kept separate from setSystemHostname so specs can assert
+// the settled name never escapes the pipeline.
+func (b *Boot) setHostname(ctx context.Context, hostname string) error {
+	if b.SetHostname != nil {
+		return b.SetHostname(ctx, hostname)
+	}
+	return setSystemHostname(ctx, hostname)
 }
 
 // setSystemHostname sets the node's static + transient hostname so

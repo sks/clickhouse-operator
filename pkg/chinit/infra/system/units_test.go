@@ -17,76 +17,74 @@ package system
 import (
 	"os"
 	"path/filepath"
-	"testing"
 
-	"github.com/stretchr/testify/require"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 )
 
-// TestWriteFile_Converges: identical content skips the write (mtime
-// stability), different content rewrites, mode applied both ways.
-func TestWriteFile_Converges(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "nested", "unit.service")
+var _ = Describe("WriteFile", func() {
+	It("converges: identical content skips the write, different content rewrites with the mode", func() {
+		path := filepath.Join(GinkgoT().TempDir(), "nested", "unit.service")
 
-	require.NoError(t, WriteFile(path, "first", 0644))
-	data, err := os.ReadFile(path)
-	require.NoError(t, err)
-	require.Equal(t, "first", string(data))
+		Expect(WriteFile(path, "first", 0644)).To(Succeed())
+		data, err := os.ReadFile(path)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(data)).To(Equal("first"))
 
-	// Same content: no error, content intact.
-	require.NoError(t, WriteFile(path, "first", 0644))
+		// Same content: no error, content intact.
+		Expect(WriteFile(path, "first", 0644)).To(Succeed())
 
-	// Different content: rewritten.
-	require.NoError(t, WriteFile(path, "second", 0600))
-	data, err = os.ReadFile(path)
-	require.NoError(t, err)
-	require.Equal(t, "second", string(data))
+		// Different content: rewritten.
+		Expect(WriteFile(path, "second", 0600)).To(Succeed())
+		data, err = os.ReadFile(path)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(data)).To(Equal("second"))
 
-	info, err := os.Stat(path)
-	require.NoError(t, err)
-	require.Equal(t, os.FileMode(0600), info.Mode().Perm())
-}
+		info, err := os.Stat(path)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(info.Mode().Perm()).To(Equal(os.FileMode(0600)))
+	})
+})
 
-// TestUnitInstaller_WritesUnits: units land under the injected unit dir
-// with the exact content (golden-file stability for the ExecStart
-// contract the units carry).
-func TestUnitInstaller_WritesUnits(t *testing.T) {
-	dir := t.TempDir()
-	installer := NewUnitInstaller(dir)
+var _ = Describe("UnitInstaller", func() {
+	It("writes units under the injected dir with the exact ExecStart content", func() {
+		// Golden-file stability for the ExecStart contract the units
+		// carry: chinit itself, never embedded bash.
+		dir := GinkgoT().TempDir()
+		installer := NewUnitInstaller(dir)
 
-	written, err := installer.InstallUnits([]UnitFile{
-		{
-			Name: "schema-sync.service",
-			Content: `[Unit]
+		written, err := installer.InstallUnits([]UnitFile{
+			{
+				Name: "schema-sync.service",
+				Content: `[Unit]
 Description=ClickHouse schema auto-propagation
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/chinit schema-sync -retries 3
 `,
-		},
-		{
-			Name: "schema-sync.timer",
-			Content: `[Timer]
+			},
+			{
+				Name: "schema-sync.timer",
+				Content: `[Timer]
 OnCalendar=hourly
 `,
-		},
+			},
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(written).To(HaveLen(2))
+
+		data, err := os.ReadFile(filepath.Join(dir, "schema-sync.service"))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(data)).To(ContainSubstring("ExecStart=/usr/local/bin/chinit schema-sync -retries 3"),
+			"the ExecStart must call chinit — embedded bash in units is the retired era")
 	})
-	require.NoError(t, err)
-	require.Len(t, written, 2)
 
-	data, err := os.ReadFile(filepath.Join(dir, "schema-sync.service"))
-	require.NoError(t, err)
-	require.Contains(t, string(data), "ExecStart=/usr/local/bin/chinit schema-sync -retries 3",
-		"the ExecStart must call chinit — embedded bash in units is the retired era")
-}
-
-// TestUnitInstaller_InstallDropin: the clickhouse-server drop-in
-// directory is created on demand.
-func TestUnitInstaller_InstallDropin(t *testing.T) {
-	dir := t.TempDir()
-	installer := NewUnitInstaller(dir)
-	require.NoError(t, installer.InstallDropin("limits.conf", "[Service]\nLimitNOFILE=262144\n"))
-	data, err := os.ReadFile(filepath.Join(dir, "clickhouse-server.service.d", "limits.conf"))
-	require.NoError(t, err)
-	require.Contains(t, string(data), "LimitNOFILE=262144")
-}
+	It("creates the clickhouse-server drop-in directory on demand", func() {
+		dir := GinkgoT().TempDir()
+		installer := NewUnitInstaller(dir)
+		Expect(installer.InstallDropin("limits.conf", "[Service]\nLimitNOFILE=262144\n")).To(Succeed())
+		data, err := os.ReadFile(filepath.Join(dir, "clickhouse-server.service.d", "limits.conf"))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(data)).To(ContainSubstring("LimitNOFILE=262144"))
+	})
+})
