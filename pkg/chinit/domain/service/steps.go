@@ -23,8 +23,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/infra/system"
 )
 
@@ -519,22 +519,28 @@ func setSystemHostname(ctx context.Context, hostname string) error {
 	return nil
 }
 
-// configurePeerHosts writes /etc/hosts entries for the WRITER short
-// names: the replication queue addresses the leader by its short name
-// and systemd-resolved's stub resolver does not answer short names —
-// Cannot resolve host writer-0 stalls every part fetch (the bash era's
-// configure_peer_hosts step, restored for the chinit cutover finding).
+// configurePeerHosts writes /etc/hosts entries for the cluster's
+// SHORT names: the replication queue addresses replica sources by
+// their short registered name (the {replica} macro — identity), and
+// systemd-resolved's stub resolver does not answer short names —
+// "Cannot resolve host writer-0" stalls every part fetch (the bash
+// era's configure_peer_hosts step, restored for the chinit cutover
+// finding; the live reader finding extended it from writers-only to
+// every server node: the reader's fetch queue addressed the writer
+// by short name and died on DNS_ERROR while interserver-by-IP
+// worked).
 //
-// Leased-writer era: writer addresses come from the LIVE claims (the
-// same inventory the render uses) — the old code fabricated the static
-// EC2 offsets (10.0.1.10+i), which on the writers ASG pinned DEAD IPs:
-// the replacement writer inherited the /etc/hosts line of its ordinal
-// and every self/peer connection timed out against a vacant address
-// (the live writers-ASG cutover finding — the hosts entry beats DNS).
-// Stale writer entries from prior boots are removed first (the old
-// contains-check kept a wrong entry forever). When a slot has no live
-// claim it gets no hosts line — DNS (self-registered at claim) is the
-// source of truth, and an absent peer is unreachable either way.
+// Leased-fleet era: peer addresses come from the LIVE claims (the
+// same inventory the render uses) — the old code fabricated the
+// static EC2 offsets (10.0.1.10+i), which on the writers ASG pinned
+// DEAD IPs: the replacement writer inherited the /etc/hosts line of
+// its ordinal and every self/peer connection timed out against a
+// vacant address (the live writers-ASG cutover finding — the hosts
+// entry beats DNS). Stale entries from prior boots are removed first
+// (the old contains-check kept a wrong entry forever). When a slot
+// has no live claim it gets no hosts line — DNS (self-registered at
+// claim) is the source of truth, and an absent peer is unreachable
+// either way.
 func (b *Boot) configurePeerHosts(ctx context.Context) error {
 	// Keepers register themselves in Keeper's own host records; the
 	// short-name problem is a server-node concern.
@@ -542,13 +548,14 @@ func (b *Boot) configurePeerHosts(ctx context.Context) error {
 		return nil
 	}
 
-	// Sweep every prior writer line first: a re-run must converge on
-	// the current claims, not preserve whatever an older boot wrote.
+	// Sweep every prior writer/reader line first: a re-run must
+	// converge on the current claims, not preserve whatever an older
+	// boot wrote.
 	if existing, err := os.ReadFile("/etc/hosts"); err == nil {
 		var kept []string
 		for _, line := range strings.Split(string(existing), "\n") {
 			stale := false
-			for _, prefix := range []string{b.Spec.WriterPrefix(), "writer-"} {
+			for _, prefix := range []string{b.Spec.WriterPrefix(), b.Spec.ReaderPrefix(), "writer-", "reader-"} {
 				for _, field := range strings.Fields(line) {
 					if strings.HasPrefix(field, prefix) {
 						stale = true
@@ -581,12 +588,16 @@ func (b *Boot) configurePeerHosts(ctx context.Context) error {
 			// Best-effort: the hosts file is an optimization over DNS
 			// (self-registered at claim); a listing outage must not
 			// abort the boot over short-name resolution.
-			fmt.Fprintf(os.Stderr, "WARNING: live-claims listing for /etc/hosts failed (%s); writer short names resolve via DNS\n", err)
+			fmt.Fprintf(os.Stderr, "WARNING: live-claims listing for /etc/hosts failed (%s); short names resolve via DNS\n", err)
 			return nil
 		}
-		prefix := b.Spec.WriterPrefix()
 		for _, claim := range claims {
-			if !strings.HasPrefix(claim.Hostname, prefix) || claim.IP == "" {
+			writer := strings.HasPrefix(claim.Hostname, b.Spec.WriterPrefix()) || strings.HasPrefix(claim.Hostname, "writer-")
+			reader := strings.HasPrefix(claim.Hostname, b.Spec.ReaderPrefix()) || strings.HasPrefix(claim.Hostname, "reader-")
+			if !writer && !reader {
+				continue // foreign row (backup-0, keeper-N): not fetch sources
+			}
+			if claim.IP == "" {
 				continue
 			}
 			fmt.Fprintf(&entries, "%s %s %s.%s\n", claim.IP, claim.Hostname, claim.Hostname, b.Spec.DNSZoneName)
