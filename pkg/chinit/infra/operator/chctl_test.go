@@ -40,9 +40,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// chiSpecPath points at the example CHI spec carried in the repo for
+// chiSpecPath points at the example CHI spec carried in the module for
 // smoke-testing the render path.
-const chiSpecPath = "../../../../docs/chctl-example-chi.yaml"
+const chiSpecPath = "testdata/example-chi.yaml"
 
 // loadCHIFromFile runs the SpecLoader over the example spec.
 func loadCHIFromFile(t *testing.T, name, namespace string) *v1.ClickHouseInstallation {

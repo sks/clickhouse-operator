@@ -1,0 +1,57 @@
+# Example CHI spec for chctl — the cloud-neutral cluster definition.
+# Same schema the operator reconciles on Kubernetes, restricted to the
+# cloud-free subset (topology, settings, users, profiles). Instance
+# sizing, disks and networking come from your infra, not this file.
+#
+# Cloud names never appear here: hosts are addressed at render time via
+# -host name=address (cloud inventory) and identified via
+# -replica name=cloudname (macros <replica>); keeper endpoints live in
+# the zookeeper section below. Passwords never live in this file either —
+# the spec declares the accounts; chctl injects the hashes at render
+# time from files your secret store drops (-user-password name=path).
+apiVersion: clickhouse.altinity.com/v1
+kind: ClickHouseInstallation
+metadata:
+  name: ch-int-dev
+spec:
+  configuration:
+    clusters:
+      - name: logexplorer
+        layout:
+          shardsCount: 1
+          replicasCount: 1
+    # Coordination: the Keeper ensemble's client endpoints. Hosts are
+    # whatever your deployment resolves — keeper DNS names off-cluster
+    # (no .svc.cluster.local patterns). Renders per host into
+    # chop-generated-zookeeper.xml (host group).
+    zookeeper:
+      nodes:
+        - host: keeper-0.ch.internal
+          port: 9181
+        - host: keeper-1.ch.internal
+          port: 9181
+        - host: keeper-2.ch.internal
+          port: 9181
+    profiles:
+      default/async_insert: "1"
+    settings:
+      query_log/partition_by: "toYYYYMM(event_date)"
+      query_log/ttl: "event_date + INTERVAL 14 DAY DELETE"
+    # Accounts only — no passwords in the spec. Two ways to credential a
+    # user: declare it here and let chctl inject the hash at render time
+    # from a file your secret store drops (-user-password name=path,
+    # the recommended flow), or commit the sha256 hex directly:
+    #   admin/password_sha256_hex: 10a6e6cc8311a3e2bcc09bf6c199adecd5dd59408c343e926b129c4914f3cb01
+    # (printf 'test_password' | sha256sum — the operator's own example
+    # hash). An injected -user-password wins over any password field
+    # here. Networks are the per-user allowlist.
+    users:
+      default/profile: readonly
+      admin/profile: default
+      admin/access_management: "1"
+      admin/networks/ip:
+        - 127.0.0.1/32
+        - 10.0.0.0/16
+      writer/profile: default
+      writer/networks/ip:
+        - 10.0.0.0/16
