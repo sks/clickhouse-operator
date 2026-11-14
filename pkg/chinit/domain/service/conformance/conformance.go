@@ -24,9 +24,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	chctlport "github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
-	chinitport "github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 )
 
 // Suite drives one provider through the capability scenarios. Fakes for
@@ -34,7 +33,7 @@ import (
 // suite only speaks ports.
 type Suite struct {
 	Name     string
-	Provider chinitport.Provider
+	Provider port.Provider
 }
 
 // Run executes every conformance scenario. Providers implementing the
@@ -58,7 +57,7 @@ func (s Suite) Run(t *testing.T) {
 	})
 
 	t.Run("secrets_roundtrip", func(t *testing.T) {
-		value, err := s.Provider.GetSecretValue(context.Background(), chctlport.SecretRequest{
+		value, err := s.Provider.GetSecretValue(context.Background(), port.SecretRequest{
 			Name: "conformance-test-secret",
 		})
 		require.NoError(t, err, "the conformance wiring serves this secret")
@@ -78,16 +77,16 @@ func (s Suite) Run(t *testing.T) {
 
 	// Optional capabilities: probed, not required.
 	t.Run("optional_capabilities", func(t *testing.T) {
-		if chinitport.AsOrdinalClaimer(s.Provider) == nil {
+		if port.AsOrdinalClaimer(s.Provider) == nil {
 			t.Logf("provider %s has no OrdinalClaimer (acceptable: static-identity clouds)", s.Provider.Name())
 		}
-		if chinitport.AsLeaseLister(s.Provider) == nil {
+		if port.AsLeaseLister(s.Provider) == nil {
 			t.Logf("provider %s has no LeaseLister (acceptable: inventory falls back to static spec lists)", s.Provider.Name())
 		}
-		if chinitport.AsDNSRegistrar(s.Provider) == nil {
+		if port.AsDNSRegistrar(s.Provider) == nil {
 			t.Logf("provider %s has no DNSRegistrar (acceptable: degraded DNS)", s.Provider.Name())
 		}
-		if chinitport.AsSpotSignals(s.Provider) == nil {
+		if port.AsSpotSignals(s.Provider) == nil {
 			t.Logf("provider %s has no SpotSignals (acceptable: on-demand only)", s.Provider.Name())
 		}
 	})

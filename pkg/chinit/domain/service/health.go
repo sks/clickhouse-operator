@@ -21,8 +21,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/altinity/clickhouse-operator/pkg/chctl/domain"
-	"github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 )
 
 // Check statuses. "skip" is a first-class outcome: optional checks
@@ -218,7 +218,7 @@ func (s *HealthService) Check(ctx context.Context, request HealthRequest) (*Heal
 	report := &HealthReport{Status: ReportStatusHealthy}
 
 	serverDetail, serverOK := s.checkServers(ctx, request, timeout)
-	report.Checks = append(report.Checks, HealthCheck{Name: "server", Status: statusOf(serverOK), Detail: serverDetail})
+	report.Checks = append(report.Checks, HealthCheck{Name: "server", Status: passFail(serverOK), Detail: serverDetail})
 
 	keeperDetail, keeperOK, keeperSkipped := s.checkKeeper(ctx, request, timeout)
 	switch {
@@ -231,7 +231,7 @@ func (s *HealthService) Check(ctx context.Context, request HealthRequest) (*Heal
 	}
 
 	rows, replicasDetail, replicasOK := s.checkReplicas(ctx, request, timeout)
-	report.Checks = append(report.Checks, HealthCheck{Name: "replicas", Status: statusOf(replicasOK), Detail: replicasDetail})
+	report.Checks = append(report.Checks, HealthCheck{Name: "replicas", Status: passFail(replicasOK), Detail: replicasDetail})
 
 	if !request.CheckTables {
 		report.Checks = append(report.Checks, HealthCheck{Name: "tables", Status: CheckStatusSkip, Detail: "no -spec given"})
@@ -239,14 +239,14 @@ func (s *HealthService) Check(ctx context.Context, request HealthRequest) (*Heal
 		expected := s.expectedTables()
 		report.ExpectedTables = expected
 		tablesDetail, tablesOK := s.checkTables(ctx, request, timeout, expected)
-		report.Checks = append(report.Checks, HealthCheck{Name: "tables", Status: statusOf(tablesOK), Detail: tablesDetail})
+		report.Checks = append(report.Checks, HealthCheck{Name: "tables", Status: passFail(tablesOK), Detail: tablesDetail})
 	}
 
 	if request.SelfName == "" {
 		report.Checks = append(report.Checks, HealthCheck{Name: "self", Status: CheckStatusSkip, Detail: "no -self given"})
 	} else {
 		selfDetail, selfOK := checkSelf(request.SelfName, rows, replicasOK)
-		report.Checks = append(report.Checks, HealthCheck{Name: "self", Status: statusOf(selfOK), Detail: selfDetail})
+		report.Checks = append(report.Checks, HealthCheck{Name: "self", Status: passFail(selfOK), Detail: selfDetail})
 	}
 
 	for _, check := range report.Checks {
@@ -258,8 +258,8 @@ func (s *HealthService) Check(ctx context.Context, request HealthRequest) (*Heal
 	return report, nil
 }
 
-// statusOf maps a bool to pass/fail.
-func statusOf(ok bool) string {
+// passFail maps a bool to pass/fail.
+func passFail(ok bool) string {
 	if ok {
 		return CheckStatusPass
 	}

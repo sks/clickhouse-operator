@@ -18,7 +18,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/altinity/clickhouse-operator/pkg/chctl/domain"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain"
 )
 
 // ClusterHealthProbe reads the live state of a ClickHouse cluster for

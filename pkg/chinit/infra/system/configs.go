@@ -60,8 +60,8 @@ func ValidateXML(path string) error {
 
 // StaticConfigInstaller moves the downloaded bundle's static XMLs into
 // /etc/clickhouse-server/config.d with validation and ownership, and
-// retires the pre-chctl hand-written overlays whose duplicate sections
-// would conflict at config-merge time with the chctl-rendered files.
+// retires the pre-chinit hand-written overlays whose duplicate sections
+// would conflict at config-merge time with the rendered files.
 type StaticConfigInstaller struct {
 	runner Runner
 	// Role gates the backup-replica-specific overlay installed from the
@@ -82,7 +82,7 @@ func (i *StaticConfigInstaller) WithRole(role model.Role) *StaticConfigInstaller
 }
 
 // retiredOverlays are files earlier stacks shipped by hand. A lingering
-// copy is config drift: chctl renders these sections now, and the merge
+// copy is config drift: chinit renders these sections now, and the merge
 // conflicts (duplicate <macros>, <remote_servers>, profiles) break the
 // server config parse. Removed on every boot — idempotent by deletion.
 var retiredOverlays = []string{
@@ -98,7 +98,7 @@ var retiredOverlays = []string{
 
 // staticConfigs maps bundle filenames to their install destinations.
 // The network/ssl/storage trio is the static remainder — everything
-// else renders from the CHI spec via chctl.
+// else renders from the CHI spec via the render library.
 var staticConfigs = map[string]string{
 	"network.xml": "/etc/clickhouse-server/config.d/network.xml",
 	"ssl.xml":     "/etc/clickhouse-server/config.d/ssl.xml",

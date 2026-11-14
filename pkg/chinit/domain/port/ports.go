@@ -23,7 +23,7 @@ package port
 import (
 	"context"
 
-	"github.com/altinity/clickhouse-operator/pkg/chctl/domain"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain"
 )
 
 // SpecLoader parses and normalizes a raw cluster spec into an

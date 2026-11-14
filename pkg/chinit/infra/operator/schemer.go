@@ -26,8 +26,8 @@ import (
 	"github.com/altinity/clickhouse-operator/pkg/model/chi/schemer"
 	"github.com/altinity/clickhouse-operator/pkg/model/clickhouse"
 
-	"github.com/altinity/clickhouse-operator/pkg/chctl/domain"
-	"github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 )
 
 // SchemaRunner implements port.SchemaRunner over the operator's

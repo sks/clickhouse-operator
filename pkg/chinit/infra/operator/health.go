@@ -25,8 +25,8 @@ import (
 	v1 "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse.altinity.com/v1"
 	"github.com/altinity/clickhouse-operator/pkg/model/clickhouse"
 
-	"github.com/altinity/clickhouse-operator/pkg/chctl/domain"
-	"github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 )
 
 // HealthProbe implements port.ClusterHealthProbe over the operator's

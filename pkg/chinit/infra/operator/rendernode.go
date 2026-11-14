@@ -27,7 +27,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 )
 
 // renderNodeManifestName is the manifest file render-node keeps in every

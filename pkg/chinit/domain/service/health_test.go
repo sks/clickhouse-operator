@@ -21,9 +21,9 @@ import (
 	"net"
 	"testing"
 
-	"github.com/altinity/clickhouse-operator/pkg/chctl/domain"
-	"github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
-	"github.com/altinity/clickhouse-operator/pkg/chctl/infra/keeper"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/infra/keeper"
 
 	"github.com/stretchr/testify/require"
 )

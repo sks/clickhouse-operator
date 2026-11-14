@@ -6,7 +6,7 @@ name: Release chinit
 #   curl -fsSL https://github.com/<repo>/releases/download/chinit-v0.1.0/chinit-linux-arm64
 #
 # Trigger: pushing a tag `chinit-v*`. The prefix keeps chinit releases
-# namespaced apart from chctl (chctl-v*) and operator (v0.27.x) tags.
+# namespaced apart from operator (v0.27.x) tags.
 #
 # Artifacts per release:
 #   chinit-<os>-<arch>  stripped static binaries (linux/arm64+amd64,
@@ -15,7 +15,7 @@ name: Release chinit
 #
 # The golden-AMI packer build and the chinit bootstrap (user-data
 # wrapper) pin both the version and the sha256 — the same gating the
-# chctl runtime-upgrade path uses.
+# runtime-upgrade path uses.
 
 on:
   push:

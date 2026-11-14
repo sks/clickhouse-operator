@@ -18,12 +18,12 @@ The Altinity Kubernetes Operator for ClickHouse creates, configures and manages 
 >   This fork vendors the fork's stdlib-only sources at `pkg/util/mergo`.
 >   Proposed upstream as Altinity/clickhouse-operator#2150 (closed).
 >
-> - **`5c61eeb` — feat(chctl): off-cluster control CLI.** Adds `cmd/chctl` —
->   the operator's config generation, schema propagation, replica cleanup
->   and keeper Raft-quorum safety gate as a standalone binary for
->   deployments outside Kubernetes (VMs, EC2 ASGs, VMSS). Usage:
->   [docs/chctl.md](docs/chctl.md). Binaries ship as GitHub Releases on
->   `chctl-v*` tags.
+> - **`5c61eeb` — feat: off-cluster control (chinit).** Adds the
+>   operator's config generation, schema propagation, replica cleanup
+>   and keeper Raft-quorum safety gate as a standalone Go library for
+>   deployments outside Kubernetes (VMs, EC2 ASGs, VMSS). `chinit` is
+>   the only binary; the cluster operations are in-process calls into
+>   `pkg/chinit`.
 >
 > - **`c6dfdc8` — feat(chinit): cloud-adaptive node bootstrapper.** Adds
 >   `cmd/chinit` — the node bootstrap as one binary: cloud detection via a

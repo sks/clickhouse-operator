@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Package keeper adapts ClickHouse Keeper's four-letter-word interface to
-// the chctl KeeperProbe port.
+// the KeeperProbe port.
 package keeper
 
 import (
@@ -25,7 +25,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 )
 
 // Probe implements port.KeeperProbe over the mntr 4lw TCP endpoint.

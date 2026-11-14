@@ -28,7 +28,6 @@ package port
 import (
 	"context"
 
-	"github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
 )
 
@@ -163,7 +162,7 @@ type Provider interface {
 	// Metadata probes instance metadata (mandatory capability).
 	MetadataProvider
 	// Secrets resolves secret-store entries by name (mandatory).
-	port.SecretSource
+	SecretSource
 	// ConfigSource fetches the config bundle (mandatory).
 	ConfigSource
 }

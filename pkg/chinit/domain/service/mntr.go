@@ -21,7 +21,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 )
 
 // KeeperMntrService fetches and formats a keeper's mntr payload — the

@@ -23,9 +23,8 @@ import (
 	"strings"
 	"time"
 
-	chctlport "github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
-	chinitport "github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/infra/system"
 )
 
@@ -66,12 +65,12 @@ func (b *Boot) Steps(ctx context.Context) ([]Step, error) {
 			return tuner.Tune(ctx)
 		}),
 		StepFunc("require_binaries", Critical, onceFatal, func(ctx context.Context) error {
-			// chctl + clickhouse binaries: every cloud (the render goes
-			// through chctl's library but the recurring-job subcommands
-			// exec the chctl CLI). The `aws` CLI is AWS-only — an Azure
+			// clickhouse binaries: every cloud. The render and the
+			// recurring-job subcommands are in-process library calls —
+			// no chctl binary. The `aws` CLI is AWS-only — an Azure
 			// node never has it, and requiring it there would fail every
 			// boot fatally.
-			bins := []string{"clickhouse-server", "clickhouse-client", "chctl"}
+			bins := []string{"clickhouse-server", "clickhouse-client"}
 			if b.Provider.Name() == "aws" {
 				bins = append(bins, "aws")
 			}
@@ -208,7 +207,7 @@ func (b *Boot) settleIdentity(ctx context.Context) error {
 		// Keepers' CROrdinal is their own ordinal; server nodes get the
 		// CR name from CRName() at render time.
 	case model.IdentityLease:
-		claimer := chinitport.AsOrdinalClaimer(b.Provider)
+		claimer := port.AsOrdinalClaimer(b.Provider)
 		if claimer == nil {
 			return Fatal(fmt.Errorf("cloud %s has no ordinal-lease capability but spec demands identity_mode: lease", b.Provider.Name()))
 		}
@@ -253,7 +252,7 @@ func (b *Boot) settleIdentity(ctx context.Context) error {
 			"hostname_prefix", prefix,
 			"claim_ceiling", ceiling,
 			"lease_table", leaseTable)
-		ordinal, err := claimer.ClaimOrdinal(ctx, chinitport.ClaimRequest{
+		ordinal, err := claimer.ClaimOrdinal(ctx, port.ClaimRequest{
 			Table:           leaseTable,
 			Prefix:          prefix,
 			Count:           ceiling,
@@ -304,12 +303,12 @@ func (b *Boot) settleIdentity(ctx context.Context) error {
 
 	// DNS registration: optional capability, best-effort with a loud
 	// warning (the bash script's `|| echo WARNING`).
-	if dns := chinitport.AsDNSRegistrar(b.Provider); dns != nil {
+	if dns := port.AsDNSRegistrar(b.Provider); dns != nil {
 		zoneID, err := dns.ResolveZoneID(ctx, b.Spec.DNSZoneName)
 		if err == nil && zoneID != "" {
 			id.ZoneID = zoneID
 			b.Identity = id
-			if err := dns.UpsertARecord(ctx, chinitport.ARecordRequest{
+			if err := dns.UpsertARecord(ctx, port.ARecordRequest{
 				ZoneID:     zoneID,
 				ZoneName:   b.Spec.DNSZoneName,
 				RecordName: id.Hostname,
@@ -360,7 +359,7 @@ func (b *Boot) retrievePasswords(ctx context.Context) error {
 		if secretName == "" {
 			continue
 		}
-		value, err := b.Provider.GetSecretValue(ctx, chctlport.SecretRequest{Name: secretName})
+		value, err := b.Provider.GetSecretValue(ctx, port.SecretRequest{Name: secretName})
 		if err != nil {
 			return err
 		}
@@ -425,7 +424,7 @@ func (b *Boot) configureTLS(ctx context.Context) error {
 		if m.secret == "" {
 			continue
 		}
-		value, err := b.Provider.GetSecretValue(ctx, chctlport.SecretRequest{Name: m.secret})
+		value, err := b.Provider.GetSecretValue(ctx, port.SecretRequest{Name: m.secret})
 		if err != nil {
 			return err
 		}
@@ -525,26 +524,80 @@ func setSystemHostname(ctx context.Context, hostname string) error {
 // and systemd-resolved's stub resolver does not answer short names —
 // Cannot resolve host writer-0 stalls every part fetch (the bash era's
 // configure_peer_hosts step, restored for the chinit cutover finding).
+//
+// Leased-writer era: writer addresses come from the LIVE claims (the
+// same inventory the render uses) — the old code fabricated the static
+// EC2 offsets (10.0.1.10+i), which on the writers ASG pinned DEAD IPs:
+// the replacement writer inherited the /etc/hosts line of its ordinal
+// and every self/peer connection timed out against a vacant address
+// (the live writers-ASG cutover finding — the hosts entry beats DNS).
+// Stale writer entries from prior boots are removed first (the old
+// contains-check kept a wrong entry forever). When a slot has no live
+// claim it gets no hosts line — DNS (self-registered at claim) is the
+// source of truth, and an absent peer is unreachable either way.
 func (b *Boot) configurePeerHosts(ctx context.Context) error {
 	// Keepers register themselves in Keeper's own host records; the
 	// short-name problem is a server-node concern.
 	if b.Spec.Role == model.RoleKeeper {
 		return nil
 	}
-	existing, _ := os.ReadFile("/etc/hosts")
-	for i, name := range b.Spec.WriterNodes {
-		ip := fmt.Sprintf("10.0.1.%d", 10+i)
-		fqdn := fmt.Sprintf("%s.%s", name, b.Spec.DNSZoneName)
-		if strings.Contains(string(existing), " "+name+" ") ||
-			strings.Contains(string(existing), " "+fqdn) {
-			continue
+
+	// Sweep every prior writer line first: a re-run must converge on
+	// the current claims, not preserve whatever an older boot wrote.
+	if existing, err := os.ReadFile("/etc/hosts"); err == nil {
+		var kept []string
+		for _, line := range strings.Split(string(existing), "\n") {
+			stale := false
+			for _, prefix := range []string{b.Spec.WriterPrefix(), "writer-"} {
+				for _, field := range strings.Fields(line) {
+					if strings.HasPrefix(field, prefix) {
+						stale = true
+						break
+					}
+				}
+				if stale {
+					break
+				}
+			}
+			if !stale {
+				kept = append(kept, line)
+			}
 		}
-		entry := fmt.Sprintf("%s %s %s\n", ip, name, fqdn)
+		if err := os.WriteFile("/etc/hosts", []byte(strings.Join(kept, "\n")+"\n"), 0644); err != nil {
+			return Fatal(fmt.Errorf("rewrite /etc/hosts: %w", err))
+		}
+	} else {
+		return Fatal(fmt.Errorf("read /etc/hosts: %w", err))
+	}
+
+	// The inventory addresses are DNS names; /etc/hosts needs IPs. The
+	// lease table carries both — list the claims directly (the same
+	// scan the inventory runs; a node claiming mid-sweep simply joins
+	// on its own DNS record).
+	var entries strings.Builder
+	if lister := port.AsLeaseLister(b.Provider); lister != nil && b.Identity.LeaseTable != "" {
+		claims, err := lister.ListActiveClaims(ctx, port.ListClaimsRequest{Table: b.Identity.LeaseTable})
+		if err != nil {
+			// Best-effort: the hosts file is an optimization over DNS
+			// (self-registered at claim); a listing outage must not
+			// abort the boot over short-name resolution.
+			fmt.Fprintf(os.Stderr, "WARNING: live-claims listing for /etc/hosts failed (%s); writer short names resolve via DNS\n", err)
+			return nil
+		}
+		prefix := b.Spec.WriterPrefix()
+		for _, claim := range claims {
+			if !strings.HasPrefix(claim.Hostname, prefix) || claim.IP == "" {
+				continue
+			}
+			fmt.Fprintf(&entries, "%s %s %s.%s\n", claim.IP, claim.Hostname, claim.Hostname, b.Spec.DNSZoneName)
+		}
+	}
+	if entries.Len() > 0 {
 		f, err := os.OpenFile("/etc/hosts", os.O_APPEND|os.O_WRONLY, 0644)
 		if err != nil {
 			return Fatal(fmt.Errorf("open /etc/hosts: %w", err))
 		}
-		if _, err := f.WriteString(entry); err != nil {
+		if _, err := f.WriteString(entries.String()); err != nil {
 			_ = f.Close()
 			return Fatal(fmt.Errorf("append /etc/hosts: %w", err))
 		}

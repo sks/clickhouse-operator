@@ -24,8 +24,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/altinity/clickhouse-operator/pkg/chctl/domain"
-	"github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 
 	"github.com/stretchr/testify/require"
 )

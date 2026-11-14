@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package aws implements chctl's cloud adapters for AWS: the Secrets
+// Package aws implements chinit's cloud adapters for AWS: the Secrets
 // Manager SecretSource and (future) the ASG lifecycle acker. All AWS
 // specifics live here; the domain ports stay cloud-agnostic.
 package aws
@@ -25,7 +25,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 
-	"github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 )
 
 // SecretsManagerSource implements port.SecretSource over AWS Secrets

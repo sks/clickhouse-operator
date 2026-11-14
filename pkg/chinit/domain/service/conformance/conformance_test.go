@@ -21,9 +21,8 @@ import (
 	"net/http"
 	"testing"
 
-	chctlport "github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
-	chinitport "github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/service/conformance"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/infra/aws"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/infra/azure"
@@ -49,40 +48,40 @@ func TestProviderConformance(t *testing.T) {
 		"storage.xml": "<clickhouse><storage_configuration/></clickhouse>",
 	}}
 
-	awsProvider := aws.New(chinitport.Config{Region: "us-east-1", Spec: spec})
+	awsProvider := aws.New(port.Config{Region: "us-east-1", Spec: spec})
 	if p, ok := awsProvider.(interface {
 		WithIMDSClient(c interface {
 			Do(req *http.Request) (*http.Response, error)
-		}) chinitport.Provider
+		}) port.Provider
 	}); ok {
 		awsProvider = p.WithIMDSClient(fakes.AWSIMDS().Client())
 	}
 	if p, ok := awsProvider.(interface {
-		WithSecrets(chctlport.SecretSource) chinitport.Provider
+		WithSecrets(port.SecretSource) port.Provider
 	}); ok {
 		awsProvider = p.WithSecrets(secrets)
 	}
 	if p, ok := awsProvider.(interface {
-		WithBundle(chinitport.ConfigSource) chinitport.Provider
+		WithBundle(port.ConfigSource) port.Provider
 	}); ok {
 		awsProvider = p.WithBundle(bundle)
 	}
 
-	azureProvider := azure.New(chinitport.Config{Region: "eastus", Spec: spec})
+	azureProvider := azure.New(port.Config{Region: "eastus", Spec: spec})
 	if p, ok := azureProvider.(interface {
 		WithIMDSClient(c interface {
 			Do(req *http.Request) (*http.Response, error)
-		}) chinitport.Provider
+		}) port.Provider
 	}); ok {
 		azureProvider = p.WithIMDSClient(fakes.AzureIMDS().Client())
 	}
 	if p, ok := azureProvider.(interface {
-		WithSecrets(chctlport.SecretSource) chinitport.Provider
+		WithSecrets(port.SecretSource) port.Provider
 	}); ok {
 		azureProvider = p.WithSecrets(secrets)
 	}
 	if p, ok := azureProvider.(interface {
-		WithBundle(chinitport.ConfigSource) chinitport.Provider
+		WithBundle(port.ConfigSource) port.Provider
 	}); ok {
 		azureProvider = p.WithBundle(bundle)
 	}

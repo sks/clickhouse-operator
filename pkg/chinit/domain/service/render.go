@@ -26,11 +26,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/altinity/clickhouse-operator/pkg/chctl/domain"
-	chctlport "github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
-	chctlops "github.com/altinity/clickhouse-operator/pkg/chctl/infra/operator"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
-	chinitport "github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/infra/keeper"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/infra/operator"
 )
 
 // renderNodeConfig renders the whole node through chctl's library —
@@ -60,8 +60,8 @@ func (b *Boot) renderNodeConfig(ctx context.Context) error {
 		crName, _ = b.CRName()
 	}
 
-	renderer := chctlops.NewNodeRenderer(chctlops.NewConfigRenderer(), chctlops.NewUsersRenderer(providerSecrets{p: b.Provider}))
-	request := chctlport.RenderNodeRequest{
+	renderer := operator.NewNodeRenderer(operator.NewConfigRenderer(), operator.NewUsersRenderer(providerSecrets{p: b.Provider}))
+	request := port.RenderNodeRequest{
 		NormalizedCR: cr,
 		NodeType:     string(b.Spec.Role),
 		HostName:     crName,
@@ -164,14 +164,14 @@ func (b *Boot) clusterHostsWithSource() (hosts []domain.HostIdentity, note strin
 	if table == "" {
 		table = b.Spec.ClaimerTableName
 	}
-	lister := chinitport.AsLeaseLister(b.Provider)
+	lister := port.AsLeaseLister(b.Provider)
 	if lister == nil {
 		return staticSpecInventory(b),
 			fmt.Sprintf("WARNING: cloud %s has no lease-listing capability; inventory enumerated from static spec (may include vacant slots)", b.Provider.Name())
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	claims, err := lister.ListActiveClaims(ctx, chinitport.ListClaimsRequest{Table: table})
+	claims, err := lister.ListActiveClaims(ctx, port.ListClaimsRequest{Table: table})
 	if err != nil {
 		// A lease-table outage must not wedge the boot in a half
 		// inventory: fall back to the static lists and say so.
@@ -194,7 +194,7 @@ func (b *Boot) clusterHostsWithSource() (hosts []domain.HostIdentity, note strin
 // Invariant: a lease-mode spec must carry writer_max (the Terraform
 // render writes it into every role's spec — reader CR slots derive
 // from it); with it unset the reader offset degenerates to WriterCount.
-func claimsInventory(b *Boot, claims []chinitport.Claim) []domain.HostIdentity {
+func claimsInventory(b *Boot, claims []port.Claim) []domain.HostIdentity {
 	writerPrefix, readerPrefix := b.Spec.WriterPrefix(), b.Spec.ReaderPrefix()
 	ceiling := b.Spec.WriterCeiling()
 	readerBound := b.Spec.ReaderCeiling()
@@ -357,8 +357,8 @@ func (b *Boot) configureKeeper(ctx context.Context) error {
 		keeperAddrs[fmt.Sprintf("0-%d", i)] = fmt.Sprintf("%s.%s", name, b.Spec.DNSZoneName)
 		raftIDs[fmt.Sprintf("0-%d", i)] = i + 1
 	}
-	renderer := chctlops.NewNodeRenderer(chctlops.NewConfigRenderer(), nil)
-	_, err = renderer.RenderNode(ctx, chctlport.RenderNodeRequest{
+	renderer := operator.NewNodeRenderer(operator.NewConfigRenderer(), nil)
+	_, err = renderer.RenderNode(ctx, port.RenderNodeRequest{
 		NormalizedCR:    cr,
 		NodeType:        string(b.Spec.Role),
 		HostName:        fmt.Sprintf("0-%d", myOrdinal),
@@ -462,59 +462,61 @@ func (b *Boot) startClickhouse(ctx context.Context) error {
 	return nil
 }
 
-// healthGate runs chctl's health check as a library call. Non-Fatal BY
-// DESIGN (the step's Criticality is BestEffort): a reader booting while
-// a peer is down must still join; the WARNING + report make a degraded
-// boot loud in the logs.
+// healthGate runs the cluster health check as a library call — the
+// operator's health service over the chctl probe (the same code path
+// `chctl health` exercised; the binary is gone, the library remains).
+// Non-Fatal BY DESIGN (the step's Criticality is BestEffort): a reader
+// booting while a peer is down must still join; the WARNING + report
+// make a degraded boot loud in the logs.
 func (b *Boot) healthGate(ctx context.Context) error {
 	if b.Spec.Role == model.RoleKeeper {
 		return nil
 	}
-	// The chctl HealthService wiring is constructed in the app layer
-	// (it needs the probe over the cluster driver); the boot reports
-	// the summary the CLI printed. A thin exec keeps the port boundary
-	// while the library wiring lands — the TODO the conformance suite
-	// covers is replacing this with the direct service call. NOTE
-	// chctl health has no -password-file flag (plain -password only):
-	// the file is read here so the value never hits another process's
-	// argv.
+	// The admin password file is the credentials source (the boot
+	// resolved it in retrieve_passwords); the typed request carries
+	// the value, never an argv.
 	pw, err := os.ReadFile(BootstrapDir + "/admin-password")
 	if err != nil {
 		return fmt.Errorf("read admin password file: %w", err)
 	}
-	// chctl health requires the -host inventory (the same CR-name →
+	// The health check requires the inventory (the same CR-name →
 	// address map the render uses) and refuses to run without it.
-	args := []string{"health",
-		"-cluster", b.Spec.ClusterName,
-		"-user", "admin",
-		"-password", strings.TrimSpace(string(pw)),
-		"-self", b.Identity.Hostname,
-		"-spec", BootstrapDir + "/chi.yaml"}
-	if b.Spec.Role != model.RoleKeeper && len(b.Spec.KeeperNodes) > 0 {
-		// chctl health's -keeper takes ONE mntr address (string, not
-		// repeatable — the ensemble's quorum math lives in the keeper
-		// health cron, not here). Pinning the ensemble's entrypoint
-		// exercises the reachability+mntr path; per-member liveness is
-		// the deadline for the dedicated gate. The server fan-out below
-		// still covers every host.
-		args = append(args, "-keeper",
-			fmt.Sprintf("%s.%s:9181", b.Spec.KeeperNodes[0], b.Spec.DNSZoneName))
-	}
 	hosts, note := b.clusterHostsWithSource()
+	if len(hosts) == 0 {
+		return fmt.Errorf("post-boot cluster health check skipped: host inventory is empty")
+	}
 	if note != "" {
 		slog.Warn(note)
 		fmt.Fprintln(os.Stderr, note)
 	}
-	for _, h := range hosts {
-		args = append(args, "-host", h.Name+"="+h.Address)
+	// The keeper check takes ONE mntr address (the ensemble's quorum
+	// math lives in the keeper health cron, not here). Pinning the
+	// ensemble's entrypoint exercises the reachability+mntr path;
+	// per-member liveness is the deadline for the dedicated gate.
+	keeperAddress := ""
+	if len(b.Spec.KeeperNodes) > 0 {
+		keeperAddress = fmt.Sprintf("%s.%s:9181", b.Spec.KeeperNodes[0], b.Spec.DNSZoneName)
 	}
-	out, err := runCommand(ctx, "chctl", args...)
-	fmt.Fprintf(os.Stderr, "chctl health verdict:\n%s\n", out)
+	cr, err := b.LoadCHI(ctx)
 	if err != nil {
-		// Redact: the exec error text echoes the full argv, which
-		// carries the admin password on the -password flag. Never
-		// leak credentials into the boot log.
-		return fmt.Errorf("post-boot cluster health check reported degradation (boot continues; investigate via RUNBOOK_CLUSTER_HEALTH.md): chctl health exited %w", err)
+		return fmt.Errorf("post-boot health check could not load the spec: %w", err)
+	}
+	tables := operator.ExpectedTablesFromCR(cr)
+	svc := NewHealthService(operator.NewHealthProbe(), keeper.NewProbe(), func() []domain.TableRef { return tables })
+	report, err := svc.Check(ctx, HealthRequest{
+		ClusterName:   b.Spec.ClusterName,
+		Hosts:         hosts,
+		Credentials:   domain.Credentials{Username: "admin", Password: strings.TrimSpace(string(pw))},
+		Timeout:       DefaultHealthTimeout,
+		KeeperAddress: keeperAddress,
+		CheckTables:   true,
+		SelfName:      b.Identity.Hostname,
+	})
+	if report != nil {
+		fmt.Fprintf(os.Stderr, "cluster health verdict:\n%s\n", report.FormatHuman())
+	}
+	if err != nil {
+		return fmt.Errorf("post-boot cluster health check reported degradation (boot continues; investigate via RUNBOOK_CLUSTER_HEALTH.md): %w", err)
 	}
 	return nil
 }
@@ -572,13 +574,13 @@ func waitForHTTP(ctx context.Context, url string, attempts int, delaySec int) er
 // user (nil dereference in adaptUser) — the renderer resolves
 // password references at render time and cannot skip them.
 type providerSecrets struct {
-	p chinitport.Provider
+	p port.Provider
 }
 
 // ResolveSecret fetches one secret value by name via the cloud
 // provider's secret source (instance role on AWS, Key Vault on Azure).
 // chinit's Provider interface embeds chctl's port.SecretSource, so the
 // request shape is shared.
-func (a providerSecrets) ResolveSecret(ctx context.Context, request chctlport.SecretRequest) (string, error) {
+func (a providerSecrets) ResolveSecret(ctx context.Context, request port.SecretRequest) (string, error) {
 	return a.p.GetSecretValue(ctx, request)
 }

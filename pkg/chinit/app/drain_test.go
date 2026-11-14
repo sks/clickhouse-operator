@@ -24,9 +24,9 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	chctlport "github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
-	chinitport "github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/infra/clusterops"
 )
 
 // This suite pins the first-class `chinit drain` subcommand (A4): the
@@ -79,18 +79,18 @@ func (f *fakeRunner) lines() []string {
 // the ones they care about.
 type drainProvider struct {
 	name    string
-	lister  chinitport.LeaseLister
-	claimer chinitport.OrdinalClaimer
-	dns     chinitport.DNSRegistrar
+	lister  port.LeaseLister
+	claimer port.OrdinalClaimer
+	dns     port.DNSRegistrar
 }
 
 func (p *drainProvider) Name() string { return p.name }
 
-func (p *drainProvider) Metadata(context.Context) (chinitport.InstanceMetadata, error) {
-	return chinitport.InstanceMetadata{}, nil
+func (p *drainProvider) Metadata(context.Context) (port.InstanceMetadata, error) {
+	return port.InstanceMetadata{}, nil
 }
 
-func (p *drainProvider) GetSecretValue(context.Context, chctlport.SecretRequest) (string, error) {
+func (p *drainProvider) GetSecretValue(context.Context, port.SecretRequest) (string, error) {
 	return "", nil
 }
 
@@ -98,19 +98,19 @@ func (p *drainProvider) FetchBundle(context.Context, model.ConfigBundle, string)
 	return nil, nil
 }
 
-func (p *drainProvider) ListActiveClaims(ctx context.Context, req chinitport.ListClaimsRequest) ([]chinitport.Claim, error) {
+func (p *drainProvider) ListActiveClaims(ctx context.Context, req port.ListClaimsRequest) ([]port.Claim, error) {
 	return p.lister.ListActiveClaims(ctx, req)
 }
 
-func (p *drainProvider) ClaimOrdinal(ctx context.Context, req chinitport.ClaimRequest) (int, error) {
+func (p *drainProvider) ClaimOrdinal(ctx context.Context, req port.ClaimRequest) (int, error) {
 	return p.claimer.ClaimOrdinal(ctx, req)
 }
 
-func (p *drainProvider) RenewLease(ctx context.Context, req chinitport.RenewRequest) error {
+func (p *drainProvider) RenewLease(ctx context.Context, req port.RenewRequest) error {
 	return p.claimer.RenewLease(ctx, req)
 }
 
-func (p *drainProvider) ReleaseLease(ctx context.Context, req chinitport.ReleaseRequest) error {
+func (p *drainProvider) ReleaseLease(ctx context.Context, req port.ReleaseRequest) error {
 	return p.claimer.ReleaseLease(ctx, req)
 }
 
@@ -118,11 +118,11 @@ func (p *drainProvider) ResolveZoneID(ctx context.Context, zone string) (string,
 	return p.dns.ResolveZoneID(ctx, zone)
 }
 
-func (p *drainProvider) UpsertARecord(ctx context.Context, req chinitport.ARecordRequest) error {
+func (p *drainProvider) UpsertARecord(ctx context.Context, req port.ARecordRequest) error {
 	return p.dns.UpsertARecord(ctx, req)
 }
 
-func (p *drainProvider) DeleteARecord(ctx context.Context, req chinitport.ARecordRequest) error {
+func (p *drainProvider) DeleteARecord(ctx context.Context, req port.ARecordRequest) error {
 	return p.dns.DeleteARecord(ctx, req)
 }
 
@@ -135,11 +135,11 @@ type bareProvider struct {
 
 func (p *bareProvider) Name() string { return p.providerName }
 
-func (p *bareProvider) Metadata(context.Context) (chinitport.InstanceMetadata, error) {
-	return chinitport.InstanceMetadata{}, nil
+func (p *bareProvider) Metadata(context.Context) (port.InstanceMetadata, error) {
+	return port.InstanceMetadata{}, nil
 }
 
-func (p *bareProvider) GetSecretValue(context.Context, chctlport.SecretRequest) (string, error) {
+func (p *bareProvider) GetSecretValue(context.Context, port.SecretRequest) (string, error) {
 	return "", nil
 }
 
@@ -151,36 +151,101 @@ func (p *bareProvider) FetchBundle(context.Context, model.ConfigBundle, string) 
 // renewals the lease-renew subcommand drives through the same
 // capability seam.
 type drainClaimer struct {
-	releases []chinitport.ReleaseRequest
-	renews   []chinitport.RenewRequest
+	releases []port.ReleaseRequest
+	renews   []port.RenewRequest
 }
 
-func (c *drainClaimer) ClaimOrdinal(context.Context, chinitport.ClaimRequest) (int, error) {
+func (c *drainClaimer) ClaimOrdinal(context.Context, port.ClaimRequest) (int, error) {
 	return 0, nil
 }
 
-func (c *drainClaimer) RenewLease(_ context.Context, req chinitport.RenewRequest) error {
+func (c *drainClaimer) RenewLease(_ context.Context, req port.RenewRequest) error {
 	c.renews = append(c.renews, req)
 	return nil
 }
 
-func (c *drainClaimer) ReleaseLease(_ context.Context, req chinitport.ReleaseRequest) error {
+func (c *drainClaimer) ReleaseLease(_ context.Context, req port.ReleaseRequest) error {
 	c.releases = append(c.releases, req)
 	return nil
 }
 
 // drainDNS records the A-record delete.
 type drainDNS struct {
-	deletes []chinitport.ARecordRequest
+	deletes []port.ARecordRequest
 }
 
 func (d *drainDNS) ResolveZoneID(context.Context, string) (string, error) { return "z-1", nil }
 
-func (d *drainDNS) UpsertARecord(context.Context, chinitport.ARecordRequest) error { return nil }
+func (d *drainDNS) UpsertARecord(context.Context, port.ARecordRequest) error { return nil }
 
-func (d *drainDNS) DeleteARecord(_ context.Context, req chinitport.ARecordRequest) error {
+func (d *drainDNS) DeleteARecord(_ context.Context, req port.ARecordRequest) error {
 	d.deletes = append(d.deletes, req)
 	return nil
+}
+
+
+// fakeClusterOps records the clusterOps calls the subcommands make so
+// the specs assert on the typed requests instead of any argv. The
+// zero value is ready to use; setting dropErr/gcErr/failRunOn drives
+// the failure paths.
+type fakeClusterOps struct {
+	calls   []recordedClusterOp
+	dropErr error
+	// gcErrs is a per-call sequence of errors for GcReplica: nil entry
+	// = success. A short slice is padded with nils (remaining calls succeed).
+	gcErrs  []error
+	gcCallCount int
+}
+
+type recordedClusterOp struct {
+	Op  string
+	Req any
+}
+
+func (f *fakeClusterOps) SyncSchema(_ context.Context, req clusterops.SyncSchemaRequest) error {
+	f.calls = append(f.calls, recordedClusterOp{Op: "SyncSchema", Req: req})
+	return nil
+}
+func (f *fakeClusterOps) SyncReplica(_ context.Context, req clusterops.SyncReplicaRequest) error {
+	f.calls = append(f.calls, recordedClusterOp{Op: "SyncReplica", Req: req})
+	return nil
+}
+func (f *fakeClusterOps) DropReplica(_ context.Context, req clusterops.DropReplicaRequest) error {
+	f.calls = append(f.calls, recordedClusterOp{Op: "DropReplica", Req: req})
+	return f.dropErr
+}
+func (f *fakeClusterOps) GcReplica(_ context.Context, req clusterops.GcReplicaRequest) (*clusterops.GcResult, error) {
+	f.calls = append(f.calls, recordedClusterOp{Op: "GcReplica", Req: req})
+	idx := f.gcCallCount
+	f.gcCallCount++
+	if idx < len(f.gcErrs) && f.gcErrs[idx] != nil {
+		return nil, f.gcErrs[idx]
+	}
+	return &clusterops.GcResult{Dropped: []string{"stale-host"}}, nil
+}
+func (f *fakeClusterOps) KeeperMntr(context.Context, clusterops.MntrRequest) (string, error) {
+	return "", nil
+}
+func (f *fakeClusterOps) Health(context.Context, clusterops.HealthRequest) (*clusterops.HealthReport, error) {
+	return &clusterops.HealthReport{Healthy: true}, nil
+}
+func (f *fakeClusterOps) gcCalls() []clusterops.GcReplicaRequest {
+	var out []clusterops.GcReplicaRequest
+	for _, c := range f.calls {
+		if c.Op == "GcReplica" {
+			out = append(out, c.Req.(clusterops.GcReplicaRequest))
+		}
+	}
+	return out
+}
+func (f *fakeClusterOps) dropCalls() []clusterops.DropReplicaRequest {
+	var out []clusterops.DropReplicaRequest
+	for _, c := range f.calls {
+		if c.Op == "DropReplica" {
+			out = append(out, c.Req.(clusterops.DropReplicaRequest))
+		}
+	}
+	return out
 }
 
 // drainSpec is the fixture bundle spec the slot arithmetic reads:
@@ -205,6 +270,7 @@ type drainFakes struct {
 	lister  *fakeJobLister
 	claimer *drainClaimer
 	dns     *drainDNS
+	ops     *fakeClusterOps
 }
 
 // drainFixtures installs the runner, spec, password and provider
@@ -219,11 +285,14 @@ func drainFixtures() (*drainFakes, func()) {
 		lister:  &fakeJobLister{},
 		claimer: &drainClaimer{},
 		dns:     &drainDNS{},
+		ops:     &fakeClusterOps{},
 	}
 	origRun := runCommand
 	runCommand = f.runner.run
+	origOps := clusterOps
+	clusterOps = f.ops
 	origBuild := buildProvider
-	buildProvider = func(string) (chinitport.Provider, error) {
+	buildProvider = func(string) (port.Provider, error) {
 		return &drainProvider{name: "aws", lister: f.lister, claimer: f.claimer, dns: f.dns}, nil
 	}
 
@@ -244,10 +313,22 @@ func drainFixtures() (*drainFakes, func()) {
 
 	return f, func() {
 		runCommand = origRun
+		clusterOps = origOps
 		buildProvider = origBuild
 		inventorySpecPath = origSpec
 		adminPasswordPath = origPassword
 	}
+}
+
+// hostPairs renders a ClusterRequest host list as ["01-0=addr", ...]
+// so the specs assert the inventory shape without reaching into the
+// struct. Order follows the request's construction order.
+func hostPairs(hosts []clusterops.Host) []string {
+	out := make([]string, 0, len(hosts))
+	for _, h := range hosts {
+		out = append(out, h.Name+"="+h.Address)
+	}
+	return out
 }
 
 // drainer builds a writer-1 nodeState — the node the ASG termination
@@ -290,7 +371,7 @@ var _ = Describe("drain peer selection", func() {
 
 	Context("writer-0 is live", func() {
 		It("prefers writer-0", func() {
-			lister.claims = []chinitport.Claim{
+			lister.claims = []port.Claim{
 				{Hostname: "writer-1"}, // self
 				{Hostname: "writer-0"},
 				{Hostname: "writer-3"},
@@ -304,7 +385,7 @@ var _ = Describe("drain peer selection", func() {
 		It("picks the lowest live writer ordinal", func() {
 			// Scan order deliberately unsorted; ordinals 10 vs 2
 			// catch a lexical sort picking the wrong "lowest".
-			lister.claims = []chinitport.Claim{
+			lister.claims = []port.Claim{
 				{Hostname: "writer-10"},
 				{Hostname: "writer-2"},
 				{Hostname: "writer-5"},
@@ -315,7 +396,7 @@ var _ = Describe("drain peer selection", func() {
 		It("excludes self from the candidates", func() {
 			// Draining writer-1 while ONLY writer-1 is live among
 			// writers: the peer cannot be self — the readers answer.
-			lister.claims = []chinitport.Claim{
+			lister.claims = []port.Claim{
 				{Hostname: "writer-1"},
 				{Hostname: "reader-0"},
 			}
@@ -338,7 +419,7 @@ var _ = Describe("drain peer selection", func() {
 				CRName:      "01-0",
 				LeaseTable:  "node-claims",
 			}}
-			lister.claims = []chinitport.Claim{
+			lister.claims = []port.Claim{
 				{Hostname: "writer-0"}, // self, first in scan order
 				{Hostname: "writer-2"},
 				{Hostname: "writer-1"},
@@ -349,7 +430,7 @@ var _ = Describe("drain peer selection", func() {
 
 	Context("only readers live (last-writer scale-in)", func() {
 		It("picks the lowest-ordinal reader — a full replica carries the drop", func() {
-			lister.claims = []chinitport.Claim{
+			lister.claims = []port.Claim{
 				{Hostname: "reader-3"},
 				{Hostname: "reader-0"},
 			}
@@ -381,7 +462,7 @@ var _ = Describe("drain peer selection", func() {
 
 	Context("stale rows beyond the ceiling", func() {
 		It("ignores writer claims at or beyond writer_max", func() {
-			lister.claims = []chinitport.Claim{
+			lister.claims = []port.Claim{
 				{Hostname: "writer-4"}, // == ceiling: no slot
 				{Hostname: "writer-9"}, // beyond ceiling
 				{Hostname: "reader-1"},
@@ -402,7 +483,7 @@ var _ = Describe("drain", func() {
 
 	It("runs the hook's full sequence against a live writer-0 peer", func() {
 		st := drainer()
-		f.lister.claims = []chinitport.Claim{
+		f.lister.claims = []port.Claim{
 			{Hostname: "writer-0"},
 			{Hostname: "writer-1"}, // self
 		}
@@ -413,20 +494,25 @@ var _ = Describe("drain", func() {
 		})).To(Succeed())
 
 		// The sequence the hook Lambda relies on, in order: stop
-		// queues, stop sends, peer drop on the LIVE writer-0 (its CR
-		// slot flag 01-0 plus self's 01-1, admin credentials, self's
-		// hostname), then the graceful shutdown. DNS + lease release
-		// run between drop and shutdown — pinned via the capability
-		// recorders below, not the exec order.
+		// queues, stop sends, peer drop on the LIVE writer-0 (self
+		// plus the peer's CR slot), then the graceful shutdown. DNS +
+		// lease release run between drop and shutdown — pinned via the
+		// capability recorders below, not the exec order.
 		Expect(f.runner.lines()).To(Equal([]string{
 			"clickhouse-client --query SYSTEM STOP REPLICATION QUEUES",
 			"clickhouse-client --query SYSTEM STOP DISTRIBUTED SENDS",
-			"chctl replica drop -spec /var/lib/clickhouse-bootstrap/chi.yaml -cluster logexplorer -on writer-0.ch.internal -host 01-0=writer-0.ch.internal -host 01-1=writer-1.ch.internal -user admin -password sekrit writer-1",
 			"clickhouse-client --query SYSTEM SHUTDOWN",
 		}))
+		drops := f.ops.dropCalls()
+		Expect(drops).To(HaveLen(1))
+		Expect(drops[0].RunOn).To(Equal("writer-0.ch.internal"))
+		Expect(drops[0].HostName).To(Equal("writer-1"))
+		Expect(hostPairs(drops[0].Cluster.Hosts)).To(Equal([]string{"01-1=writer-1.ch.internal", "01-0=writer-0.ch.internal"}))
+		Expect(drops[0].Cluster.ClusterName).To(Equal("logexplorer"))
+		Expect(drops[0].Cluster.Credentials.Password).To(Equal("sekrit"))
 
 		// The lease went back to the table.
-		Expect(f.claimer.releases).To(Equal([]chinitport.ReleaseRequest{
+		Expect(f.claimer.releases).To(Equal([]port.ReleaseRequest{
 			{Table: "node-claims", Hostname: "writer-1"},
 		}))
 		// The A record went away.
@@ -437,7 +523,7 @@ var _ = Describe("drain", func() {
 
 	It("drops on a reader peer at the ceiling-offset CR slot", func() {
 		st := drainer()
-		f.lister.claims = []chinitport.Claim{
+		f.lister.claims = []port.Claim{
 			{Hostname: "writer-1"}, // self, alone among writers
 			{Hostname: "reader-2"},
 		}
@@ -445,8 +531,10 @@ var _ = Describe("drain", func() {
 
 		Expect(drain(context.Background(), st, provider, drainOptions{DeadlineSeconds: 240, Reason: drainReasonSpot})).To(Succeed())
 		// Reader-2's CR slot is writerCeiling+2 = 01-6 (writer_max 4).
-		Expect(f.runner.lines()).To(ContainElement(
-			"chctl replica drop -spec /var/lib/clickhouse-bootstrap/chi.yaml -cluster logexplorer -on reader-2.ch.internal -host 01-6=reader-2.ch.internal -host 01-1=writer-1.ch.internal -user admin -password sekrit writer-1"))
+		drops := f.ops.dropCalls()
+		Expect(drops).To(HaveLen(1))
+		Expect(drops[0].RunOn).To(Equal("reader-2.ch.internal"))
+		Expect(hostPairs(drops[0].Cluster.Hosts)).To(Equal([]string{"01-1=writer-1.ch.internal", "01-6=reader-2.ch.internal"}))
 	})
 
 	It("drops on the lowest live writer at its own CR slot when writer-0 is gone", func() {
@@ -454,7 +542,7 @@ var _ = Describe("drain", func() {
 		// already terminated; the drain must reach writer-2's slot
 		// (01-2), not a dead 01-0.
 		st := drainer()
-		f.lister.claims = []chinitport.Claim{
+		f.lister.claims = []port.Claim{
 			{Hostname: "writer-1"}, // self
 			{Hostname: "writer-5"},
 			{Hostname: "writer-2"},
@@ -462,8 +550,10 @@ var _ = Describe("drain", func() {
 		provider := &drainProvider{name: "aws", lister: f.lister, claimer: f.claimer, dns: f.dns}
 
 		Expect(drain(context.Background(), st, provider, drainOptions{DeadlineSeconds: 240, Reason: drainReasonTerminationHook})).To(Succeed())
-		Expect(f.runner.lines()).To(ContainElement(
-			"chctl replica drop -spec /var/lib/clickhouse-bootstrap/chi.yaml -cluster logexplorer -on writer-2.ch.internal -host 01-2=writer-2.ch.internal -host 01-1=writer-1.ch.internal -user admin -password sekrit writer-1"))
+		drops := f.ops.dropCalls()
+		Expect(drops).To(HaveLen(1))
+		Expect(drops[0].RunOn).To(Equal("writer-2.ch.internal"))
+		Expect(hostPairs(drops[0].Cluster.Hosts)).To(Equal([]string{"01-1=writer-1.ch.internal", "01-2=writer-2.ch.internal"}))
 	})
 
 	It("attempts the full ordered sequence inside a 1-second budget", func() {
@@ -475,7 +565,7 @@ var _ = Describe("drain", func() {
 		// CommandContext mid-phase; the fake runner here is instant,
 		// so this spec pins the ORDERING contract, not timing.)
 		st := drainer()
-		f.lister.claims = []chinitport.Claim{
+		f.lister.claims = []port.Claim{
 			{Hostname: "writer-0"},
 			{Hostname: "writer-1"}, // self
 		}
@@ -488,18 +578,19 @@ var _ = Describe("drain", func() {
 		Expect(f.runner.lines()).To(Equal([]string{
 			"clickhouse-client --query SYSTEM STOP REPLICATION QUEUES",
 			"clickhouse-client --query SYSTEM STOP DISTRIBUTED SENDS",
-			"chctl replica drop -spec /var/lib/clickhouse-bootstrap/chi.yaml -cluster logexplorer -on writer-0.ch.internal -host 01-0=writer-0.ch.internal -host 01-1=writer-1.ch.internal -user admin -password sekrit writer-1",
 			"clickhouse-client --query SYSTEM SHUTDOWN",
 		}), "the short budget must not silently truncate the sequence")
+		Expect(f.ops.dropCalls()).To(HaveLen(1), "the peer drop still runs inside the budget")
 	})
 
 	It("falls back to the local drop when the peer drop fails", func() {
 		st := drainer()
-		f.lister.claims = []chinitport.Claim{{Hostname: "writer-0"}}
+		f.lister.claims = []port.Claim{{Hostname: "writer-0"}}
 		provider := &drainProvider{name: "aws", lister: f.lister, claimer: f.claimer, dns: f.dns}
-		f.runner.chctlFails = true
+		f.ops.dropErr = fmt.Errorf("peer unreachable")
 
 		Expect(drain(context.Background(), st, provider, drainOptions{DeadlineSeconds: 240, Reason: drainReasonSpot})).To(Succeed())
+		Expect(f.ops.dropCalls()).To(HaveLen(1))
 		Expect(f.runner.lines()).To(ContainElement(
 			"clickhouse-client --query SYSTEM DROP REPLICA 'writer-1'"))
 		// The sequence still finishes: shutdown after the fallback.
@@ -512,8 +603,10 @@ var _ = Describe("drain", func() {
 
 		Expect(drain(context.Background(), st, provider, drainOptions{DeadlineSeconds: 240, Reason: drainReasonSpot})).To(Succeed())
 		// The hardcoded fallback peer still gets the drop attempt.
-		Expect(f.runner.lines()).To(ContainElement(
-			"chctl replica drop -spec /var/lib/clickhouse-bootstrap/chi.yaml -cluster logexplorer -on writer-0.ch.internal -host 01-0=writer-0.ch.internal -host 01-1=writer-1.ch.internal -user admin -password sekrit writer-1"))
+		drops := f.ops.dropCalls()
+		Expect(drops).To(HaveLen(1))
+		Expect(drops[0].RunOn).To(Equal("writer-0.ch.internal"))
+		Expect(hostPairs(drops[0].Cluster.Hosts)).To(Equal([]string{"01-1=writer-1.ch.internal", "01-0=writer-0.ch.internal"}))
 		// And the sequence still finishes — best-effort by contract.
 		Expect(f.runner.lines()).To(ContainElement("clickhouse-client --query SYSTEM SHUTDOWN"))
 	})
@@ -545,15 +638,10 @@ var _ = Describe("runDrain", func() {
 		// table degrades to.
 		lines := f.runner.lines()
 		Expect(lines).To(ContainElement("clickhouse-client --query SYSTEM STOP REPLICATION QUEUES"))
-		drop := ""
-		for _, l := range lines {
-			if strings.HasPrefix(l, "chctl replica drop ") {
-				drop = l
-			}
-		}
-		Expect(drop).NotTo(BeEmpty(), "the entry reached the peer-drop phase")
-		Expect(drop).To(ContainSubstring("-on writer-0.ch.internal"), "the fallback peer")
-		Expect(drop).To(HaveSuffix(" writer-1"), "the identity reloaded from the state file")
+		drops := f.ops.dropCalls()
+		Expect(drops).NotTo(BeEmpty(), "the entry reached the peer-drop phase")
+		Expect(drops[0].RunOn).To(Equal("writer-0.ch.internal"), "the fallback peer")
+		Expect(drops[0].HostName).To(Equal("writer-1"), "the identity reloaded from the state file")
 	})
 
 	It("defaults the reason to termination-hook", func() {

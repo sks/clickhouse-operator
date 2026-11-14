@@ -57,7 +57,7 @@ bundle, and resolve secrets:
 type Provider interface {
     Name() string
     MetadataProvider          // instance id, region, private IP
-    port.SecretSource         // the same secrets port chctl uses
+    port.SecretSource         // the same secrets port the cluster ops use
     ConfigSource              // SHA-gated bundle fetch
 }
 ```
@@ -93,7 +93,7 @@ architecture's spine (`pkg/chinit/domain/service/steps.go`):
 |---|------|------|--------|-------------------------|
 | 1 | `fetch_config_bundle` | Critical | apiRetry | S3/Blob fetch of the XMLs + chi.yaml + keeper.yaml; the SHA256 gate is Fatal (a stale hash means the spec does not vouch for these bytes) |
 | 2 | `os_optimizations` | Critical | onceFatal | THP off, limits, sysctls — convergent probes first |
-| 3 | `require_binaries` | Critical | onceFatal | chctl + clickhouse present; the `aws` CLI check is cloud-gated (an Azure node never has it) |
+| 3 | `require_binaries` | Critical | onceFatal | clickhouse binaries present; the `aws` CLI check is cloud-gated (an Azure node never has it) |
 | 4 | `mount_data_disks` | Critical | bootWait | mount by LABEL (NVMe renames device paths); ownership; the keeper state dirs prepared and chowned |
 | 5 | `install_static_configs` | Critical | onceFatal | the bundle's XMLs → `/etc/clickhouse-server/config.d` |
 | 6 | `settle_identity` | Critical | claimSweep | the identity contract (below); persists immediately |
@@ -101,11 +101,11 @@ architecture's spine (`pkg/chinit/domain/service/steps.go`):
 | 8 | `retrieve_passwords` | Critical | apiRetry | secrets → 0600 files; values never enter state or logs |
 | 9 | `configure_tls` | Critical | apiRetry | TLS material from the cloud store, or self-signed interserver-only when no secrets are configured |
 | 10 | `configure_server_env` | Critical | onceFatal | `/etc/default/clickhouse-server` + the systemd drop-in; `storage.xml`'s `from_env` endpoint is a start requirement (Code 36), not a warning |
-| 11 | `render_node_config` | Critical | onceFatal | the whole node config through chctl's library (below) |
+| 11 | `render_node_config` | Critical | onceFatal | the whole node config through the in-process render library (below) |
 | 12 | `configure_keeper` | BestEffort | onceFatal | keeper nodes: single-file render + myid/raft-id discipline + service enable; no-ops for others |
 | 13 | `write_node_env` | BestEffort | onceFatal | the shell-contract file for anything not yet on typed state |
 | 14 | `start_clickhouse` | Critical | onceFatal | enable, start, wait for `/ping`, S3-disk health probe; keepers return immediately |
-| 15 | `health_gate` | BestEffort | onceFatal | `chctl health` with the CR inventory; non-fatal BY DESIGN so a reader booting while a peer is down still joins |
+| 15 | `health_gate` | BestEffort | onceFatal | the in-process health fan-out with the CR inventory; non-fatal BY DESIGN so a reader booting while a peer is down still joins |
 | 16 | `prometheus_reload` | BestEffort | bootWait | reload + wait for the metrics endpoint; restart fallback |
 | 17 | `install_units` | BestEffort | onceFatal | the recurring-job units (below) |
 | 18 | `configure_backup` | BestEffort | onceFatal | clickhouse-backup config + daily timer (backup replica only) |
@@ -213,12 +213,12 @@ The settled identity persists **immediately** at claim time
 (`PersistIdentity`), before renders and the server start: a crash
 later must not lose it, and the job subcommands read it from state.
 
-## The render path: chctl's library, not its CLI
+## The render path: the library, not a CLI
 
 `render_node_config` and `configure_keeper` do not shell out to
-chctl. They call the same code paths the `chctl` CLI resolves to —
+the library packages in `pkg/chinit/domain/...` —
 `SpecLoader`, `NodeRenderer`, `ConfigRenderer` from
-`pkg/chctl/infra/operator` — as a library:
+`pkg/chinit/infra/operator` — as a library:
 
 ```
 BootSpec ──► LoadCHI/LoadCHK ──► NodeRenderer.RenderNode(...)
@@ -278,12 +278,11 @@ line — logic lives in testable Go:
 | `clickhouse-backup-daily` | `chinit backup-daily` | backup replica | daily 02:00 |
 | `chinit-spot-watch` | `chinit spot-watch` | spot readers | daemon |
 
-Each subcommand is a thin orchestration over the **chctl CLI** for
-cluster operations (`chctl schema sync`, `chctl replica gc`, `chctl
-keeper mntr` — one process per job, typed exit codes, the units'
-contract) and over the provider for cloud operations (lease renewal,
-DNS cleanup). They reload identity from `state.json`; none re-derive
-it.
+Each subcommand is a thin orchestration over the **in-process clusterops port** for
+cluster operations (schema sync, replica sync, replica gc, replica drop, keeper mntr) —
+no subprocess per job, typed errors end to end — and over the provider for
+cloud operations (lease renewal, DNS cleanup). They reload identity from
+`state.json`; none re-derive it.
 
 **Maintenance gating and the GC safety contract.** With ASG writers,
 `writer-0` is a lease ordinal, not a machine — the maintenance timers
@@ -295,12 +294,10 @@ node). The dead-replica GC itself is two passes with an asymmetric
 safety posture: the **reader pass always runs** (`reader-*` — readers
 are disposable, their drain already dropped them authoritatively); the
 **writer pass runs only with liveness data** — it lists the lease
-table's active claims first and passes every live writer as `-exclude`
-to chctl, so a stale-looking registration whose lease is minutes
+table's active claims first and passes every live writer as an exclude entry on the gc request, so a stale-looking registration whose lease is minutes
 fresh (a mid-boot re-join) is reported but never dropped. No
 lease-listing capability or a scan failure skips the writer pass with
-a warning; the reader pass still ran. chctl gained the `-exclude`
-flag for exactly this guard.
+a warning; the reader pass still ran. the gc request carries the exclude set for exactly this guard.
 
 ## The conformance suite: one contract, every cloud
 
@@ -345,13 +342,13 @@ cmd/chinit/main.go               entry point
 pkg/chinit/app/
   app.go                          subcommand dispatch + version
   boot.go                         boot orchestration, provider wiring, state store
-  subcommands.go                  the recurring jobs + the chctl CLI seam
+  subcommands.go                  the recurring jobs; the cluster ops run in-process via the clusterops port
 pkg/chinit/domain/
   model/spec.go                   BootSpec + validation (the data contract)
   port/provider.go                Provider, capabilities, registry, probes
   service/steps.go                the pipeline table, identity, TLS, env
   service/engine.go               retry Do(), state store, shared-state discipline
-  service/render.go               chctl-library renders (node + keeper)
+  service/render.go               in-process library renders (node + keeper)
   service/units.go                unit composition per role
   service/conformance/            the provider contract suite
   fail/                           Retryable/Fatal classification

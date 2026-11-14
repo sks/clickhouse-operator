@@ -20,10 +20,9 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	chctlport "github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/fail"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
-	chinitport "github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 )
 
 // This suite pins the writer-ASG identity/CR-naming contract: CR slots
@@ -36,21 +35,21 @@ import (
 // recordingClaimer is the fake OrdinalClaimer: it records every claim
 // request settleIdentity builds and hands back a canned ordinal.
 type recordingClaimer struct {
-	requests []chinitport.ClaimRequest
+	requests []port.ClaimRequest
 	// ordinal is the canned claim result.
 	ordinal int
 }
 
-func (c *recordingClaimer) ClaimOrdinal(_ context.Context, req chinitport.ClaimRequest) (int, error) {
+func (c *recordingClaimer) ClaimOrdinal(_ context.Context, req port.ClaimRequest) (int, error) {
 	c.requests = append(c.requests, req)
 	return c.ordinal, nil
 }
 
-func (c *recordingClaimer) RenewLease(_ context.Context, _ chinitport.RenewRequest) error {
+func (c *recordingClaimer) RenewLease(_ context.Context, _ port.RenewRequest) error {
 	return nil
 }
 
-func (c *recordingClaimer) ReleaseLease(_ context.Context, _ chinitport.ReleaseRequest) error {
+func (c *recordingClaimer) ReleaseLease(_ context.Context, _ port.ReleaseRequest) error {
 	return nil
 }
 
@@ -64,11 +63,11 @@ type fakeLeaseProvider struct {
 
 func (p *fakeLeaseProvider) Name() string { return "aws" }
 
-func (p *fakeLeaseProvider) Metadata(context.Context) (chinitport.InstanceMetadata, error) {
-	return chinitport.InstanceMetadata{}, nil
+func (p *fakeLeaseProvider) Metadata(context.Context) (port.InstanceMetadata, error) {
+	return port.InstanceMetadata{}, nil
 }
 
-func (p *fakeLeaseProvider) GetSecretValue(context.Context, chctlport.SecretRequest) (string, error) {
+func (p *fakeLeaseProvider) GetSecretValue(context.Context, port.SecretRequest) (string, error) {
 	return "", nil
 }
 
@@ -104,7 +103,7 @@ func newSettleBoot(spec model.BootSpec, claimer *recordingClaimer) *Boot {
 	b := &Boot{
 		Spec:     &spec,
 		Provider: &fakeLeaseProvider{recordingClaimer: claimer},
-		Meta: chinitport.InstanceMetadata{
+		Meta: port.InstanceMetadata{
 			Provider:   "aws",
 			Region:     "us-east-1",
 			InstanceID: "i-ceiling-test",

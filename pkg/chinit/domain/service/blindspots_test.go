@@ -23,10 +23,9 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	chctlport "github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/fail"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
-	chinitport "github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 )
 
 // This file pins the settle-identity blind-spot fixes:
@@ -55,16 +54,16 @@ type recordingPersister struct {
 type dnsRegistrarProvider struct {
 	recorder *recordingClaimer
 	zoneID   string
-	upserts  []chinitport.ARecordRequest
+	upserts  []port.ARecordRequest
 }
 
 func (p *dnsRegistrarProvider) Name() string { return "aws" }
 
-func (p *dnsRegistrarProvider) Metadata(context.Context) (chinitport.InstanceMetadata, error) {
-	return chinitport.InstanceMetadata{}, nil
+func (p *dnsRegistrarProvider) Metadata(context.Context) (port.InstanceMetadata, error) {
+	return port.InstanceMetadata{}, nil
 }
 
-func (p *dnsRegistrarProvider) GetSecretValue(context.Context, chctlport.SecretRequest) (string, error) {
+func (p *dnsRegistrarProvider) GetSecretValue(context.Context, port.SecretRequest) (string, error) {
 	return "", nil
 }
 
@@ -73,15 +72,15 @@ func (p *dnsRegistrarProvider) FetchBundle(context.Context, model.ConfigBundle, 
 }
 
 // Claim capability delegates to the recording claimer.
-func (p *dnsRegistrarProvider) ClaimOrdinal(ctx context.Context, req chinitport.ClaimRequest) (int, error) {
+func (p *dnsRegistrarProvider) ClaimOrdinal(ctx context.Context, req port.ClaimRequest) (int, error) {
 	return p.recorder.ClaimOrdinal(ctx, req)
 }
 
-func (p *dnsRegistrarProvider) RenewLease(ctx context.Context, req chinitport.RenewRequest) error {
+func (p *dnsRegistrarProvider) RenewLease(ctx context.Context, req port.RenewRequest) error {
 	return p.recorder.RenewLease(ctx, req)
 }
 
-func (p *dnsRegistrarProvider) ReleaseLease(ctx context.Context, req chinitport.ReleaseRequest) error {
+func (p *dnsRegistrarProvider) ReleaseLease(ctx context.Context, req port.ReleaseRequest) error {
 	return p.recorder.ReleaseLease(ctx, req)
 }
 
@@ -90,12 +89,12 @@ func (p *dnsRegistrarProvider) ResolveZoneID(context.Context, string) (string, e
 	return p.zoneID, nil
 }
 
-func (p *dnsRegistrarProvider) UpsertARecord(_ context.Context, req chinitport.ARecordRequest) error {
+func (p *dnsRegistrarProvider) UpsertARecord(_ context.Context, req port.ARecordRequest) error {
 	p.upserts = append(p.upserts, req)
 	return nil
 }
 
-func (p *dnsRegistrarProvider) DeleteARecord(context.Context, chinitport.ARecordRequest) error {
+func (p *dnsRegistrarProvider) DeleteARecord(context.Context, port.ARecordRequest) error {
 	return nil
 }
 
@@ -124,7 +123,7 @@ var _ = Describe("settleIdentity blind-spot contracts", func() {
 			Spec:            &spec,
 			Provider:        dns,
 			PersistIdentity: func(id model.NodeIdentity) { persister.calls = append(persister.calls, id) },
-			Meta: chinitport.InstanceMetadata{
+			Meta: port.InstanceMetadata{
 				Provider:   "aws",
 				Region:     "us-east-1",
 				InstanceID: "i-blindspot-test",
@@ -167,7 +166,7 @@ var _ = Describe("settleIdentity blind-spot contracts", func() {
 				Spec:            &spec,
 				Provider:        &fakeLeaseProvider{recordingClaimer: claimer},
 				PersistIdentity: func(id model.NodeIdentity) { persister.calls = append(persister.calls, id) },
-				Meta: chinitport.InstanceMetadata{
+				Meta: port.InstanceMetadata{
 					Provider:   "aws",
 					Region:     "us-east-1",
 					InstanceID: "i-nocap-test",
@@ -190,7 +189,7 @@ var _ = Describe("settleIdentity blind-spot contracts", func() {
 			b := &Boot{
 				Spec:     &spec,
 				Provider: &fakeLeaseProvider{recordingClaimer: claimer},
-				Meta: chinitport.InstanceMetadata{
+				Meta: port.InstanceMetadata{
 					Provider:   "aws",
 					Region:     "us-east-1",
 					InstanceID: "i-empty-table-test",
@@ -242,7 +241,7 @@ var _ = Describe("settleIdentity blind-spot contracts", func() {
 				Spec:            &spec,
 				Provider:        failing,
 				PersistIdentity: func(id model.NodeIdentity) { persister.calls = append(persister.calls, id) },
-				Meta: chinitport.InstanceMetadata{
+				Meta: port.InstanceMetadata{
 					Provider:   "aws",
 					Region:     "us-east-1",
 					InstanceID: "i-dnsfail-test",
@@ -321,11 +320,11 @@ type failingUpsertProvider struct {
 
 func (p *failingUpsertProvider) Name() string { return "aws" }
 
-func (p *failingUpsertProvider) Metadata(context.Context) (chinitport.InstanceMetadata, error) {
-	return chinitport.InstanceMetadata{}, nil
+func (p *failingUpsertProvider) Metadata(context.Context) (port.InstanceMetadata, error) {
+	return port.InstanceMetadata{}, nil
 }
 
-func (p *failingUpsertProvider) GetSecretValue(context.Context, chctlport.SecretRequest) (string, error) {
+func (p *failingUpsertProvider) GetSecretValue(context.Context, port.SecretRequest) (string, error) {
 	return "", nil
 }
 
@@ -333,15 +332,15 @@ func (p *failingUpsertProvider) FetchBundle(context.Context, model.ConfigBundle,
 	return nil, nil
 }
 
-func (p *failingUpsertProvider) ClaimOrdinal(ctx context.Context, req chinitport.ClaimRequest) (int, error) {
+func (p *failingUpsertProvider) ClaimOrdinal(ctx context.Context, req port.ClaimRequest) (int, error) {
 	return p.recorder.ClaimOrdinal(ctx, req)
 }
 
-func (p *failingUpsertProvider) RenewLease(ctx context.Context, req chinitport.RenewRequest) error {
+func (p *failingUpsertProvider) RenewLease(ctx context.Context, req port.RenewRequest) error {
 	return p.recorder.RenewLease(ctx, req)
 }
 
-func (p *failingUpsertProvider) ReleaseLease(ctx context.Context, req chinitport.ReleaseRequest) error {
+func (p *failingUpsertProvider) ReleaseLease(ctx context.Context, req port.ReleaseRequest) error {
 	return p.recorder.ReleaseLease(ctx, req)
 }
 
@@ -349,10 +348,10 @@ func (p *failingUpsertProvider) ResolveZoneID(context.Context, string) (string, 
 	return p.zoneID, nil
 }
 
-func (p *failingUpsertProvider) UpsertARecord(context.Context, chinitport.ARecordRequest) error {
+func (p *failingUpsertProvider) UpsertARecord(context.Context, port.ARecordRequest) error {
 	return fmt.Errorf("route53 throttled")
 }
 
-func (p *failingUpsertProvider) DeleteARecord(context.Context, chinitport.ARecordRequest) error {
+func (p *failingUpsertProvider) DeleteARecord(context.Context, port.ARecordRequest) error {
 	return nil
 }

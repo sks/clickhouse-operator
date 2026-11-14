@@ -21,10 +21,9 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"github.com/altinity/clickhouse-operator/pkg/chctl/domain"
-	chctlport "github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
-	chinitport "github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 )
 
 // This suite pins the live-claims inventory contract (A3): the CR
@@ -37,12 +36,12 @@ import (
 // fakeLeaseLister is the fake LeaseLister: canned claims (or a canned
 // failure) plus a record of the table each call listed.
 type fakeLeaseLister struct {
-	claims []chinitport.Claim
+	claims []port.Claim
 	err    error
 	tables []string
 }
 
-func (f *fakeLeaseLister) ListActiveClaims(_ context.Context, req chinitport.ListClaimsRequest) ([]chinitport.Claim, error) {
+func (f *fakeLeaseLister) ListActiveClaims(_ context.Context, req port.ListClaimsRequest) ([]port.Claim, error) {
 	f.tables = append(f.tables, req.Table)
 	if f.err != nil {
 		return nil, f.err
@@ -59,11 +58,11 @@ type listerProvider struct {
 
 func (p *listerProvider) Name() string { return "aws" }
 
-func (p *listerProvider) Metadata(context.Context) (chinitport.InstanceMetadata, error) {
-	return chinitport.InstanceMetadata{}, nil
+func (p *listerProvider) Metadata(context.Context) (port.InstanceMetadata, error) {
+	return port.InstanceMetadata{}, nil
 }
 
-func (p *listerProvider) GetSecretValue(context.Context, chctlport.SecretRequest) (string, error) {
+func (p *listerProvider) GetSecretValue(context.Context, port.SecretRequest) (string, error) {
 	return "", nil
 }
 
@@ -99,7 +98,7 @@ func newInventoryBoot(spec model.BootSpec, lister *fakeLeaseLister) *Boot {
 	return &Boot{
 		Spec:     &spec,
 		Provider: &listerProvider{fakeLeaseLister: lister},
-		Meta: chinitport.InstanceMetadata{
+		Meta: port.InstanceMetadata{
 			Provider:   "aws",
 			Region:     "us-east-1",
 			InstanceID: "i-inventory-test",
@@ -123,7 +122,7 @@ var _ = Describe("clusterHostsWithSource", func() {
 			// in, lease expired and released), readers 0-1 live.
 			// The scan order is deliberately shuffled: the inventory
 			// must sort by CR slot, not scan order.
-			lister := &fakeLeaseLister{claims: []chinitport.Claim{
+			lister := &fakeLeaseLister{claims: []port.Claim{
 				{Hostname: "reader-1", InstanceID: "i-r1", IP: "10.0.1.41"},
 				{Hostname: "writer-2", InstanceID: "i-w2", IP: "10.0.1.12"},
 				{Hostname: "writer-0", InstanceID: "i-w0", IP: "10.0.1.10"},
@@ -147,7 +146,7 @@ var _ = Describe("clusterHostsWithSource", func() {
 		})
 
 		It("includes THIS node's claim (self is a cluster member)", func() {
-			lister := &fakeLeaseLister{claims: []chinitport.Claim{
+			lister := &fakeLeaseLister{claims: []port.Claim{
 				{Hostname: "writer-0", InstanceID: "i-inventory-test", IP: "10.0.1.50"},
 			}}
 			b := newInventoryBoot(inventoryTestSpec(), lister)
@@ -163,7 +162,7 @@ var _ = Describe("clusterHostsWithSource", func() {
 		It("drops out-of-ceiling stale claims and foreign rows", func() {
 			// writer-4 exceeds WriterMax 4 (a stale row from a shrunk
 			// max); backup-0 is not an ASG claim at all.
-			lister := &fakeLeaseLister{claims: []chinitport.Claim{
+			lister := &fakeLeaseLister{claims: []port.Claim{
 				{Hostname: "writer-0", InstanceID: "i-w0", IP: "10.0.1.10"},
 				{Hostname: "writer-4", InstanceID: "i-w4", IP: "10.0.1.14"},
 				{Hostname: "backup-0", InstanceID: "i-b0", IP: "10.0.1.30"},
@@ -179,7 +178,7 @@ var _ = Describe("clusterHostsWithSource", func() {
 			spec := inventoryTestSpec()
 			spec.WriterHostPrefix = "ingest-"
 			spec.ReaderHostPrefix = "query-"
-			lister := &fakeLeaseLister{claims: []chinitport.Claim{
+			lister := &fakeLeaseLister{claims: []port.Claim{
 				{Hostname: "ingest-0", InstanceID: "i0", IP: "10.0.1.10"},
 				{Hostname: "query-0", InstanceID: "i1", IP: "10.0.1.40"},
 			}}
@@ -259,11 +258,11 @@ type noListerProvider struct{}
 
 func (p *noListerProvider) Name() string { return "azure" }
 
-func (p *noListerProvider) Metadata(context.Context) (chinitport.InstanceMetadata, error) {
-	return chinitport.InstanceMetadata{}, nil
+func (p *noListerProvider) Metadata(context.Context) (port.InstanceMetadata, error) {
+	return port.InstanceMetadata{}, nil
 }
 
-func (p *noListerProvider) GetSecretValue(context.Context, chctlport.SecretRequest) (string, error) {
+func (p *noListerProvider) GetSecretValue(context.Context, port.SecretRequest) (string, error) {
 	return "", nil
 }
 

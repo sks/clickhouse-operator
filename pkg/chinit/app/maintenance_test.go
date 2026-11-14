@@ -177,19 +177,15 @@ dns_zone_name: ch.internal
 })
 
 var _ = Describe("deadReplicaGc", func() {
-	var runner *fakeRunner
+	var ops *fakeClusterOps
 	var lister *fakeJobLister
 
 	BeforeEach(func() {
 		DeferCleanup(maintFixtures())
-		origRun := runCommand
-		runCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
-			_ = ctx
-			runner.commands = append(runner.commands, recordedCommand{Name: name, Args: append([]string{}, args...)})
-			return []byte("ok"), nil
-		}
-		DeferCleanup(func() { runCommand = origRun })
-		runner = &fakeRunner{}
+		origOps := clusterOps
+		ops = &fakeClusterOps{}
+		clusterOps = ops
+		DeferCleanup(func() { clusterOps = origOps })
 		lister = &fakeJobLister{}
 	})
 
@@ -206,12 +202,16 @@ var _ = Describe("deadReplicaGc", func() {
 
 			// Reader pass first (self as the detection peer, no
 			// pattern = the reader-* default); writer pass second
-			// with the writer pattern and one -exclude per LIVE
+			// with the writer pattern and one exclude per LIVE
 			// writer claim (sorted).
-			Expect(runner.lines()).To(Equal([]string{
-				"chctl replica gc -spec /var/lib/clickhouse-bootstrap/chi.yaml -cluster logexplorer -on writer-0 -host 01-0=writer-0.ch.internal -user admin -password sekrit",
-				"chctl replica gc -spec /var/lib/clickhouse-bootstrap/chi.yaml -cluster logexplorer -on writer-0 -host 01-0=writer-0.ch.internal -user admin -password sekrit -name-pattern writer-* -exclude writer-0 -exclude writer-1",
-			}))
+			calls := ops.gcCalls()
+			Expect(calls).To(HaveLen(2))
+			Expect(calls[0].RunOn).To(Equal("writer-0"))
+			Expect(calls[0].NamePattern).To(Equal(""))
+			Expect(calls[0].ExcludeHosts).To(BeEmpty())
+			Expect(calls[1].RunOn).To(Equal("writer-0"))
+			Expect(calls[1].NamePattern).To(Equal("writer-*"))
+			Expect(calls[1].ExcludeHosts).To(Equal([]string{"writer-0", "writer-1"}))
 			// The lease table listed once, from the identity.
 			Expect(lister.tables).To(Equal([]string{"node-claims"}))
 		})
@@ -231,10 +231,9 @@ var _ = Describe("deadReplicaGc", func() {
 			st := maintState(model.RoleWriter, "writer-0")
 
 			Expect(deadReplicaGc(context.Background(), st, nil)).To(Succeed())
-			lines := runner.lines()
-			Expect(lines).To(HaveLen(1), "exactly one chctl call — the reader pass")
-			Expect(lines[0]).To(ContainSubstring("replica gc"))
-			Expect(lines[0]).NotTo(ContainSubstring("-name-pattern"))
+			calls := ops.gcCalls()
+			Expect(calls).To(HaveLen(1), "exactly one gc call — the reader pass")
+			Expect(calls[0].NamePattern).To(BeEmpty())
 		})
 
 		It("skips the writer pass when the claims scan fails", func() {
@@ -242,8 +241,9 @@ var _ = Describe("deadReplicaGc", func() {
 			st := maintState(model.RoleWriter, "writer-0")
 
 			Expect(deadReplicaGc(context.Background(), st, lister)).To(Succeed())
-			Expect(runner.lines()).To(HaveLen(1))
-			Expect(runner.lines()[0]).NotTo(ContainSubstring("-name-pattern"))
+			calls := ops.gcCalls()
+			Expect(calls).To(HaveLen(1))
+			Expect(calls[0].NamePattern).To(BeEmpty())
 		})
 
 		It("skips the writer pass when no lease table is known", func() {
@@ -266,18 +266,15 @@ dns_zone_name: ch.internal
 
 			Expect(deadReplicaGc(context.Background(), st, lister)).To(Succeed())
 			Expect(lister.tables).To(BeEmpty(), "no table known — the lister is never consulted")
-			Expect(runner.lines()).To(HaveLen(1))
-			Expect(runner.lines()[0]).NotTo(ContainSubstring("-name-pattern"))
+			calls := ops.gcCalls()
+			Expect(calls).To(HaveLen(1))
+			Expect(calls[0].NamePattern).To(BeEmpty())
 		})
 	})
 
 	Context("pass failures", func() {
 		It("fails the run when the reader pass fails", func() {
-			origRun := runCommand
-			runCommand = func(context.Context, string, ...string) ([]byte, error) {
-				return []byte("connection refused"), fmt.Errorf("exit status 1")
-			}
-			defer func() { runCommand = origRun }()
+			ops.gcErrs = []error{fmt.Errorf("connection refused")}
 
 			st := maintState(model.RoleWriter, "writer-0")
 			err := deadReplicaGc(context.Background(), st, lister)
@@ -285,16 +282,8 @@ dns_zone_name: ch.internal
 		})
 
 		It("fails the run when the writer pass fails but the reader pass ran", func() {
-			calls := 0
-			origRun := runCommand
-			runCommand = func(_ context.Context, _ string, _ ...string) ([]byte, error) {
-				calls++
-				if calls == 1 {
-					return []byte("ok"), nil // reader pass succeeds
-				}
-				return []byte("peer unreachable"), fmt.Errorf("exit status 3")
-			}
-			defer func() { runCommand = origRun }()
+			// First call (reader pass) succeeds; second (writer pass) fails.
+			ops.gcErrs = []error{nil, fmt.Errorf("peer unreachable")}
 
 			lister.claims = []chinitport.Claim{{Hostname: "writer-0"}}
 			st := maintState(model.RoleWriter, "writer-0")
@@ -305,7 +294,7 @@ dns_zone_name: ch.internal
 })
 
 var _ = Describe("runDeadReplicaGc / runOrphanedGc (the CLI entries)", func() {
-	var runner *fakeRunner
+	var ops *fakeClusterOps
 	var lister *fakeJobLister
 	var statePath string
 
@@ -318,14 +307,12 @@ var _ = Describe("runDeadReplicaGc / runOrphanedGc (the CLI entries)", func() {
 
 	BeforeEach(func() {
 		DeferCleanup(maintFixtures())
-		runner = &fakeRunner{}
+		ops = &fakeClusterOps{}
 		lister = &fakeJobLister{}
-		origRun := runCommand
-		runCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
-			_ = ctx
-			runner.commands = append(runner.commands, recordedCommand{Name: name, Args: append([]string{}, args...)})
-			return []byte("ok"), nil
-		}
+		// The cluster-op seam: the entry calls the in-process port,
+		// not a binary — the fake records the typed request.
+		origOps := clusterOps
+		clusterOps = ops
 		// The provider seam (drain suite's pattern): the entry builds
 		// its lister through buildProvider, and the fake keeps the
 		// registry's real AWS provider (IMDS credential retries) out
@@ -335,7 +322,7 @@ var _ = Describe("runDeadReplicaGc / runOrphanedGc (the CLI entries)", func() {
 			return &drainProvider{name: "aws", lister: lister}, nil
 		}
 		DeferCleanup(func() {
-			runCommand = origRun
+			clusterOps = origOps
 			buildProvider = origBuild
 		})
 
@@ -351,7 +338,7 @@ var _ = Describe("runDeadReplicaGc / runOrphanedGc (the CLI entries)", func() {
 		writeMaintState(model.RoleWriter, "writer-1")
 		Expect(runDeadReplicaGc([]string{"-state", statePath})).To(Succeed())
 		Expect(runOrphanedGc([]string{"-state", statePath})).To(Succeed())
-		Expect(runner.commands).To(BeEmpty(), "neither maintenance job shells out")
+		Expect(ops.calls).To(BeEmpty(), "neither maintenance job reaches the cluster port")
 	})
 
 	It("runs both passes on the ordinal-0 holder with live claims", func() {
@@ -367,11 +354,10 @@ var _ = Describe("runDeadReplicaGc / runOrphanedGc (the CLI entries)", func() {
 		}
 		writeMaintState(model.RoleWriter, "writer-0")
 		Expect(runDeadReplicaGc([]string{"-state", statePath})).To(Succeed())
-		lines := runner.lines()
-		Expect(lines).To(HaveLen(2), "reader pass then writer pass")
-		Expect(lines[1]).To(ContainSubstring("-name-pattern writer-*"))
-		Expect(lines[1]).To(ContainSubstring("-exclude writer-0"))
-		Expect(lines[1]).To(ContainSubstring("-exclude writer-1"))
+		calls := ops.gcCalls()
+		Expect(calls).To(HaveLen(2), "reader pass then writer pass")
+		Expect(calls[1].NamePattern).To(Equal("writer-*"))
+		Expect(calls[1].ExcludeHosts).To(Equal([]string{"writer-0", "writer-1"}))
 		// The claims came from the entry's own provider build, not a
 		// direct lister handoff.
 		Expect(lister.tables).To(Equal([]string{"node-claims"}))
@@ -395,8 +381,9 @@ var _ = Describe("runDeadReplicaGc / runOrphanedGc (the CLI entries)", func() {
 		log := captureStderr(func() {
 			Expect(runDeadReplicaGc([]string{"-state", statePath})).To(Succeed())
 		})
-		Expect(runner.lines()).To(HaveLen(1), "exactly one chctl call — the reader pass")
-		Expect(runner.lines()[0]).NotTo(ContainSubstring("-name-pattern"))
+		calls := ops.gcCalls()
+		Expect(calls).To(HaveLen(1), "exactly one gc call — the reader pass")
+		Expect(calls[0].NamePattern).To(BeEmpty())
 		Expect(log).To(ContainSubstring("WARNING"))
 		Expect(log).To(ContainSubstring("skipping the writer GC pass"))
 		Expect(log).To(ContainSubstring("no lease-listing capability"))
@@ -405,7 +392,6 @@ var _ = Describe("runDeadReplicaGc / runOrphanedGc (the CLI entries)", func() {
 	It("runs the orphaned census on the ordinal-0 holder", func() {
 		writeMaintState(model.RoleWriter, "writer-0")
 		Expect(runOrphanedGc([]string{"-state", statePath})).To(Succeed())
-		Expect(runner.lines()).To(HaveLen(1))
-		Expect(runner.lines()[0]).To(ContainSubstring("-orphaned-only"))
+		Expect(ops.calls).To(BeEmpty(), "orphaned-gc is a documented no-op; it reaches no cluster port")
 	})
 })

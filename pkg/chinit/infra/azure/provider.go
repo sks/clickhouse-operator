@@ -28,8 +28,7 @@ import (
 	"fmt"
 	"net/http"
 
-	chctlport "github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
-	chinitport "github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
 )
 
@@ -40,9 +39,9 @@ type Provider struct {
 
 	meta            *IMDSMetadata
 	secrets         *KeyVaultSource
-	secretsOverride chctlport.SecretSource
+	secretsOverride port.SecretSource
 	bundle          *BlobBundleSource
-	bundleOverride  chinitport.ConfigSource
+	bundleOverride  port.ConfigSource
 	claims          *TableClaimer
 	dns             *PrivateDNS
 	spot    *ScheduledEventsWatcher
@@ -50,14 +49,14 @@ type Provider struct {
 
 // Compile-time capability checks.
 var (
-	_ chinitport.Provider       = (*Provider)(nil)
-	_ chinitport.OrdinalClaimer = (*Provider)(nil)
-	_ chinitport.DNSRegistrar   = (*Provider)(nil)
-	_ chinitport.SpotSignals     = (*Provider)(nil)
+	_ port.Provider       = (*Provider)(nil)
+	_ port.OrdinalClaimer = (*Provider)(nil)
+	_ port.DNSRegistrar   = (*Provider)(nil)
+	_ port.SpotSignals     = (*Provider)(nil)
 )
 
 // New builds the Azure provider.
-func New(cfg chinitport.Config) chinitport.Provider {
+func New(cfg port.Config) port.Provider {
 	region := cfg.Region
 	if region == "" && cfg.Spec != nil {
 		region = cfg.Spec.Region
@@ -78,19 +77,19 @@ func (p *Provider) Name() string { return "azure" }
 // WithIMDSClient injects a metadata HTTP client (conformance tests).
 func (p *Provider) WithIMDSClient(c interface {
 	Do(req *http.Request) (*http.Response, error)
-}) chinitport.Provider {
+}) port.Provider {
 	p.meta = p.meta.WithClient(c)
 	return p
 }
 
 // Metadata probes the Azure IMDS.
-func (p *Provider) Metadata(ctx context.Context) (chinitport.InstanceMetadata, error) {
+func (p *Provider) Metadata(ctx context.Context) (port.InstanceMetadata, error) {
 	return p.meta.Get(ctx)
 }
 
 // GetSecretValue resolves a Key Vault secret (managed identity), or
 // the test-injected override when present.
-func (p *Provider) GetSecretValue(ctx context.Context, request chctlport.SecretRequest) (string, error) {
+func (p *Provider) GetSecretValue(ctx context.Context, request port.SecretRequest) (string, error) {
 	if p.secretsOverride != nil {
 		return p.secretsOverride.GetSecretValue(ctx, request)
 	}
@@ -98,13 +97,13 @@ func (p *Provider) GetSecretValue(ctx context.Context, request chctlport.SecretR
 }
 
 // WithSecrets overrides the secret source (conformance tests).
-func (p *Provider) WithSecrets(s chctlport.SecretSource) chinitport.Provider {
+func (p *Provider) WithSecrets(s port.SecretSource) port.Provider {
 	p.secretsOverride = s
 	return p
 }
 
 // WithBundle overrides the config-bundle fetcher (conformance tests).
-func (p *Provider) WithBundle(c chinitport.ConfigSource) chinitport.Provider {
+func (p *Provider) WithBundle(c port.ConfigSource) port.Provider {
 	p.bundleOverride = c
 	return p
 }
@@ -118,17 +117,17 @@ func (p *Provider) FetchBundle(ctx context.Context, bundle model.ConfigBundle, d
 }
 
 // ClaimOrdinal claims a reader ordinal via Table Storage.
-func (p *Provider) ClaimOrdinal(ctx context.Context, req chinitport.ClaimRequest) (int, error) {
+func (p *Provider) ClaimOrdinal(ctx context.Context, req port.ClaimRequest) (int, error) {
 	return p.claims.Claim(ctx, req)
 }
 
 // RenewLease extends the node's lease.
-func (p *Provider) RenewLease(ctx context.Context, req chinitport.RenewRequest) error {
+func (p *Provider) RenewLease(ctx context.Context, req port.RenewRequest) error {
 	return p.claims.Renew(ctx, req)
 }
 
 // ReleaseLease drops the node's claim.
-func (p *Provider) ReleaseLease(ctx context.Context, req chinitport.ReleaseRequest) error {
+func (p *Provider) ReleaseLease(ctx context.Context, req port.ReleaseRequest) error {
 	return p.claims.Release(ctx, req)
 }
 
@@ -138,17 +137,17 @@ func (p *Provider) ResolveZoneID(ctx context.Context, zoneName string) (string, 
 }
 
 // UpsertARecord creates or replaces the node's A record.
-func (p *Provider) UpsertARecord(ctx context.Context, req chinitport.ARecordRequest) error {
+func (p *Provider) UpsertARecord(ctx context.Context, req port.ARecordRequest) error {
 	return p.dns.UpsertARecord(ctx, req)
 }
 
 // DeleteARecord removes the node's A record.
-func (p *Provider) DeleteARecord(ctx context.Context, req chinitport.ARecordRequest) error {
+func (p *Provider) DeleteARecord(ctx context.Context, req port.ARecordRequest) error {
 	return p.dns.DeleteARecord(ctx, req)
 }
 
 // Watch polls scheduled events for the Preempt document.
-func (p *Provider) Watch(ctx context.Context) <-chan chinitport.InterruptionNotice {
+func (p *Provider) Watch(ctx context.Context) <-chan port.InterruptionNotice {
 	return p.spot.Watch(ctx)
 }
 

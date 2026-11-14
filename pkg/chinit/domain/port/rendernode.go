@@ -18,7 +18,7 @@ import (
 	"context"
 	"os"
 
-	"github.com/altinity/clickhouse-operator/pkg/chctl/domain"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain"
 )
 
 // NodeRenderer renders and installs ONE node's complete configuration set

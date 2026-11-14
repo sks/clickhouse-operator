@@ -21,11 +21,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/altinity/clickhouse-operator/pkg/chctl/domain"
-	chctlport "github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
-	chctlops "github.com/altinity/clickhouse-operator/pkg/chctl/infra/operator"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
-	chinitport "github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/infra/operator"
 )
 
 // Paths the boot pipeline owns (mirrors the bash script's constants).
@@ -57,9 +56,9 @@ const (
 // the server start, and the health gate is non-fatal by design.
 type Boot struct {
 	Spec     *model.BootSpec
-	Provider chinitport.Provider
+	Provider port.Provider
 	// Meta is the probed instance metadata (fetched once, reused).
-	Meta chinitport.InstanceMetadata
+	Meta port.InstanceMetadata
 
 	// Identity is filled by the identity step; later steps and the
 	// node-env writer read it.
@@ -196,8 +195,8 @@ func (b *Boot) LoadCHI(ctx context.Context) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read chi.yaml: %w", err)
 	}
-	loader := chctlops.NewSpecLoader()
-	cr, err := loader.LoadCHI(ctx, chctlport.LoadCHIRequest{
+	loader := operator.NewSpecLoader()
+	cr, err := loader.LoadCHI(ctx, port.LoadCHIRequest{
 		Spec: domain.SpecReference{
 			Name: b.Spec.ClusterName,
 			Data: data,
@@ -216,8 +215,8 @@ func (b *Boot) LoadCHK(ctx context.Context) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read keeper.yaml: %w", err)
 	}
-	loader := chctlops.NewSpecLoader()
-	cr, err := loader.LoadCHK(ctx, chctlport.LoadCHKRequest{
+	loader := operator.NewSpecLoader()
+	cr, err := loader.LoadCHK(ctx, port.LoadCHKRequest{
 		Spec: domain.SpecReference{
 			Name: b.Spec.ClusterName,
 			Data: data,

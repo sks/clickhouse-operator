@@ -20,7 +20,7 @@ import (
 	"os"
 	"path/filepath"
 
-	chctlport "github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
 )
 
@@ -33,7 +33,7 @@ type SecretSource struct {
 // GetSecretValue serves the canned value; unknown names error loudly
 // (mirrors the real stores' behavior — a typo'd secret name must fail
 // the boot, not write an empty password).
-func (s *SecretSource) GetSecretValue(_ context.Context, request chctlport.SecretRequest) (string, error) {
+func (s *SecretSource) GetSecretValue(_ context.Context, request port.SecretRequest) (string, error) {
 	value, ok := s.Values[request.Name]
 	if !ok {
 		return "", fmt.Errorf("secret %q not found in fake", request.Name)

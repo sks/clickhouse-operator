@@ -225,11 +225,11 @@ var _ = Describe("OSTuner.RequireBinaries", func() {
 		// LookPath finds nothing on a stripped PATH.
 		GinkgoT().Setenv("PATH", "/nonexistent")
 		tuner := NewOSTuner(newFakeRunner())
-		err := tuner.RequireBinaries(context.Background(), []string{"clickhouse-server", "chctl"})
+		err := tuner.RequireBinaries(context.Background(), []string{"clickhouse-server", "chinit-helper"})
 		Expect(err).To(HaveOccurred())
 		Expect(fail.IsFatal(err)).To(BeTrue())
 		Expect(err.Error()).To(ContainSubstring("clickhouse-server"))
-		Expect(err.Error()).To(ContainSubstring("chctl"))
+		Expect(err.Error()).To(ContainSubstring("chinit-helper"))
 		Expect(err.Error()).To(ContainSubstring("golden AMI"))
 	})
 })

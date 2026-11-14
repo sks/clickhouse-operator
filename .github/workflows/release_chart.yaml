@@ -15,9 +15,9 @@ jobs:
   release_chart:
     name: Release Chart
     # Chart publishing is upstream-only (forks lack the ghcr/registry
-    # context this expects) and applies to operator releases only — chctl
-    # binary releases (chctl-v*) carry no chart.
-    if: github.repository_owner == 'Altinity' && !startsWith(github.ref, 'refs/tags/chctl-v')
+    # context this expects) and applies to operator releases only —
+    # binary releases (chinit-v*) carry no chart.
+    if: github.repository_owner == 'Altinity' && !startsWith(github.ref, 'refs/tags/chinit-v')
     permissions:
       contents: write
       packages: write

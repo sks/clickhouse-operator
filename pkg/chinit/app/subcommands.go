@@ -29,10 +29,12 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/fail"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/service"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/infra/clusterops"
 )
 
 // nodeState is the subcommands' shared context: the state file's
@@ -384,16 +386,47 @@ func adminPasswordAt(path string) string {
 	return strings.TrimSpace(string(data))
 }
 
-// chctl runs the chctl binary for the cluster-operation subcommands.
-// These wrap chctl's CLI (the library seam covers render/health inside
-// the boot; the job commands keep the CLI boundary the units' ExecStart
-// contract already uses — one process per job, typed exit codes).
-func chctl(ctx context.Context, args ...string) (string, error) {
-	out, err := runCommand(ctx, "chctl", args...)
-	if err != nil {
-		return string(out), fmt.Errorf("chctl %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+// clusterOps is the cluster-operations port: production binds the
+// chctl library services in-process (no chctl binary, no flag
+// parsing, one error path); tests substitute a recorder with the
+// same interface. A package-level var like runCommand — the
+// subcommands are functions over the nodeState, and the var is the
+// seam the specs inject.
+var clusterOps clusterops.Ops = clusterops.New()
+
+// clusterRequest builds the shared binding for a cluster operation
+// from the settled state: cluster, spec, live-claims inventory and
+// the admin credentials (read from the boot's password file so the
+// value never hits another process's argv — one more reason the
+// in-process port beats the CLI).
+func clusterRequest(st *nodeState) clusterops.ClusterRequest {
+	return clusterRequestWithHosts(st, specInventoryHosts(st))
+}
+
+// clusterRequestWithHosts is clusterRequest over a caller-built
+// inventory: the drain's peer drop carries ONLY the two hosts the
+// drop touches (self + the peer), not the full slot list.
+func clusterRequestWithHosts(st *nodeState, hosts []clusterops.Host) clusterops.ClusterRequest {
+	return clusterops.ClusterRequest{
+		ClusterName: st.clusterName(),
+		SpecPath:    clusterops.DefaultSpecPath(),
+		Hosts:       hosts,
+		Credentials: domain.Credentials{Username: "admin", Password: adminPassword()},
 	}
-	return string(out), nil
+}
+
+// specInventoryHosts projects the spec inventory (live claims, with
+// the static fallback) onto the port's Host list.
+func specInventoryHosts(st *nodeState) []clusterops.Host {
+	hosts := make([]clusterops.Host, 0)
+	for _, pair := range st.specInventory() {
+		name, addr, ok := strings.Cut(pair, "=")
+		if !ok {
+			continue
+		}
+		hosts = append(hosts, clusterops.Host{Name: name, Address: addr})
+	}
+	return hosts
 }
 
 // runCommand is the exec seam: production shells out via
@@ -433,29 +466,13 @@ func runSchemaSync(args []string) error {
 	}
 	ctx := context.Background()
 
-	argv := []string{"schema", "sync",
-		"-spec", service.BootstrapDir + "/chi.yaml",
-		"-cluster", st.clusterName(),
-		"-retries", fmt.Sprint(*retries),
-	}
-	// Host inventory: chctl's schemer names replicas from the spec but
-	// resolves addresses from the -host flags ("host inventory is
-	// empty" without them). CR names: writers 01-0.. then readers
-	// 01-(writer ceiling+i).. — CRName()'s order; the addresses are the
-	// stack's private-zone DNS.
-	for _, h := range st.specInventory() {
-		argv = append(argv, "-host", h)
-	}
-	if *pruneStaleSelf {
-		argv = append(argv, "-prune-stale-self")
-	}
-	argv = append(argv,
-		"-user", "admin",
-		"-password", adminPassword(),
-		st.Identity.Hostname,
-	)
-	if out, err := chctl(ctx, argv...); err != nil {
-		fmt.Fprintln(os.Stderr, out)
+	if err := clusterOps.SyncSchema(ctx, clusterops.SyncSchemaRequest{
+		Cluster:        clusterRequest(st),
+		HostName:       st.Identity.Hostname,
+		Retries:        *retries,
+		PruneStaleSelf: *pruneStaleSelf,
+	}); err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		return fmt.Errorf("schema sync failed (retry on timer): %w", err)
 	}
 	return nil
@@ -473,15 +490,14 @@ func runReplicaSync(args []string) error {
 		return err
 	}
 	ctx := context.Background()
-	out, err := chctl(ctx, "replica", "sync",
-		"-spec", service.BootstrapDir+"/chi.yaml",
-		"-cluster", st.clusterName(),
-		"-user", "admin",
-		"-password", adminPassword(),
-		st.Identity.Hostname,
-	)
-	fmt.Fprintln(os.Stderr, out)
-	return err
+	if err := clusterOps.SyncReplica(ctx, clusterops.SyncReplicaRequest{
+		Cluster:  clusterRequest(st),
+		HostName: st.Identity.Hostname,
+	}); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return err
+	}
+	return nil
 }
 
 // runLeaseRenew is `chinit lease-renew` (readers' timer): extends the
@@ -548,18 +564,27 @@ var buildProvider = func(cloud string) (port.Provider, error) {
 
 // runKeeperHealth is `chinit keeper-health` (keepers' cron): the
 // ensemble health probe (mntr four-letter word over the keeper port).
+// Localhost is the settled contract: the cron runs ON the keeper it
+// reports about.
 func runKeeperHealth(args []string) error {
 	statePath, err := statePathFlag(args)
 	if err != nil {
 		return err
 	}
-	if _, err := loadNodeState(statePath); err != nil {
+	st, err := loadNodeState(statePath)
+	if err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	out, err := chctl(ctx, "keeper", "mntr")
+	out, err := clusterOps.KeeperMntr(ctx, clusterops.MntrRequest{
+		Address: "localhost:9181",
+		Timeout: 30 * time.Second,
+	})
 	fmt.Fprintln(os.Stderr, out)
+	if err != nil {
+		_ = st // identity already validated by the load
+	}
 	return err
 }
 
@@ -615,60 +640,112 @@ func gcLivelinessFrom(st *nodeState) port.LeaseLister {
 	return port.AsLeaseLister(provider)
 }
 
-// gcRunFlags builds the shared chctl replica-gc argv prefix: the
-// maintenance holder IS the detection peer — chctl runs its stale
-// detection against this node's own system.replicas, and the
-// clusterAllReplicas fan-out rides the node's rendered remote_servers
-// config (not chctl's -host map, which only builds the client
-// connection). That is why -on is the settled hostname and the single
-// -host entry is the node's own CR slot: chctl resolves the run-on
-// peer through the -host inventory, and self is the only host it must
-// reach.
-func gcRunFlags(st *nodeState) []string {
-	flags := []string{
-		"replica", "gc",
-		"-spec", service.BootstrapDir + "/chi.yaml",
-		"-cluster", st.clusterName(),
-		"-on", st.Identity.Hostname,
+// writerGcExcludes builds the writer pass's liveness guard: the
+// ACTIVE writer claims (never dropped, always reported) plus the
+// skip reason when the pass cannot run safely. A nil lister or an
+// unlistable table skips the writer pass — the reader pass still
+// swept — because dropping writer registrations without liveness
+// data risks a mid-boot re-join.
+func writerGcExcludes(ctx context.Context, st *nodeState, lister port.LeaseLister) (excludes []string, skipNote string, err error) {
+	if lister == nil {
+		return nil, "cloud has no lease-listing capability", nil
 	}
-	if st.Identity.CRName != "" {
-		flags = append(flags, "-host", st.Identity.CRName+"="+st.Identity.Hostname+"."+st.dnsZone())
+	table := st.Identity.LeaseTable
+	if table == "" {
+		// The maintenance holder need not hold a lease itself
+		// (theoretically it always does in this stack, but a manual
+		// SSM run on a static writer must still find the table the
+		// boot's spec names).
+		if spec, specErr := loadInventorySpec(); specErr == nil && spec != nil {
+			table = spec.ClaimerTableName
+		}
 	}
-	return append(flags, "-user", "admin", "-password", adminPassword())
+	if table == "" {
+		return nil, "", fmt.Errorf("no lease table to list (identity and bundle spec both carry none)")
+	}
+	claims, err := lister.ListActiveClaims(ctx, port.ListClaimsRequest{Table: table})
+	if err != nil {
+		return nil, "", fmt.Errorf("live-claims listing failed: %w", err)
+	}
+	prefix := model.DefaultWriterHostPrefix
+	if spec, specErr := loadInventorySpec(); specErr == nil && spec != nil {
+		prefix = spec.writerPrefix()
+	}
+	for _, claim := range claims {
+		if strings.HasPrefix(claim.Hostname, prefix) {
+			excludes = append(excludes, claim.Hostname)
+		}
+	}
+	sort.Strings(excludes)
+	slog.Info("writer GC pass: live writer leases excluded from the sweep",
+		"excluded", len(excludes),
+		"name_pattern", prefix+"*")
+	fmt.Fprintf(os.Stderr, "writer GC pass: %d live writer lease(s) excluded from the sweep\n", len(excludes))
+	return excludes, "", nil
 }
 
 // deadReplicaGc is the two-pass sweep over a settled identity and a
 // liveness source (nil lister = skip the writer pass; the reader pass
 // still runs). Extracted from runDeadReplicaGc so the specs can drive
-// the passes without the provider registry.
+// the passes without the provider registry. The maintenance holder IS
+// the detection peer: detection runs against this node's own
+// system.replicas and the clusterAllReplicas fan-out rides the
+// node's rendered remote_servers config — self is the only host the
+// request must reach.
 func deadReplicaGc(ctx context.Context, st *nodeState, lister port.LeaseLister) error {
-	// Pass 1: readers, unconditionally (no -name-pattern: chctl's
-	// reader-* default is the pass).
+	// Pass 1: readers, unconditionally (the empty pattern keeps the
+	// service's reader-* default).
 	slog.Info("dead-replica-gc: reader pass starting", "on", st.Identity.Hostname)
-	out, err := chctl(ctx, gcRunFlags(st)...)
-	fmt.Fprintln(os.Stderr, out)
+	res, err := clusterOps.GcReplica(ctx, clusterops.GcReplicaRequest{
+		Cluster:    clusterRequest(st),
+		RunOn:      st.Identity.Hostname,
+	})
 	if err != nil {
 		return fmt.Errorf("reader GC pass failed: %w", err)
 	}
+	logGcResult("reader", res)
 	slog.Info("dead-replica-gc: reader pass complete")
 
 	// Pass 2: writers, only with liveness data. The active claims are
-	// the exclude set — chctl reports a stale-but-live writer and
-	// leaves its registration alone.
-	argv, skip, err := writerGcPassFlags(ctx, st, lister)
+	// the exclude set — stale-but-live writers are reported and left
+	// alone.
+	excludes, skip, err := writerGcExcludes(ctx, st, lister)
 	if err != nil || skip != "" {
 		slog.Warn("WARNING: skipping the writer GC pass; the reader pass ran",
 			"reason", reasonOf(err, skip))
 		fmt.Fprintf(os.Stderr, "WARNING: skipping the writer GC pass (%s); the reader pass ran\n", reasonOf(err, skip))
 		return nil
 	}
-	out, err = chctl(ctx, argv...)
-	fmt.Fprintln(os.Stderr, out)
+	res, err = clusterOps.GcReplica(ctx, clusterops.GcReplicaRequest{
+		Cluster:      clusterRequest(st),
+		RunOn:        st.Identity.Hostname,
+		NamePattern:  model.DefaultWriterHostPrefix + "*",
+		ExcludeHosts: excludes,
+	})
 	if err != nil {
 		return fmt.Errorf("writer GC pass failed: %w", err)
 	}
+	logGcResult("writer", res)
 	slog.Info("dead-replica-gc: writer pass complete")
 	return nil
+}
+
+// logGcResult prints a pass outcome in the operator's triage shape
+// (stale/dropped/failed counts; the human lines the weekly timer's
+// log greps).
+func logGcResult(pass string, res *clusterops.GcResult) {
+	if res == nil {
+		return
+	}
+	slog.Info("dead-replica-gc: pass result",
+		"pass", pass, "stale", len(res.Stale), "dropped", len(res.Dropped), "failed", len(res.Failed))
+	fmt.Fprintf(os.Stderr, "GC %s pass: %d stale, %d dropped, %d failed\n", pass, len(res.Stale), len(res.Dropped), len(res.Failed))
+	for _, host := range res.Dropped {
+		fmt.Fprintf(os.Stderr, "  dropped %s\n", host)
+	}
+	for _, host := range res.Failed {
+		fmt.Fprintf(os.Stderr, "  FAILED %s\n", host)
+	}
 }
 
 // reasonOf renders the skip reason from either the error path (the
@@ -683,6 +760,16 @@ func reasonOf(err error, note string) string {
 // runOrphanedGc is `chinit orphaned-gc` (the weekly timer on every
 // writer; the ordinal-0 holder does the work): S3 parts not referenced
 // by any replica's metadata.
+//
+// Explicit no-op, loudly logged: the chctl call this replaced passed
+// `-orphaned-only` — a flag chctl NEVER implemented (unknown to its
+// flag set; the bash-era census loop this promised to inherit never
+// landed in the operator's schemer). The weekly timer has been a
+// silent no-op since the chinit cutover; keeping the CLI shape would
+// have carried the no-op into the in-process port invisible. The
+// follow-up belongs to the schemer (an S3-census compare against
+// every replica's parts catalog); until it ships, S3-side orphan
+// reaping stays with the bucket's lifecycle rules.
 func runOrphanedGc(args []string) error {
 	statePath, err := statePathFlag(args)
 	if err != nil {
@@ -697,17 +784,9 @@ func runOrphanedGc(args []string) error {
 	if gateMaintenanceJob(st) {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-	defer cancel()
-	// The GC is a chctl replica-gc shape against the S3 disk; the
-	// detailed census/compare logic ships with the operator's schemer
-	// integration (the bash census loop's Go home).
-	out, err := chctl(ctx, "replica", "gc",
-		"-spec", service.BootstrapDir+"/chi.yaml",
-		"-orphaned-only",
-	)
-	fmt.Fprintln(os.Stderr, out)
-	return err
+	slog.Warn("orphaned-gc: not implemented — the S3 census (parts no replica's metadata references) is a schemer follow-up; this timer has been a no-op since the chinit cutover")
+	fmt.Fprintln(os.Stderr, "orphaned-gc: no-op (S3 census not implemented; bucket lifecycle rules own orphan reaping)")
+	return nil
 }
 
 // gateMaintenanceJob answers whether this node should skip the
@@ -750,50 +829,6 @@ func gateMaintenanceJob(st *nodeState) bool {
 // claims are not excluded (the reader pass owns them and the writer
 // pattern never matches them). A nil lister means the cloud has no
 // lease-listing capability — the note says so.
-func writerGcPassFlags(ctx context.Context, st *nodeState, lister port.LeaseLister) (argv []string, skipNote string, err error) {
-	if lister == nil {
-		return nil, "cloud has no lease-listing capability", nil
-	}
-	table := st.Identity.LeaseTable
-	if table == "" {
-		// The maintenance holder need not hold a lease itself
-		// (theoretically it always does in this stack, but a manual
-		// SSM run on a static writer must still find the table the
-		// boot's spec names).
-		if spec, specErr := loadInventorySpec(); specErr == nil && spec != nil {
-			table = spec.ClaimerTableName
-		}
-	}
-	if table == "" {
-		return nil, "", fmt.Errorf("no lease table to list (identity and bundle spec both carry none)")
-	}
-	claims, err := lister.ListActiveClaims(ctx, port.ListClaimsRequest{Table: table})
-	if err != nil {
-		return nil, "", fmt.Errorf("live-claims listing failed: %w", err)
-	}
-	prefix := model.DefaultWriterHostPrefix
-	if spec, specErr := loadInventorySpec(); specErr == nil && spec != nil {
-		prefix = spec.writerPrefix()
-	}
-	var excludes []string
-	for _, claim := range claims {
-		if strings.HasPrefix(claim.Hostname, prefix) {
-			excludes = append(excludes, claim.Hostname)
-		}
-	}
-	sort.Strings(excludes)
-	slog.Info("writer GC pass: live writer leases excluded from the sweep",
-		"excluded", len(excludes),
-		"name_pattern", prefix+"*")
-	fmt.Fprintf(os.Stderr, "writer GC pass: %d live writer lease(s) excluded from the sweep\n", len(excludes))
-
-	argv = append(gcRunFlags(st), "-name-pattern", prefix+"*")
-	for _, host := range excludes {
-		argv = append(argv, "-exclude", host)
-	}
-	return argv, "", nil
-}
-
 // runBackupDaily is `chinit backup-daily` (the backup replica's timer):
 // clickhouse-backup create/upload/delete-local.
 func runBackupDaily(args []string) error {
@@ -1087,13 +1122,12 @@ func drain(ctx context.Context, st *nodeState, provider port.Provider, opts drai
 	peer := selectDrainPeer(drainCtx, st, spec, port.AsLeaseLister(provider), provider.Name())
 	if peer != nil {
 		slog.Info("drain: dropping replica on peer", "peer", peer.Hostname)
-		out, err := dropOnPeer(drainCtx, st, spec, peer)
+		err := dropOnPeer(drainCtx, st, spec, peer)
 		if err != nil {
-			slog.Warn("NOTE: chctl peer drop failed; the weekly dead-replica GC will clean up",
+			slog.Warn("NOTE: peer replica drop failed; the weekly dead-replica GC will clean up",
 				"peer", peer.Hostname,
-				"err", err,
-				"out", strings.TrimSpace(out))
-			fmt.Fprintf(os.Stderr, "NOTE: chctl peer drop on %s failed (%s); the weekly dead-replica GC will clean up\n", peer.Hostname, strings.TrimSpace(out))
+				"err", err)
+			fmt.Fprintf(os.Stderr, "NOTE: peer replica drop on %s failed (%s); the weekly dead-replica GC will clean up\n", peer.Hostname, err)
 			// Fallback: local drop.
 			_, _ = runCommand(drainCtx, "clickhouse-client", "--query",
 				"SYSTEM DROP REPLICA '"+st.Identity.Hostname+"'")
@@ -1145,31 +1179,27 @@ func drain(ctx context.Context, st *nodeState, provider port.Provider, opts drai
 	return nil
 }
 
-// dropOnPeer runs the chctl replica drop against one live peer,
-// preserving the drain's argv shape: the peer's own CR slot flag
-// (writers 01-{N}; readers 01-{writerCeiling+N} — the same
-// claimCRSlot arithmetic the inventory flags use) plus self, so
-// chctl resolves both replica addresses. The peer's -on address is
-// its DNS name; a CR slot the peer cannot have (beyond a shrunk
-// ceiling) or a peer with no slot arithmetic (nil spec) means no peer
-// flag — chctl falls back to its spec-resolved address for the peer.
-func dropOnPeer(ctx context.Context, st *nodeState, spec *inventorySpec, peer *port.Claim) (string, error) {
+// dropOnPeer removes this node's replica registration via one live
+// peer (the operator's HostDropReplica form): the peer executes the
+// SYSTEM DROP REPLICA that reaches both the table and the DATABASE
+// registration the local statement misses. The request's inventory
+// carries the peer's CR slot (writers 01-{N}; readers
+// 01-{writerCeiling+N} — the claimCRSlot arithmetic) plus self, so
+// the service resolves both replica addresses; the in-process port
+// carries credentials in the typed request, never on an argv.
+func dropOnPeer(ctx context.Context, st *nodeState, spec *inventorySpec, peer *port.Claim) error {
 	peerFQDN := peer.Hostname + "." + st.dnsZone()
-	argv := []string{"replica", "drop",
-		"-spec", service.BootstrapDir + "/chi.yaml",
-		"-cluster", st.clusterName(),
-		"-on", peerFQDN,
+	hosts := []clusterops.Host{
+		{Name: st.Identity.CRName, Address: st.Identity.Hostname + "." + st.dnsZone()},
 	}
 	if role, ordinal, ok := claimRoleOrdinal(peer.Hostname, spec.writerPrefix(), spec.readerPrefix()); ok {
 		if slot := claimCRSlot(role, ordinal, spec.writerCeiling()); slot >= 0 {
-			argv = append(argv, "-host", fmt.Sprintf("01-%d=%s", slot, peerFQDN))
+			hosts = append(hosts, clusterops.Host{Name: fmt.Sprintf("01-%d", slot), Address: peerFQDN})
 		}
 	}
-	argv = append(argv,
-		"-host", st.Identity.CRName+"="+st.Identity.Hostname+"."+st.dnsZone(),
-		"-user", "admin",
-		"-password", adminPassword(),
-		st.Identity.Hostname,
-	)
-	return chctl(ctx, argv...)
+	return clusterOps.DropReplica(ctx, clusterops.DropReplicaRequest{
+		Cluster:  clusterRequestWithHosts(st, hosts),
+		HostName: st.Identity.Hostname,
+		RunOn:    peerFQDN,
+	})
 }

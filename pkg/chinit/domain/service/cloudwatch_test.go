@@ -20,9 +20,8 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	chctlport "github.com/altinity/clickhouse-operator/pkg/chctl/domain/port"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
-	chinitport "github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 )
 
 // nonAWSProvider fakes any non-AWS cloud for the gating spec. It
@@ -34,11 +33,11 @@ type nonAWSProvider struct {
 
 func (nonAWSProvider) Name() string { return "azure" }
 
-func (nonAWSProvider) Metadata(context.Context) (chinitport.InstanceMetadata, error) {
-	return chinitport.InstanceMetadata{}, nil
+func (nonAWSProvider) Metadata(context.Context) (port.InstanceMetadata, error) {
+	return port.InstanceMetadata{}, nil
 }
 
-func (nonAWSProvider) GetSecretValue(context.Context, chctlport.SecretRequest) (string, error) {
+func (nonAWSProvider) GetSecretValue(context.Context, port.SecretRequest) (string, error) {
 	return "", nil
 }
 

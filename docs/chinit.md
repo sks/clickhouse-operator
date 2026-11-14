@@ -36,7 +36,7 @@ hit builds the provider from the registry:
 type Provider interface {
     Name() string
     MetadataProvider          // instance id, region, private IP — mandatory
-    port.SecretSource          // the same secrets port chctl uses
+    port.SecretSource          // the shared secrets port
     ConfigSource               // SHA-gated bundle fetch — mandatory
 }
 // Optional capabilities, probed at boot; nil = disabled with a WARNING:
@@ -59,7 +59,7 @@ is down still joins):
 ```
 fetch_config_bundle → os_optimizations → require_binaries → mount_data_disks
 → install_static_configs → settle_identity → retrieve_passwords
-→ render_node_config (chctl's library — no process boundary)
+→ render_node_config (in-process library — no process boundary)
 → configure_keeper → write_node_env → start_clickhouse → health_gate
 → prometheus_reload → install_units → configure_backup → configure_monitoring
 → install_spot_watch → boot_finished
@@ -104,7 +104,7 @@ Releases build from the `chinit-v*` tag workflow (vet+test gate, stripped
 static binaries for linux/darwin arm64+amd64). The golden AMI bakes a
 pinned version; the user-data wrapper upgrades from the staged
 `bootstrap/artifacts/chinit/<version>/` prefix with the same sha256 gate
-chctl uses.
+the cluster-ops port uses.
 
 ## Wiring into node boot (the langchain-examples stacks)
 
