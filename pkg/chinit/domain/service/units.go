@@ -239,9 +239,10 @@ User=root
 }
 
 // configureMonitoring writes the OTEL/Fluent Bit configs for remote log
-// shipping (disabled silently when the spec's endpoint is empty; the
-// provider-specific agent — CloudWatch on AWS, AMA on Azure — is baked
-// by the image or VM extension, not by chinit).
+// shipping (disabled silently when the spec's endpoint is empty; on AWS
+// the local CloudWatch agent is configured separately by
+// configureCloudWatch — the image only installs the deb, chinit owns
+// the config).
 func (b *Boot) configureMonitoring(ctx context.Context) error {
 	if b.Spec.LogShipping.Endpoint == "" {
 		return nil // remote shipping disabled
@@ -347,6 +348,197 @@ WantedBy=multi-user.target
 	}
 	if out, err := runCommand(ctx, "systemctl", "enable", "--now", "chinit-spot-watch.service"); err != nil {
 		return fmt.Errorf("enable chinit-spot-watch: %w: %s", err, out)
+	}
+	return nil
+}
+
+// cloudWatchConfig is the pure config-shape builder configureCloudWatch
+// writes to disk — split out so the contracts (role gating, namespace
+// split, identity-label placement) are testable without executing
+// system commands.
+type cloudWatchConfig struct {
+	PromCfg         string
+	AgentJSON       string
+	ChNamespace     string
+	MetricSelectors string
+}
+
+// cloudWatchConfig renders the agent's prometheus scrape + JSON config
+// for a role. Custom identity labels live ONLY in the Prometheus EMF
+// dimensions: append_dimensions with custom keys fails agent config
+// validation on EC2, so node-metric alarms must key on the
+// auto-appended InstanceID dimension instead.
+func (b *Boot) cloudWatchConfig(role model.Role, cluster string) cloudWatchConfig {
+	cfgDir := "/opt/aws/amazon-cloudwatch-agent/etc"
+
+	// Exact exposition names from ClickHouse 26.8 :9363/metrics — the
+	// operator's alert-catalog thresholds key on these. Keepers have no
+	// server logs and servers no keeper logs; pointing the agent at
+	// files a role cannot exist with makes it retry forever.
+	chNamespace := "ClickHouse/Server"
+	metricSelectors := `^ClickHouse(AsyncMetrics_)?(Uptime|ReplicasMaxAbsoluteDelay|MaxPartCountForPartition)$|^ClickHouseMetrics_(ReadonlyReplica|DistributedFilesToInsert|Query)$`
+	logEntries := `,
+                    {
+                        "file_path": "/var/log/clickhouse-server/clickhouse-server.log",
+                        "log_group_name": "/clickhouse/` + cluster + `/server",
+                        "log_stream_name": "{instance_id}"
+                    },
+                    {
+                        "file_path": "/var/log/clickhouse-server/clickhouse-server.err.log",
+                        "log_group_name": "/clickhouse/` + cluster + `/error",
+                        "log_stream_name": "{instance_id}"
+                    }`
+	if role == model.RoleKeeper {
+		chNamespace = "ClickHouse/Keeper"
+		metricSelectors = `^ClickHouse(AsyncMetrics_)?Keeper[A-Za-z]*$|^ClickHouseProfileEvents_KeeperSnapshot[A-Za-z]*$|^ClickHouseMetrics_KeeperOutstandingRequests$`
+		logEntries = `,
+                    {
+                        "file_path": "/var/log/clickhouse-keeper/clickhouse-keeper.log",
+                        "log_group_name": "/clickhouse/` + cluster + `/keeper",
+                        "log_stream_name": "{instance_id}"
+                    },
+                    {
+                        "file_path": "/var/log/clickhouse-keeper/clickhouse-keeper.err.log",
+                        "log_group_name": "/clickhouse/` + cluster + `/keeper",
+                        "log_stream_name": "{instance_id}"
+                    },
+                    {
+                        "file_path": "/var/log/keeper_health.log",
+                        "log_group_name": "/clickhouse/` + cluster + `/keeper",
+                        "log_stream_name": "{instance_id}"
+                    }`
+	}
+
+	promCfg := `global:
+  scrape_interval: 60s
+  scrape_timeout: 10s
+scrape_configs:
+  - job_name: clickhouse
+    static_configs:
+      - targets:
+          - 127.0.0.1:9363
+        labels:
+          ClusterName: "` + cluster + `"
+          NodeType: "` + string(role) + `"
+`
+	agentCfg := `{
+    "agent": {
+        "metrics_collection_interval": 60,
+        "run_as_user": "cwagent"
+    },
+    "metrics": {
+        "namespace": "ClickHouse/Node",
+        "metrics_collected": {
+            "cpu": { "measurement": ["cpu_usage_idle", "cpu_usage_iowait"], "resources": ["*"] },
+            "mem": { "measurement": ["mem_used_percent", "mem_available"] },
+            "disk": { "measurement": ["used_percent"], "resources": ["/", "/var/lib/clickhouse"] },
+            "swap": { "measurement": ["swap_used_percent"] },
+            "net": { "measurement": ["bytes_recv", "bytes_sent"], "resources": ["*"] }
+        }
+    },
+    "logs": {
+        "metrics_collected": {
+            "prometheus": {
+                "cluster_name": "` + cluster + `",
+                "log_group_name": "/clickhouse/` + cluster + `/prometheus",
+                "prometheus_config_path": "` + cfgDir + `/prometheus.yaml",
+                "emf_processor": {
+                    "metric_namespace": "` + chNamespace + `",
+                    "metric_declaration": [
+                        {
+                            "source_labels": ["job"],
+                            "label_matcher": "^clickhouse$",
+                            "metric_selectors": ["` + metricSelectors + `"],
+                            "dimensions": [["ClusterName", "NodeType"], ["ClusterName"]]
+                        }
+                    ]
+                }
+            }
+        },
+        "logs_collected": {
+            "files": {
+                "collect_list": [
+                    {
+                        "file_path": "/var/log/bootstrap.log",
+                        "log_group_name": "/clickhouse/` + cluster + `/bootstrap",
+                        "log_stream_name": "{instance_id}"
+                    }` + logEntries + `
+                ]
+            }
+        }
+    }
+}
+`
+	return cloudWatchConfig{
+		PromCfg:         promCfg,
+		AgentJSON:       agentCfg,
+		ChNamespace:     chNamespace,
+		MetricSelectors: metricSelectors,
+	}
+}
+
+// configureCloudWatch configures the AWS node-metrics + log-shipping
+// agent — the step the bash-era configure_cloudwatch_agent() carried
+// (deleted in the chinit cutover). Nothing else configures the agent:
+// packer only INSTALLS the deb, so without this step every node is
+// invisible to every alarm while its logs pile up unreadable on local
+// disk (observed live: a full-day outage whose 2,328 errors existed
+// only on the node).
+//
+// Why chinit and not the launch template: instances come and go — an
+// ASG instance refresh or replacement must boot with visibility
+// configured, or the fix is a per-node manual patch that dies with the
+// instance. The config is the verbatim agent JSON from the bash era:
+// node metrics (ClickHouse/Node), the :9363 Prometheus EMF bridge
+// (ClickHouse/Server or ClickHouse/Keeper by role), and the per-role
+// log collect_list into /clickhouse/<cluster>/{server,error,keeper,
+// bootstrap,prometheus}.
+//
+// AWS-only (the Provider.Name() branch the aws-cli binary requirement
+// already uses); a no-op on other clouds (Azure's AMA keeps its
+// VM-extension path).
+func (b *Boot) configureCloudWatch(ctx context.Context) error {
+	if b.Provider.Name() != "aws" {
+		return nil
+	}
+
+	// The agent runs as cwagent but ClickHouse writes its logs 640
+	// clickhouse:clickhouse — group membership is the standard read
+	// grant (keepers may lack the group; the server package creates
+	// it on server roles).
+	if _, err := runCommand(ctx, "getent", "group", "clickhouse"); err != nil {
+		if out, gerr := runCommand(ctx, "groupadd", "clickhouse"); gerr != nil {
+			return fmt.Errorf("groupadd clickhouse: %w: %s", gerr, out)
+		}
+	}
+	// Best-effort: the cwagent user exists on the golden AMI.
+	_, _ = runCommand(ctx, "usermod", "-aG", "clickhouse", "cwagent")
+
+	cfgDir := "/opt/aws/amazon-cloudwatch-agent/etc"
+	if err := os.MkdirAll(cfgDir, 0755); err != nil {
+		return err
+	}
+
+	cluster := b.Identity.ClusterName
+	if cluster == "" {
+		cluster = b.Spec.ClusterName
+	}
+
+	cfg := b.cloudWatchConfig(b.Identity.Role, cluster)
+	if err := os.WriteFile(cfgDir+"/prometheus.yaml", []byte(cfg.PromCfg), 0644); err != nil {
+		return err
+	}
+	agentPath := cfgDir + "/amazon-cloudwatch-agent.json"
+	if err := os.WriteFile(agentPath, []byte(cfg.AgentJSON), 0644); err != nil {
+		return err
+	}
+
+	if out, err := runCommand(ctx, "/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl",
+		"-a", "fetch-config", "-m", "ec2", "-c", "file:"+agentPath, "-s"); err != nil {
+		return fmt.Errorf("cw-agent fetch-config: %w: %s", err, out)
+	}
+	if out, err := runCommand(ctx, "systemctl", "enable", "amazon-cloudwatch-agent"); err != nil {
+		return fmt.Errorf("enable amazon-cloudwatch-agent: %w: %s", err, out)
 	}
 	return nil
 }

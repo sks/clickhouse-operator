@@ -151,8 +151,11 @@ func (b *Boot) Steps(ctx context.Context) ([]Step, error) {
 		// 15. Backup (clickhouse-backup config + timer).
 		StepFunc("configure_backup", BestEffort, onceFatal, b.configureBackup),
 
-		// 16. Monitoring agents (OTEL/Fluent Bit; CloudWatch on AWS).
+		// 16. Monitoring agents (OTEL/Fluent Bit remote shipping;
+		// CloudWatch agent on AWS — chinit owns it now, the image only
+		// installs the deb).
 		StepFunc("configure_monitoring", BestEffort, onceFatal, b.configureMonitoring),
+		StepFunc("configure_cloudwatch", BestEffort, onceFatal, b.configureCloudWatch),
 
 		// 17. Spot watcher service (readers).
 		StepFunc("install_spot_watch", BestEffort, onceFatal, b.installSpotWatch),
