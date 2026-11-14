@@ -67,10 +67,6 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
 
-      - name: Derive goreleaser version
-        id: ver
-        run: echo "tag=${GITHUB_REF_NAME#chinit-}" >> "$GITHUB_OUTPUT"
-
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
@@ -79,7 +75,12 @@ jobs:
           args: release --clean --config .goreleaser.chinit.yaml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # chinit-v* tags are not valid semver; hand GoReleaser the
-          # stripped version (v0.2.0). The release is still published
-          # under the chinit-v* tag via the workflow's tag trigger.
-          GORELEASER_CURRENT_TAG: ${{ steps.ver.outputs.tag }}
+          # GORELEASER_CURRENT_TAG must name a tag that EXISTS against
+          # HEAD — GoReleaser validates the git state against it before
+          # anything else ("tag v0.2.0 was not made against commit"
+          # when the env named the STRIPPED form, which never exists as
+          # a ref). The real chinit-v* tag passes the check; the
+          # non-semver prefix is tolerated (verified with a local
+          # snapshot run), and name_template renders "chinit 0.2.0"
+          # from it. The release publishes under the chinit-v* tag.
+          GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
