@@ -20,7 +20,12 @@ name: Release chinit
 on:
   push:
     tags:
-      - "chinit-v*"
+      # Bare semver: GoReleaser OSS publishes the release under the
+      # CURRENT_TAG ref, which must be valid semver — the chinit-v
+      # prefix never satisfies both that and the git-state check (the
+      # v0.2.0 release-gate findings). v0.* cannot collide with the
+      # operator's release-* tags or any other workflow trigger.
+      - "v0.*"
 
 permissions:
   contents: write # create the Release + upload artifacts
@@ -75,12 +80,11 @@ jobs:
           args: release --clean --config .goreleaser.chinit.yaml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # GORELEASER_CURRENT_TAG must name a tag that EXISTS against
-          # HEAD — GoReleaser validates the git state against it before
-          # anything else ("tag v0.2.0 was not made against commit"
-          # when the env named the STRIPPED form, which never exists as
-          # a ref). The real chinit-v* tag passes the check; the
-          # non-semver prefix is tolerated (verified with a local
-          # snapshot run), and name_template renders "chinit 0.2.0"
-          # from it. The release publishes under the chinit-v* tag.
+          # GORELEASER_CURRENT_TAG is the ref the release publishes
+          # under — it must both EXIST against HEAD (the git-state
+          # check; a stripped form that names no ref fails "was not
+          # made against commit") and parse as semver (the chinit-v
+          # prefix fails "invalid semantic version"). Bare v0.* tags
+          # satisfy both; the release NAME still renders
+          # "chinit <version>" from name_template.
           GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
