@@ -183,7 +183,7 @@ var _ = Describe("lease-renew logging", func() {
 
 		claimer := &drainClaimer{}
 		origBuild := buildProvider
-		buildProvider = func(string) (chinitport.Provider, error) {
+		buildProvider = func(string, string) (chinitport.Provider, error) {
 			return &drainProvider{name: "aws", claimer: claimer}, nil
 		}
 		DeferCleanup(func() { buildProvider = origBuild })
@@ -207,7 +207,7 @@ var _ = Describe("lease-renew logging", func() {
 		DeferCleanup(restore)
 
 		origBuild := buildProvider
-		buildProvider = func(string) (chinitport.Provider, error) {
+		buildProvider = func(string, string) (chinitport.Provider, error) {
 			return &drainProvider{name: "aws", claimer: &failingRenewClaimer{}}, nil
 		}
 		DeferCleanup(func() { buildProvider = origBuild })

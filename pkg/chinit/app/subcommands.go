@@ -284,7 +284,7 @@ func claimsHostFlags(claims []port.Claim, dnsZone string, writerCeiling int, wri
 // very old state file, and the job still has a spec to enumerate.
 func (s *nodeState) specInventory() []string {
 	return s.specInventoryWithSource(func(cloud string) (port.LeaseLister, string) {
-		provider, err := registry().Build(cloud, port.Config{})
+		provider, err := registry().Build(cloud, port.Config{Region: s.Identity.Region})
 		if err != nil {
 			return nil, "unknown provider " + cloud
 		}
@@ -514,7 +514,7 @@ func runLeaseRenew(args []string) error {
 	if st.Identity.LeaseTable == "" {
 		return fail.Fatal(fmt.Errorf("node holds no lease (identity has no lease table)"))
 	}
-	provider, err := buildProvider(providerNameOf(st))
+	provider, err := buildProvider(providerNameOf(st), st.Identity.Region)
 	if err != nil {
 		return err
 	}
@@ -558,8 +558,15 @@ func providerNameOf(st *nodeState) string {
 // registry (the boot's provider instance died with its process). A
 // package-level var so the drain's SSM-invocation specs inject a
 // fake — production always builds the real registry provider.
-var buildProvider = func(cloud string) (port.Provider, error) {
-	return registry().Build(cloud, port.Config{})
+//
+// The state's REGION threads through: the boot resolves it from IMDS
+// and persists it in the identity, but subcommands run later (timers,
+// SSM) with no IMDS probe — without it the AWS clients fail
+// "Missing Region" on their first call (the live schema-sync finding:
+// the reader's live-claims scan fell back to the static 12-slot list
+// and every vacant-peer DNS lookup died).
+var buildProvider = func(cloud string, region string) (port.Provider, error) {
+	return registry().Build(cloud, port.Config{Region: region})
 }
 
 // runKeeperHealth is `chinit keeper-health` (keepers' cron): the
@@ -633,7 +640,7 @@ func runDeadReplicaGc(args []string) error {
 // itself takes the lister as a parameter (deadReplicaGc), so the
 // specs drive the passes without the registry.
 func gcLivelinessFrom(st *nodeState) port.LeaseLister {
-	provider, err := buildProvider(providerNameOf(st))
+	provider, err := buildProvider(providerNameOf(st), st.Identity.Region)
 	if err != nil {
 		return nil
 	}
@@ -697,8 +704,8 @@ func deadReplicaGc(ctx context.Context, st *nodeState, lister port.LeaseLister) 
 	// service's reader-* default).
 	slog.Info("dead-replica-gc: reader pass starting", "on", st.Identity.Hostname)
 	res, err := clusterOps.GcReplica(ctx, clusterops.GcReplicaRequest{
-		Cluster:    clusterRequest(st),
-		RunOn:      st.Identity.Hostname,
+		Cluster: clusterRequest(st),
+		RunOn:   st.Identity.Hostname,
 	})
 	if err != nil {
 		return fmt.Errorf("reader GC pass failed: %w", err)
@@ -873,7 +880,7 @@ func runSpotWatch(args []string) error {
 	if err != nil {
 		return err
 	}
-	provider, err := buildProvider(providerNameOf(st))
+	provider, err := buildProvider(providerNameOf(st), st.Identity.Region)
 	if err != nil {
 		return err
 	}
@@ -965,7 +972,7 @@ func runDrain(args []string) error {
 			"a node that never settled identity cannot drain safely; the ASG termination hook will CONTINUE and the weekly dead-replica GC will clean up (SSM sees this failure)",
 			*statePath, err)
 	}
-	provider, err := buildProvider(providerNameOf(st))
+	provider, err := buildProvider(providerNameOf(st), st.Identity.Region)
 	if err != nil {
 		return err
 	}

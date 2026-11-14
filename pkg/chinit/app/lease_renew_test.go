@@ -55,7 +55,7 @@ var _ = Describe("runLeaseRenew", func() {
 	fixtures := func() func() {
 		claimer = &drainClaimer{}
 		origBuild := buildProvider
-		buildProvider = func(string) (chinitport.Provider, error) {
+		buildProvider = func(string, string) (chinitport.Provider, error) {
 			return &drainProvider{name: "aws", claimer: claimer}, nil
 		}
 		Expect(os.MkdirAll(leaseRenewDir, 0755)).To(Succeed())
@@ -127,7 +127,7 @@ var _ = Describe("runLeaseRenew", func() {
 				LeaseTable: "node-claims",
 			})
 			origBuild := buildProvider
-			buildProvider = func(string) (chinitport.Provider, error) {
+			buildProvider = func(string, string) (chinitport.Provider, error) {
 				return &bareProvider{providerName: "azure"}, nil
 			}
 			DeferCleanup(func() { buildProvider = origBuild })

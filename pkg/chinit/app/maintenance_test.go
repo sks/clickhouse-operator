@@ -318,7 +318,7 @@ var _ = Describe("runDeadReplicaGc / runOrphanedGc (the CLI entries)", func() {
 		// registry's real AWS provider (IMDS credential retries) out
 		// of the test clock.
 		origBuild := buildProvider
-		buildProvider = func(string) (chinitport.Provider, error) {
+		buildProvider = func(string, string) (chinitport.Provider, error) {
 			return &drainProvider{name: "aws", lister: lister}, nil
 		}
 		DeferCleanup(func() {
@@ -372,7 +372,7 @@ var _ = Describe("runDeadReplicaGc / runOrphanedGc (the CLI entries)", func() {
 		// deadReplicaGc specs pin the same pass with a nil lister
 		// handed in directly).
 		origBuild := buildProvider
-		buildProvider = func(string) (chinitport.Provider, error) {
+		buildProvider = func(string, string) (chinitport.Provider, error) {
 			return &bareProvider{providerName: "azure"}, nil
 		}
 		DeferCleanup(func() { buildProvider = origBuild })

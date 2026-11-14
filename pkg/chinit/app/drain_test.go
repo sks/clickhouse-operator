@@ -24,8 +24,8 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/model"
+	"github.com/altinity/clickhouse-operator/pkg/chinit/domain/port"
 	"github.com/altinity/clickhouse-operator/pkg/chinit/infra/clusterops"
 )
 
@@ -183,7 +183,6 @@ func (d *drainDNS) DeleteARecord(_ context.Context, req port.ARecordRequest) err
 	return nil
 }
 
-
 // fakeClusterOps records the clusterOps calls the subcommands make so
 // the specs assert on the typed requests instead of any argv. The
 // zero value is ready to use; setting dropErr/gcErr/failRunOn drives
@@ -193,7 +192,7 @@ type fakeClusterOps struct {
 	dropErr error
 	// gcErrs is a per-call sequence of errors for GcReplica: nil entry
 	// = success. A short slice is padded with nils (remaining calls succeed).
-	gcErrs  []error
+	gcErrs      []error
 	gcCallCount int
 }
 
@@ -292,7 +291,7 @@ func drainFixtures() (*drainFakes, func()) {
 	origOps := clusterOps
 	clusterOps = f.ops
 	origBuild := buildProvider
-	buildProvider = func(string) (port.Provider, error) {
+	buildProvider = func(string, string) (port.Provider, error) {
 		return &drainProvider{name: "aws", lister: f.lister, claimer: f.claimer, dns: f.dns}, nil
 	}
 
